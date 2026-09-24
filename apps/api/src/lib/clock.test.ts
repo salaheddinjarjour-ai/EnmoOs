@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { DAY_MS, FakeClock, MINUTE_MS, systemClock } from "./clock";
+import { calendarDay, DAY_MS, FakeClock, MINUTE_MS, systemClock } from "./clock";
 
 describe("FakeClock", () => {
   it("starts at the given instant and only moves when told to", () => {
@@ -32,5 +32,24 @@ describe("FakeClock", () => {
   it("rejects invalid instants and durations", () => {
     expect(() => new FakeClock("not a date")).toThrow(RangeError);
     expect(() => new FakeClock().advance(Number.NaN)).toThrow(RangeError);
+  });
+});
+
+describe("calendarDay", () => {
+  it("is the day on the wall calendar of the zone, not the UTC day", () => {
+    // 21:00 in New York on Sept 24 is already Sept 25 in UTC; 06:00 in Dubai is still Sept 24.
+    const evening = new Date("2026-09-25T01:00:00.000Z");
+    expect(calendarDay(evening, "UTC")).toBe("2026-09-25");
+    expect(calendarDay(evening, "America/New_York")).toBe("2026-09-24");
+    const morning = new Date("2026-09-24T02:00:00.000Z");
+    expect(calendarDay(morning, "Asia/Dubai")).toBe("2026-09-24");
+    expect(calendarDay(new Date("2026-09-23T21:00:00.000Z"), "Asia/Dubai")).toBe("2026-09-24");
+    expect(calendarDay(new Date("2026-12-31T23:30:00.000Z"), "Pacific/Kiritimati")).toBe(
+      "2027-01-01",
+    );
+  });
+
+  it("rejects an unknown zone", () => {
+    expect(() => calendarDay(new Date(0), "Mars/Olympus_Mons")).toThrow(RangeError);
   });
 });

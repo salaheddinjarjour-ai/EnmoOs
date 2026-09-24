@@ -43,7 +43,7 @@ mock or dry-run mode.
 | Phase              | Ships                                                                                                                                                                                  | Exit criteria                                          | Status   |
 | ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------ | -------- |
 | 1 · Foundation     | Monorepo, full Prisma schema, auth + RBAC, invites, client CRUD (brand voice, visual style, banned words, approval chain), Command Center shell, Render + Cloudflare deploy config, CI | Log in, create a client, see the dashboard             | **Done** |
-| 2 · First words    | Brief chat, Manager intake/plan, task graph, BullMQ, Copywriter, approvals (text only)                                                                                                 | Brief → caption drafts → approve in the UI             | Planned  |
+| 2 · First words    | Brief chat, Manager intake/plan, task graph, BullMQ, Copywriter, approvals (text only)                                                                                                 | Brief → caption drafts → approve in the UI             | **Done** |
 | 3 · Eyes           | Visual provider abstraction + MockProvider, Visual Director, Vault, asset versioning                                                                                                   | Brief → approvable post card with a placeholder visual | Planned  |
 | 4 · Go live (Meta) | Meta Graph publishing, Publisher agent, Calendar + slot optimizer, Approvals Queue                                                                                                     | An approved post publishes itself to IG/FB             | Planned  |
 | 5 · Everywhere     | TikTok publishing, Adapter agent, Higgsfield provider                                                                                                                                  | One brief → three platforms, in native formats         | Planned  |
@@ -78,17 +78,77 @@ metrics. Real improvement can only be measured with live accounts.
   confirms a token still decrypts and hasn't expired.
 - **Web.** Login, invite accept, the Command Center shell (one tab per client over the "The Arsenal
   is idle. Give it a brief." empty state), the Clients roster and per-client settings tabs, and
-  Admin → Users. The other four screens are labelled placeholders until their phases land.
+  Admin → Users. Calendar, The Vault and the Approvals Queue are labelled placeholders until their
+  phases land.
 - **Ops.** `GET /healthz` (liveness) and `/readyz` (Postgres + Redis). `render.yaml` defines the
   API, the worker and Postgres. `wrangler.jsonc` and `worker.ts` define the Cloudflare Worker with
   its keep-alive cron. CI runs lint, typecheck, test, build, `build:cf`, the smoke test and
   Playwright.
 
-**Mocked, dry-run or not there yet in Phase 1.**
+### Phase 2: what works today
 
-- No agent runs yet. The worker process starts idle, and queues arrive in Phase 2.
-  `LLM_PROVIDER=mock`, `VISUAL_PROVIDER=mock` and `PUBLISH_MODE=dry-run` are the defaults, and the
-  Topbar shows them as chips.
+A chat brief becomes approved caption drafts, text only, end to end.
+
+- **The Brief (chat).** Start a campaign from **The Brief** with one message, optionally picking the
+  client ("Ramadan campaign for the coffee client, 12 posts, push the iced line"). The Manager reads
+  the whole thread and asks at most **one** consolidated clarifying question, naming every gap at
+  once. After that the intake runs under a brief-only contract, so remaining gaps become written
+  assumptions on the locked brief and a second question is impossible (`Campaign.clarifyCount`).
+- **Plan before spend.** The Manager turns the brief into a task graph (write → QA per post for
+  now, `PIPELINE_ACTIONS=write,qa`). Code validates the graph (acyclic, one node per action per
+  post, mix, platforms and dates inside the window) and prices it: the plan card shows the summary,
+  every planned post, and a token and dollar estimate against today's remaining budget. Nothing is
+  generated until a MANAGER or ADMIN approves the plan. Anyone can request changes: the note is
+  passed to the Manager verbatim and comes back as version n+1, and the old version is marked
+  superseded.
+- **Drafting.** Approving creates the posts and their agent tasks in one transaction. The task
+  graph is scheduled from Postgres, and each ready task runs as a BullMQ `task.run` job on the
+  `agents` queue. The Copywriter answers in strict JSON checked against its contract (the right
+  shape per post type, scene timing, hook by 3s, caption and hashtag limits, one caption per
+  platform, no banned words). An invalid reply gets two corrective retries with the zod issues fed
+  back, then escalates. Every attempt is an `AgentRun` row, and tokens are counted per UTC day.
+- **QA and approval.** Manager QA reviews each draft with the automated checks and may send it
+  back once for an automatic revision (`MAX_QA_REVISIONS`). A draft that still uses a banned word
+  never reaches a person. Passing drafts open an approval round against a snapshot of the client's
+  chain, and a post card lands in the thread.
+- **Live progress.** `GET /v1/events` streams over SSE: one progress line per plan updated in place
+  (`Copywriter ✓ 12/12 …`), agent status, post cards, approvals and alerts. Reconnecting with
+  `Last-Event-ID` replays what was missed (up to 500 events, then a `resync`).
+- **Review.** Each card has Approve, Request Changes and Edit. Decisions follow the client's
+  approval chain. Request Changes passes the reviewer's words byte-for-byte to the Copywriter's
+  revision (recorded in `AgentRun.inputSnapshot`), and the revised draft returns through QA as
+  round 2. The copy editor flags banned words as you type, the API refuses them with a 422, and an
+  edit reopens approval with a new round. **Approve all** (MANAGER and ADMIN) approves the current
+  step of every post waiting on you in one click. It never skips a chain step, writes one
+  `approval.approve_all` audit row, and marks each decision as made through it.
+- **When something goes wrong.** An agent that can't meet its contract escalates: the task is
+  ESCALATED, the post is flagged, the Manager posts an escalation in the thread, an alert goes out,
+  and a MANAGER or ADMIN can retry it. Once `DAILY_TOKEN_CAP` is reached, tasks wait in
+  `BLOCKED_BUDGET` with a budget alert. The sweeper (every 5 minutes) re-queues a stuck task once
+  before failing it, and resumes budget-blocked tasks after the UTC day rolls over. A daily prune
+  removes week-old realtime events and expired sessions. Archiving a campaign cancels its
+  unfinished work.
+- **Web.** The Brief lists campaigns by client and runs the thread with its cards (clarifying
+  question, brief, plan, live progress, post cards, escalations) and the sticky approve-all bar.
+  Each client tab in the Command Center shows its posts on the 7-column pipeline kanban with an
+  Alerts panel. The Topbar shows today's token budget and whether live updates are connected.
+
+**Mocked, dry-run or not there yet (as of Phase 2).**
+
+- The agents run on the deterministic **MockLlm** unless `ANTHROPIC_API_KEY` is set
+  (`LLM_PROVIDER=mock` is the default and shows as a Topbar chip). It reads post counts, platforms
+  and date phrases with heuristics and goes through the same runner, validation and retries as the
+  real client. `MOCK_LLM_FAULTS` injects faults and `MOCK_LLM_DELAY_MS` adds latency for demos. The
+  Anthropic client is written against the real Messages API (streaming, structured JSON output,
+  adaptive thinking, prompt caching), but so far it has only been tested against a fake `fetch`.
+- Text only. There are no visuals until Phase 3: the card preview is a text-only 9:16 frame in the
+  client's palette, and Request Changes can only target Copy.
+- Approved is not yet published. Approved posts show the SCHEDULED pill, but publishing jobs,
+  slots and the Calendar arrive in Phase 4, so a campaign stays PRODUCING. `VISUAL_PROVIDER=mock`
+  and `PUBLISH_MODE=dry-run` remain the defaults.
+- The Alerts panel is assembled in the browser from the budget, flagged posts and live alert
+  events; the dashboard alerts endpoint arrives in Phase 6. The Strategist joins the pipeline in
+  Phase 6. Calendar, The Vault and the Approvals Queue are still placeholders.
 - Social accounts are connected only by pasting a token. Meta and TikTok OAuth arrive in Phases 4
   and 5. "Check" can't ask the platform yet, so it only verifies decryption and expiry.
 - Nothing has been deployed: there are no Render, Cloudflare, Upstash or R2 credentials. The deploy
@@ -146,8 +206,9 @@ metrics. Real improvement can only be measured with live accounts.
 ```
 apps/
   api/          @enmo/api     Fastify API + BullMQ worker (tsup bundle: server, worker, create-admin)
-    src/        config.ts (all env), app.ts, deps.ts, plugins/, routes/, services/, jobs/, lib/
-    test/       integration (real Postgres + Redis, app.inject), helpers
+    src/        config.ts (all env), app.ts, deps.ts, plugins/, routes/, services/, orchestrator/,
+                jobs/ (queues, processors, schedulers), realtime/ (publisher, SSE hub), lib/
+    test/       integration (real Postgres + Redis, app.inject), e2e (pipeline harness), helpers
   web/          @enmo/web     Next.js 16 → Cloudflare Workers via @opennextjs/cloudflare
     src/        app/ (routes), components/, hooks/ (TanStack Query), lib/ (api client, auth)
     e2e/        Playwright specs, phase1.spec.ts …
@@ -155,7 +216,7 @@ apps/
 packages/
   shared/       @enmo/shared  zod enums + DTOs, RBAC matrix, approval-chain walk, status maps (no Node deps)
   db/           @enmo/db      Prisma 7 schema + migrations, createPrisma(), seed, test helpers
-  agents/       (Phase 2)     agent runner, Anthropic + MockLlm clients, prompts, definitions
+  agents/       @enmo/agents  agent runner, Anthropic + MockLlm clients, prompts, definitions, validators
   providers/    (Phase 3+)    visual providers, storage (local / R2), imaging, publishers, OAuth, metrics
 scripts/
   services.sh   local Postgres :54329 + Redis :63799 (up | down | status | env | createdb <name>)
@@ -206,7 +267,10 @@ pnpm dev                            # API :4000 (embedded worker, mock LLM) + we
 ```
 
 Open <http://localhost:3000> and sign in with the seed admin. The Command Center greets you with
-"The Arsenal is idle. Give it a brief." Go to **Clients → New client** to set up a brand.
+"The Arsenal is idle. Give it a brief." Go to **Clients → New client** to set up a brand, then
+brief a campaign in **The Brief**. With the mock LLM the Manager answers within seconds;
+`MOCK_LLM_DELAY_MS` in `apps/api/.env` (300 in the example) paces the agents so you can watch the
+progress arrive.
 
 There are two other ways to create users:
 
@@ -230,13 +294,13 @@ eval "$(scripts/services.sh env)"                  # the suites need Postgres + 
 pnpm turbo run lint typecheck
 pnpm turbo run test                                # every package: unit + integration
 pnpm --filter @enmo/api test:unit                  # no services needed
-pnpm --filter @enmo/api test:integration           # app.inject against enmo_test, truncated per test
+pnpm --filter @enmo/api test:integration           # test/integration + test/e2e against enmo_test
 pnpm --filter @enmo/shared test
 pnpm --filter @enmo/web test                       # web unit tests (pure modules, e.g. safe redirects)
 pnpm --filter @enmo/db test                        # schema drift + seed, in enmo_test_dbpkg (needs services)
 
 pnpm --filter @enmo/web test:e2e                   # Playwright, all specs
-pnpm --filter @enmo/web test:e2e -- phase1         # one phase
+pnpm --filter @enmo/web test:e2e -- phase2         # one phase
 
 pnpm --filter @enmo/api build && node scripts/smoke-api.mjs   # boot the bundle: /healthz, /readyz
 pnpm --filter @enmo/web build:cf                   # OpenNext build for Cloudflare Workers
@@ -247,6 +311,11 @@ pnpm format:check
   run `prisma migrate deploy` once, then truncate every table before each test. They refuse any
   database whose name lacks `test` or `e2e`. `@enmo/db` uses its own `enmo_test_dbpkg`, so both
   suites can run in parallel under turbo.
+- **Pipeline e2e.** `apps/api/test/e2e/phaseN.*` run in the integration project through
+  `startHarness()`: the app listening on a free port, in-process BullMQ workers on a unique queue
+  prefix, the MockLlm and a FakeClock. The SSE stream is read over the real port, scheduler ticks
+  are called directly, and `waitFor` polls the database. `phase2.brief-to-approval` is the Phase 2
+  exit test; `phase2.faults` covers `MOCK_LLM_FAULTS` and `DAILY_TOKEN_CAP`.
 - **Playwright.** The config starts the API from source on port 4100 (tsx, embedded worker, mock
   LLM, dry-run publishing) against a fresh `enmo_e2e` database. It starts the web app on port 3100
   with `next build && next start`. Every run starts its own servers: if port 4100 or 3100 is
@@ -301,8 +370,8 @@ combination stops the process at boot with a list of the problems, for example
 | ------------------------ | ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------- |
 | `DATABASE_URL`           | `postgresql://postgres@127.0.0.1:54329/enmo_dev` | Postgres connection string. On Render it comes from `enmo-db`.                                                    |
 | `REDIS_URL`              | `redis://127.0.0.1:63799`                        | Redis for BullMQ, realtime pub/sub and OAuth state. `rediss://` enables TLS (Upstash).                            |
-| `BULLMQ_PREFIX`          | `enmo`                                           | Key prefix for every queue. Tests use a unique one.                                                               |
-| `BULLMQ_DRAIN_DELAY_SEC` | `5`                                              | Seconds an idle worker blocks waiting for jobs. Production uses `20`, which keeps Upstash command costs down.     |
+| `BULLMQ_PREFIX`          | `enmo`                                           | Key prefix for every queue and the realtime pub/sub channel (`<prefix>:rt`). Tests use a unique one.              |
+| `BULLMQ_DRAIN_DELAY_SEC` | `20` in production, else `5`                     | Seconds an idle worker blocks waiting for jobs. The production default keeps Upstash command costs down.          |
 | `EMBEDDED_WORKER`        | `false`                                          | Run the queue consumers inside the API process. `pnpm dev` and the Render free tier set it to `true`.             |
 | `SCHEDULERS_ENABLED`     | `true`                                           | Register the repeatable ticks (publish, metrics, tokens, analyst, sweeper, prune). Tests call the ticks directly. |
 
@@ -318,7 +387,10 @@ combination stops the process at boot with a list of the problems, for example
 | `AGENT_CONCURRENCY`       | `4`                                                    | Concurrency of the `agents` queue (LLM work).                                                                                        |
 | `MEDIA_CONCURRENCY`       | `4`                                                    | Concurrency of the `media` queue (renders, adapting).                                                                                |
 | `PIPELINE_ACTIONS`        | `write,qa`                                             | Comma list of per-post actions the Manager may plan, from `strategy`, `write`, `direct`, `adapt` and `qa`. It widens phase by phase. |
+| `MAX_QA_REVISIONS`        | `1`                                                    | Automatic Manager QA revisions per post (0–3). After that the post goes to humans with the QA notes.                                 |
 | `MOCK_LLM_FAULTS`         | none                                                   | MockLlm fault injection for tests, e.g. `COPYWRITER.write:invalid*2,VISUAL_DIRECTOR.review:weak*3`.                                  |
+| `MOCK_LLM_DELAY_MS`       | `0`                                                    | MockLlm latency per call (0–60000 ms), so a local demo shows progress arriving live instead of all at once.                          |
+| `AGENT_EFFORT_<AGENT>`    | per action                                             | `low`, `medium`, `high`, `xhigh` or `max` for every action of one agent, e.g. `AGENT_EFFORT_COPYWRITER=high`.                        |
 
 **Visuals**
 

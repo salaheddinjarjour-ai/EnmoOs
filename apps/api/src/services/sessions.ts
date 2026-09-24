@@ -89,11 +89,21 @@ export interface ResolvedSession {
   refreshed: boolean;
 }
 
+export interface ResolveSessionOptions {
+  /**
+   * Roll the session when a refresh is due (the default). False for a caller that can't re-issue
+   * the cookie (a hijacked SSE reply): rolling only the row would let the server session outlive
+   * the browser's cookie, and take the refresh window from a request that could have re-issued it.
+   */
+  refresh?: boolean;
+}
+
 /** The live session for a cookie token, or null when unknown, expired or its user is inactive. */
 export async function resolveSession(
   db: DbClient,
   token: string,
   timing: SessionTiming,
+  { refresh = true }: ResolveSessionOptions = {},
 ): Promise<ResolvedSession | null> {
   const session = await db.session.findUnique({
     where: { tokenHash: sha256(token) },
@@ -115,7 +125,7 @@ export async function resolveSession(
   if (!isActive) return null;
 
   let refreshed = false;
-  if (isRefreshDue(session.lastSeenAt, now)) {
+  if (refresh && isRefreshDue(session.lastSeenAt, now)) {
     // Matching on the old lastSeenAt lets exactly one of several concurrent requests refresh.
     const { count } = await db.session.updateMany({
       where: { id: session.id, lastSeenAt: session.lastSeenAt },

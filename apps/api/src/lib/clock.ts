@@ -16,6 +16,22 @@ export const systemClock: Clock = {
   now: () => new Date(),
 };
 
+/**
+ * "YYYY-MM-DD": the calendar day `instant` falls on in the IANA `timeZone` (RangeError for an
+ * unknown zone). A client's "today" is this in its own time zone, not the UTC day.
+ */
+export function calendarDay(instant: Date, timeZone: string): string {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(instant);
+  const part = (type: Intl.DateTimeFormatPartTypes) =>
+    parts.find((candidate) => candidate.type === type)?.value ?? "";
+  return `${part("year").padStart(4, "0")}-${part("month")}-${part("day")}`;
+}
+
 type Instant = Date | string | number;
 
 function toEpochMs(instant: Instant): number {

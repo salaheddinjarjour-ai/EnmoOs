@@ -14,6 +14,13 @@ export type Id = z.infer<typeof Id>;
 export const IsoDateTime = z.iso.datetime({ offset: true });
 export type IsoDateTime = z.infer<typeof IsoDateTime>;
 
+/**
+ * Calendar dates ("2026-03-01"), e.g. `@db.Date` columns and brief windows. Plain `YYYY-MM-DD`
+ * strings compare correctly with `<`/`>`, which the task-graph validator relies on.
+ */
+export const IsoDate = z.iso.date();
+export type IsoDate = z.infer<typeof IsoDate>;
+
 /** Emails are compared and stored lowercased. */
 export const Email = z.string().trim().toLowerCase().max(254).pipe(z.email());
 export type Email = z.infer<typeof Email>;
@@ -28,6 +35,25 @@ export const UserRef = z.object({
   email: z.string(),
 });
 export type UserRef = z.infer<typeof UserRef>;
+
+/** A person or entity named on another resource where the email isn't needed. */
+export const NamedRef = z.object({
+  id: Id,
+  name: z.string(),
+});
+export type NamedRef = z.infer<typeof NamedRef>;
+
+export const VERBATIM_TEXT_MAX_LENGTH = 4000;
+
+/**
+ * Reviewer feedback that reaches an agent byte-for-byte (DESIGN "Request Changes"). Deliberately
+ * not trimmed or otherwise rewritten; it only has to contain something besides whitespace.
+ */
+export const VerbatimText = z
+  .string()
+  .min(1)
+  .max(VERBATIM_TEXT_MAX_LENGTH)
+  .refine((text) => text.trim().length > 0, "Can't be blank");
 
 /** List endpoints return `{ items }`; single-resource endpoints return the DTO itself. */
 export function listResponse<T extends z.ZodType>(item: T) {

@@ -39,6 +39,31 @@ describe("toErrorResponse", () => {
     expect(toErrorResponse(known("P2003")).status).toBe(500);
   });
 
+  it("maps a transaction Postgres aborted for another one (deadlock, serialization) to 409", () => {
+    const conflict = { code: "CONFLICT", message: expect.any(String) as string };
+    const deadlock = new Prisma.PrismaClientKnownRequestError("deadlock detected", {
+      code: "P2034",
+      clientVersion: "7.10.0",
+      meta: {
+        driverAdapterError: {
+          name: "DriverAdapterError",
+          cause: { originalCode: "40P01", kind: "TransactionWriteConflict" },
+        },
+      },
+    });
+    expect(toErrorResponse(deadlock)).toEqual({ status: 409, body: { error: conflict } });
+    // A raw query (a row lock) reports the driver's error under its own code.
+    const raw = (originalCode: string) =>
+      new Prisma.PrismaClientKnownRequestError("raw query failed", {
+        code: "P2010",
+        clientVersion: "7.10.0",
+        meta: { driverAdapterError: { name: "DriverAdapterError", cause: { originalCode } } },
+      });
+    expect(toErrorResponse(raw("40001")).status).toBe(409);
+    expect(toErrorResponse(raw("40P01")).status).toBe(409);
+    expect(toErrorResponse(raw("23503")).status).toBe(500);
+  });
+
   it("keeps 4xx framework errors (including rate-limit objects) and hides 5xx details", () => {
     expect(toErrorResponse({ statusCode: 429, message: "Rate limit exceeded" })).toEqual({
       status: 429,

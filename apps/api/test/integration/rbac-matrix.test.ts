@@ -4,14 +4,16 @@ import type { RouteAccess } from "../../src/plugins/rbac";
 import { browserHeaders, buildTestApp, type TestApp } from "../helpers/app";
 import { sessionCookieFor } from "../helpers/auth";
 import { createUser, type TestUser } from "../helpers/factories";
+import { testCopy } from "../helpers/route-fixtures";
 
 /*
- * The RBAC matrix (DESIGN §E) against every Phase 1 route: auth, users, audit, invites, clients,
- * social accounts, capabilities and health.
+ * The RBAC matrix (DESIGN §E) against every route: Phase 1's auth, users, audit, invites, clients,
+ * social accounts, capabilities and health, and Phase 2's campaigns, threads, plans, tasks, posts,
+ * approvals, budget and the SSE stream.
  *
  * 1. Statically: the access rule each route declares (recorded by plugins/rbac.ts) must equal the
- *    table below, and every registered route under a Phase 1 prefix must appear in it. A new route
- *    under these prefixes (e.g. Phase 6's POST /clients/:id/analyze) has to be added here.
+ *    table below, and every registered route must appear in it. A new route (e.g. Phase 6's
+ *    POST /clients/:id/analyze) has to be added here.
  * 2. Behaviourally: for each route, no session → 401; each role → 403 exactly when
  *    ROLE_CAPABILITIES (the shared matrix) lacks the route's capability, otherwise the request gets
  *    past the guard. Requests carry valid bodies and point at missing ids, so an allowed call ends
@@ -175,6 +177,106 @@ const ROUTES: readonly RouteCase[] = [
 
   // ── system ──
   { method: "GET", route: "/v1/capabilities", access: "session" },
+  { method: "GET", route: "/v1/budget", access: "budget.read" },
+
+  // ── campaigns and chat (Phase 2) ──
+  { method: "GET", route: "/v1/campaigns", access: "campaigns.read" },
+  {
+    method: "POST",
+    route: "/v1/campaigns",
+    access: "campaigns.create",
+    // An unknown client: allowed callers get 404 and nothing is created or queued.
+    payload: () => ({ clientId: MISSING, message: "Matrix brief, 3 posts" }),
+  },
+  {
+    method: "GET",
+    route: "/v1/campaigns/:id",
+    access: "campaigns.read",
+    url: `/v1/campaigns/${MISSING}`,
+  },
+  {
+    method: "POST",
+    route: "/v1/campaigns/:id/archive",
+    access: "campaigns.archive",
+    url: `/v1/campaigns/${MISSING}/archive`,
+  },
+  {
+    method: "GET",
+    route: "/v1/threads/:id/messages",
+    access: "campaigns.read",
+    url: `/v1/threads/${MISSING}/messages`,
+  },
+  {
+    method: "POST",
+    route: "/v1/threads/:id/messages",
+    access: "chat.post",
+    url: `/v1/threads/${MISSING}/messages`,
+    payload: () => ({ content: "Instagram only, please." }),
+  },
+
+  // ── plans and tasks (Phase 2) ──
+  {
+    method: "GET",
+    route: "/v1/task-graphs/:id",
+    access: "campaigns.read",
+    url: `/v1/task-graphs/${MISSING}`,
+  },
+  {
+    method: "POST",
+    route: "/v1/task-graphs/:id/approve",
+    access: "plan.approve",
+    url: `/v1/task-graphs/${MISSING}/approve`,
+  },
+  {
+    method: "POST",
+    route: "/v1/task-graphs/:id/request-changes",
+    access: "plan.requestChanges",
+    url: `/v1/task-graphs/${MISSING}/request-changes`,
+    payload: () => ({ feedback: "Fewer statics, more reels." }),
+  },
+  {
+    method: "GET",
+    route: "/v1/campaigns/:id/tasks",
+    access: "campaigns.read",
+    url: `/v1/campaigns/${MISSING}/tasks`,
+  },
+  {
+    method: "POST",
+    route: "/v1/agent-tasks/:id/resolve",
+    access: "tasks.resolveEscalation",
+    url: `/v1/agent-tasks/${MISSING}/resolve`,
+    payload: () => ({ action: "retry" }),
+  },
+
+  // ── posts and approvals (Phase 2) ──
+  { method: "GET", route: "/v1/posts", access: "posts.read" },
+  { method: "GET", route: "/v1/posts/:id", access: "posts.read", url: `/v1/posts/${MISSING}` },
+  {
+    method: "PATCH",
+    route: "/v1/posts/:id/copy",
+    access: "posts.editCopy",
+    url: `/v1/posts/${MISSING}/copy`,
+    payload: () => ({ copy: testCopy() }),
+  },
+  { method: "GET", route: "/v1/approvals", access: "posts.read" },
+  {
+    method: "POST",
+    route: "/v1/approvals/:id/decision",
+    access: "approvals.decide",
+    url: `/v1/approvals/${MISSING}/decision`,
+    payload: () => ({ decision: "APPROVE" }),
+  },
+  {
+    method: "POST",
+    route: "/v1/approvals/approve-all",
+    access: "approvals.approveAll",
+    // Unknown ids are reported as skipped: a 200 that changes nothing.
+    payload: () => ({ requestIds: [MISSING] }),
+  },
+
+  // ── realtime (Phase 2) ──
+  // An unknown thread answers 404 before the stream opens, so allowed calls return.
+  { method: "GET", route: "/v1/events", access: "session", url: `/v1/events?threadId=${MISSING}` },
 ];
 
 /*
@@ -263,17 +365,21 @@ describe("enforced access", () => {
   );
 });
 
-/** Invalid for every Phase 1 query schema that has these keys (audit limit, clients flag). */
-const INVALID_QUERY = "limit=0&includeArchived=maybe";
+/**
+ * Invalid for every query schema that has these keys (audit limit, clients flag, campaign and post
+ * filters, the SSE cursor).
+ */
+const INVALID_QUERY = "limit=0&includeArchived=maybe&status=NOPE&platform=NOPE&lastEventId=x";
 /** Not an object, so no body schema accepts it. */
 const INVALID_BODY = ["not", "a", "request", "body"];
 const BODY_METHODS: ReadonlySet<Method> = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 
 function invalidCall(routeCase: RouteCase, fixture: Fixture, cookie?: string) {
+  const url = routeCase.url ?? routeCase.route;
   return call(
     {
       ...routeCase,
-      url: `${routeCase.url ?? routeCase.route}?${INVALID_QUERY}`,
+      url: `${url}${url.includes("?") ? "&" : "?"}${INVALID_QUERY}`,
       ...(BODY_METHODS.has(routeCase.method) ? { payload: () => INVALID_BODY } : {}),
     },
     fixture,

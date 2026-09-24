@@ -2,7 +2,12 @@ import { SESSION_COOKIE_NAME, type Role } from "@enmo/shared";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import fp from "fastify-plugin";
 import { unauthenticated } from "../lib/errors";
-import { resolveSession, sessionCookieOptions, type RequestMeta } from "../services/sessions";
+import {
+  resolveSession,
+  sessionCookieOptions,
+  type RequestMeta,
+  type ResolveSessionOptions,
+} from "../services/sessions";
 
 /*
  * Session authentication (DESIGN §E). The exported names and the `request.user` shape are the
@@ -42,16 +47,24 @@ export function requestMeta(request: FastifyRequest): RequestMeta {
   return { ip: request.clientIp || null, userAgent: userAgent ? userAgent.slice(0, 512) : null };
 }
 
-/** Resolves the session cookie to an active user, or null. Does not throw. */
-export async function resolveSessionUser(request: FastifyRequest): Promise<AuthUser | null> {
+/**
+ * Resolves the session cookie to an active user, or null. Does not throw. With `refresh: false`
+ * the session is only checked, never rolled (see ResolveSessionOptions).
+ */
+export async function resolveSessionUser(
+  request: FastifyRequest,
+  options: ResolveSessionOptions = {},
+): Promise<AuthUser | null> {
   const token = sessionToken(request);
   if (!token) return null;
 
   const { prisma, clock, config } = request.server.deps;
-  const session = await resolveSession(prisma, token, {
-    now: clock.now(),
-    ttlDays: config.SESSION_TTL_DAYS,
-  });
+  const session = await resolveSession(
+    prisma,
+    token,
+    { now: clock.now(), ttlDays: config.SESSION_TTL_DAYS },
+    options,
+  );
   if (!session) return null;
   if (session.refreshed) cookieRefreshes.set(request, token);
   return { ...session.user, sessionId: session.id };
@@ -60,6 +73,16 @@ export async function resolveSessionUser(request: FastifyRequest): Promise<AuthU
 /** onRequest guard: 401 unless the request carries a valid session. */
 export async function authenticate(request: FastifyRequest): Promise<void> {
   request.user ??= await resolveSessionUser(request);
+  if (!request.user) throw unauthenticated();
+}
+
+/**
+ * `authenticate` for a route that hijacks its reply (the SSE stream): onSend never runs there, so
+ * a rolled session's cookie could never be re-issued. The session is checked without rolling it;
+ * the app's ordinary requests roll it, cookie included.
+ */
+export async function authenticateWithoutRefresh(request: FastifyRequest): Promise<void> {
+  request.user ??= await resolveSessionUser(request, { refresh: false });
   if (!request.user) throw unauthenticated();
 }
 

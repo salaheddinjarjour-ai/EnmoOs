@@ -5,14 +5,16 @@ import { Button } from "@/components/ui/Button";
 import { FormAlert } from "@/components/ui/Field";
 import { LoadingRegion, Skeleton } from "@/components/ui/Skeleton";
 import { Tabs, type TabItem } from "@/components/ui/Tabs";
+import { ClientPipeline } from "@/components/kanban/ClientPipeline";
 import { useArchivedClientCount, useClients } from "@/hooks/useClients";
 import { errorMessage } from "@/lib/api";
 import { useCan } from "@/lib/auth";
 import { ArsenalIdle } from "./ArsenalIdle";
 
 /*
- * Command Center shell (Phase 1): one tab per active client over the idle-Arsenal empty state. The
- * pipeline kanban, alerts, growth tiles and learnings feed fill these panels in Phase 6.
+ * Command Center: one tab per active client. Each tab shows its alerts over the pipeline kanban
+ * (Phase 2), or the idle-Arsenal empty state while the client has no posts. Growth tiles and the
+ * learnings feed join these panels in Phase 6.
  */
 export function CommandCenter() {
   const clients = useClients();
@@ -48,11 +50,15 @@ export function CommandCenter() {
               id: "all",
               label: "All clients",
               content: (
-                <ArsenalIdle
-                  noActiveClients={
-                    clients.data.length === 0 && archivedCount !== undefined
-                      ? { archived: archivedCount }
-                      : undefined
+                <ClientPipeline
+                  empty={
+                    <ArsenalIdle
+                      noActiveClients={
+                        clients.data.length === 0 && archivedCount !== undefined
+                          ? { archived: archivedCount }
+                          : undefined
+                      }
+                    />
                   }
                 />
               ),
@@ -60,7 +66,9 @@ export function CommandCenter() {
             ...clients.data.map((client): TabItem => ({
               id: client.id,
               label: client.name,
-              content: <ArsenalIdle client={client} />,
+              content: (
+                <ClientPipeline clientId={client.id} empty={<ArsenalIdle client={client} />} />
+              ),
             })),
           ]}
         />

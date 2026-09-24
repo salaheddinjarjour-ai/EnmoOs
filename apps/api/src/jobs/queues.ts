@@ -1,0 +1,294 @@
+import { Id, VerbatimText } from "@enmo/shared";
+import { Queue, UnrecoverableError, type DefaultJobOptions, type JobsOptions } from "bullmq";
+import type { Redis } from "ioredis";
+import { z } from "zod";
+import type { Config } from "../config";
+import { AppError } from "../lib/errors";
+import type { Logger } from "../lib/logger";
+import { closeRedis, createProducerConnection } from "./connection";
+
+/*
+ * The three BullMQ queues, every job name with its payload schema and deterministic job id, and
+ * the producer side (DESIGN §D). Processors live in processors/*.ts and are wired by registry.ts;
+ * runtime.ts consumes.
+ *
+ *   agents  LLM work                         concurrency AGENT_CONCURRENCY
+ *   media   rendering and adapting (Phase 3)  concurrency MEDIA_CONCURRENCY
+ *   ops     publishing, metrics, ticks        concurrency 2
+ */
+
+export const QUEUE_NAMES = ["agents", "media", "ops"] as const;
+export type QueueName = (typeof QUEUE_NAMES)[number];
+
+export const OPS_CONCURRENCY = 2;
+
+export function queueConcurrency(config: Config, queue: QueueName): number {
+  switch (queue) {
+    case "agents":
+      return config.AGENT_CONCURRENCY;
+    case "media":
+      return config.MEDIA_CONCURRENCY;
+    case "ops":
+      return OPS_CONCURRENCY;
+  }
+}
+
+/* ─── job names and payloads ─────────────────────────────────────────────────────────────────── */
+
+export const JOB = {
+  /** Read the thread, then ask the one clarifying question or lock the brief. */
+  managerIntake: "manager.intake",
+  /** Propose TaskGraph `version` for the campaign's brief (a re-plan carries the change request). */
+  managerPlan: "manager.plan",
+  /** Run one AgentTask of an approved graph. */
+  taskRun: "task.run",
+  /** Every 5 min: stuck RUNNING tasks, BLOCKED_BUDGET after the UTC day rolls, stale WAITING. */
+  tickSweeper: "tick.sweeper",
+  /** Daily: RealtimeEvent rows older than 7 days and expired Session rows. */
+  tickPrune: "tick.prune",
+} as const;
+export type JobName = (typeof JOB)[keyof typeof JOB];
+
+export const TICK_JOB_NAMES = [JOB.tickSweeper, JOB.tickPrune] as const;
+export type TickJobName = (typeof TICK_JOB_NAMES)[number];
+
+/** The queue each job runs on. */
+export const JOB_QUEUE: Readonly<Record<JobName, QueueName>> = {
+  "manager.intake": "agents",
+  "manager.plan": "agents",
+  "task.run": "agents",
+  "tick.sweeper": "ops",
+  "tick.prune": "ops",
+};
+
+/** A short token that makes a deliberate re-queue a new job, e.g. "stall1" or "budget-2026-09-25". */
+export const RequeueToken = z.string().regex(/^[A-Za-z0-9._-]{1,48}$/);
+
+export const ManagerIntakeJob = z.object({
+  campaignId: Id,
+  /** The USER ChatMessage this intake answers (the brief, or the reply to the clarify). */
+  messageId: Id,
+});
+export type ManagerIntakeJob = z.infer<typeof ManagerIntakeJob>;
+
+export const ManagerPlanJob = z.object({
+  campaignId: Id,
+  /** The TaskGraph version to create: 1, or n+1 after a plan change request. */
+  version: z.int().positive(),
+  /** The reviewer's plan feedback, byte-for-byte; null for version 1. */
+  changeRequest: VerbatimText.nullable(),
+  /** The graph being replaced (SUPERSEDED once the new one is proposed). */
+  previousGraphId: Id.nullable(),
+});
+export type ManagerPlanJob = z.infer<typeof ManagerPlanJob>;
+
+export const TaskRunJob = z.object({
+  taskId: Id,
+  /** AgentTask.revision (0 for the planned node, N for an .rN revision node). */
+  revision: z.int().nonnegative(),
+  /** Set when the sweeper, the budget roll-over or a manual retry queues the task again. */
+  requeue: RequeueToken.nullable(),
+});
+export type TaskRunJob = z.infer<typeof TaskRunJob>;
+
+/** Scheduler ticks carry no data; everything they act on is read from the database. */
+export const TickJob = z.object({});
+export type TickJob = z.infer<typeof TickJob>;
+
+export const JOB_PAYLOADS = {
+  "manager.intake": ManagerIntakeJob,
+  "manager.plan": ManagerPlanJob,
+  "task.run": TaskRunJob,
+  "tick.sweeper": TickJob,
+  "tick.prune": TickJob,
+} as const satisfies Record<JobName, z.ZodType>;
+export type JobData<N extends JobName> = z.infer<(typeof JOB_PAYLOADS)[N]>;
+
+/**
+ * Validates a job's data inside its processor. Jobs outlive deploys, so a processor never trusts
+ * the shape its producer had in mind. Malformed data fails the job for good: a retry carries the
+ * same data.
+ */
+export function parseJobData<N extends JobName>(name: N, data: unknown): JobData<N> {
+  const parsed = JOB_PAYLOADS[name].safeParse(data);
+  if (!parsed.success) {
+    throw new UnrecoverableError(`Invalid ${name} job data: ${z.prettifyError(parsed.error)}`);
+  }
+  return parsed.data as JobData<N>;
+}
+
+/* ─── job ids ────────────────────────────────────────────────────────────────────────────────── */
+
+/*
+ * Deterministic ids make every enqueue idempotent: BullMQ ignores an add whose id already exists,
+ * and finished jobs are kept for a day (removeOnComplete), so a duplicate trigger in that window
+ * is a no-op. DESIGN writes them as task:<id>:r<revision>, but BullMQ rejects custom ids containing
+ * ":" (it tolerates exactly three segments only for legacy repeatable jobs), hence "-".
+ */
+export const jobIds = {
+  managerIntake: ({ campaignId, messageId }: ManagerIntakeJob) =>
+    `intake-${campaignId}-${messageId}`,
+  managerPlan: ({ campaignId, version }: Pick<ManagerPlanJob, "campaignId" | "version">) =>
+    `plan-${campaignId}-v${version}`,
+  taskRun: ({ taskId, revision, requeue }: TaskRunJob) =>
+    `task-${taskId}-r${revision}${requeue ? `-${requeue}` : ""}`,
+} as const;
+
+/* ─── options ────────────────────────────────────────────────────────────────────────────────── */
+
+const KEEP_COMPLETED = { age: 86_400, count: 1_000 } as const;
+const KEEP_FAILED = { age: 604_800 } as const;
+
+/**
+ * Transport errors (429, 5xx, connection) are retried by the Anthropic SDK first, then by BullMQ:
+ * 3 attempts with exponential backoff from 5s. Contract failures escalate instead of throwing, so
+ * only transport and infrastructure errors reach these attempts; a processor may still have done
+ * part of its work before one, so every processor must be safe to run again.
+ */
+export const DEFAULT_JOB_OPTIONS = {
+  attempts: 3,
+  backoff: { type: "exponential", delay: 5_000 },
+  removeOnComplete: KEEP_COMPLETED,
+  removeOnFail: KEEP_FAILED,
+} as const satisfies DefaultJobOptions;
+
+/** Per-job overrides of DEFAULT_JOB_OPTIONS: a failed tick is simply redone by the next one. */
+export const JOB_OPTIONS: Readonly<Partial<Record<JobName, JobsOptions>>> = {
+  "tick.sweeper": { attempts: 1 },
+  "tick.prune": { attempts: 1 },
+};
+
+/** BullMQ Worker settings shared by every queue (runtime.ts adds concurrency and drainDelay). */
+export const WORKER_SETTINGS = {
+  stalledInterval: 60_000,
+  removeOnComplete: KEEP_COMPLETED,
+  removeOnFail: KEEP_FAILED,
+} as const;
+
+/* ─── producer ───────────────────────────────────────────────────────────────────────────────── */
+
+/** How long an enqueue waits for a producer connection that never came up (Redis down at boot). */
+export const ENQUEUE_READY_TIMEOUT_MS = 5_000;
+
+export interface EnqueueOptions {
+  /** Deterministic id from `jobIds` (or another stable key); a repeat add is a no-op. */
+  jobId: string;
+  delayMs?: number;
+}
+
+/** The producer side of the queues, shared by the API and the worker (deps.queues). */
+export interface JobQueues {
+  /** BULLMQ_PREFIX, or a test's override. Workers must consume with this same prefix. */
+  readonly prefix: string;
+  /** The BullMQ Queue for `name`, created (and connected) on first use. */
+  queue(name: QueueName): Queue;
+  /**
+   * Validates `data` against the job's schema and adds it to its queue. Resolves to the job id;
+   * rejects with UNAVAILABLE when Redis can't take the job.
+   */
+  add<N extends JobName>(name: N, data: JobData<N>, options: EnqueueOptions): Promise<string>;
+  /** Closes the Queue instances and their connection. */
+  close(): Promise<void>;
+}
+
+export interface JobQueuesOptions {
+  redisUrl: string;
+  prefix: string;
+  logger: Logger;
+  /** Defaults to ENQUEUE_READY_TIMEOUT_MS. */
+  readyTimeoutMs?: number;
+}
+
+function unavailable(cause?: unknown): AppError {
+  return new AppError("UNAVAILABLE", "The job queue is unavailable, try again shortly", { cause });
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(unavailable()), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+export function createJobQueues({
+  redisUrl,
+  prefix,
+  logger,
+  readyTimeoutMs = ENQUEUE_READY_TIMEOUT_MS,
+}: JobQueuesOptions): JobQueues {
+  let connection: Redis | undefined;
+  const queues = new Map<QueueName, Queue>();
+  let closing: Promise<void> | undefined;
+
+  const queue = (name: QueueName): Queue => {
+    if (closing) throw new Error("Job queues are closed");
+    let existing = queues.get(name);
+    if (!existing) {
+      // Created on first use, so processes and tests that never enqueue never connect.
+      connection ??= createProducerConnection(redisUrl, logger);
+      existing = new Queue(name, { connection, prefix, defaultJobOptions: DEFAULT_JOB_OPTIONS });
+      existing.on("error", (error: Error) =>
+        logger.warn({ err: error, queue: name }, "job queue error"),
+      );
+      queues.set(name, existing);
+    }
+    return existing;
+  };
+
+  const add = async <N extends JobName>(
+    name: N,
+    data: JobData<N>,
+    options: EnqueueOptions,
+  ): Promise<string> => {
+    const payload = JOB_PAYLOADS[name].parse(data);
+    if (options.jobId.includes(":")) {
+      throw new Error(`Job ids must not contain ":" (BullMQ rejects them): ${options.jobId}`);
+    }
+    const target = queue(JOB_QUEUE[name]);
+    // Until the first connection is up BullMQ waits forever; bound that for the caller.
+    await withTimeout(target.waitUntilReady(), readyTimeoutMs);
+    try {
+      const job = await target.add(name, payload, {
+        ...JOB_OPTIONS[name],
+        jobId: options.jobId,
+        ...(options.delayMs ? { delay: options.delayMs } : {}),
+      });
+      return job.id ?? options.jobId;
+    } catch (error) {
+      // With the offline queue off, an outage surfaces here immediately.
+      if (connection?.status !== "ready") throw unavailable(error);
+      throw error;
+    }
+  };
+
+  const close = (): Promise<void> =>
+    (closing ??= (async () => {
+      const results = await Promise.allSettled([...queues.values()].map((q) => q.close()));
+      for (const result of results) {
+        if (result.status === "rejected")
+          logger.warn({ err: result.reason }, "error while closing job queues");
+      }
+      if (connection) await closeRedis(connection);
+    })());
+
+  return { prefix, queue, add, close };
+}
+
+/* ─── typed enqueue helpers ──────────────────────────────────────────────────────────────────── */
+
+export function enqueueManagerIntake(queues: JobQueues, data: ManagerIntakeJob): Promise<string> {
+  return queues.add(JOB.managerIntake, data, { jobId: jobIds.managerIntake(data) });
+}
+
+export function enqueueManagerPlan(queues: JobQueues, data: ManagerPlanJob): Promise<string> {
+  return queues.add(JOB.managerPlan, data, { jobId: jobIds.managerPlan(data) });
+}
+
+export function enqueueTaskRun(
+  queues: JobQueues,
+  data: TaskRunJob,
+  options: { delayMs?: number } = {},
+): Promise<string> {
+  return queues.add(JOB.taskRun, data, { jobId: jobIds.taskRun(data), ...options });
+}

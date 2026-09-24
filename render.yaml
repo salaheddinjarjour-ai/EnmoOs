@@ -41,6 +41,7 @@ envVarGroups:
       - key: COREPACK_ENABLE_DOWNLOAD_PROMPT
         value: "0"
       # Queues live in Upstash: one prefix, and a longer idle poll to keep the command bill low.
+      # The prefix also names the realtime channel (enmo:rt), so the API and worker must share it.
       - key: BULLMQ_PREFIX
         value: enmo
       - key: BULLMQ_DRAIN_DELAY_SEC

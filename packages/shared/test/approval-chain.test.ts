@@ -234,13 +234,40 @@ describe("nextStateAfterDecision", () => {
     expect(early.ok && early.outcome.status).toBe("CHANGES_REQUESTED");
   });
 
+  it("holds a change request to the same eligibility as an approval (it starts spend)", () => {
+    const defaultChain = defaultApprovalChain();
+    expect(nextStateAfterDecision(pending(defaultChain), editor, "REQUEST_CHANGES")).toEqual({
+      ok: false,
+      reason: "NOT_ELIGIBLE",
+    });
+    // Step 1 belongs to its named approvers: the managers of step 0 can't send it back.
+    const atStepOne = pending(twoStepChain, 1, [
+      { step: 0, userId: manager1.id, decision: "APPROVE" },
+      { step: 0, userId: manager2.id, decision: "APPROVE" },
+    ]);
+    expect(nextStateAfterDecision(atStepOne, manager1, "REQUEST_CHANGES")).toEqual({
+      ok: false,
+      reason: "NOT_ELIGIBLE",
+    });
+    // A manager who already approved step 0 can't change their mind on it either.
+    const approvedOnce = pending(twoStepChain, 0, [
+      { step: 0, userId: manager1.id, decision: "APPROVE" },
+    ]);
+    expect(nextStateAfterDecision(approvedOnce, manager1, "REQUEST_CHANGES")).toEqual({
+      ok: false,
+      reason: "ALREADY_DECIDED",
+    });
+  });
+
   it("rejects decisions on resolved requests and out-of-range steps", () => {
     for (const status of ["APPROVED", "CHANGES_REQUESTED", "CANCELLED"] as const) {
       const state = { ...pending(twoStepChain), status };
-      expect(nextStateAfterDecision(state, manager1, "APPROVE")).toEqual({
-        ok: false,
-        reason: "NOT_PENDING",
-      });
+      for (const decision of ["APPROVE", "REQUEST_CHANGES"] as const) {
+        expect(nextStateAfterDecision(state, manager1, decision)).toEqual({
+          ok: false,
+          reason: "NOT_PENDING",
+        });
+      }
       expect(canDecideRequest(state, manager1)).toBe(false);
     }
     expect(nextStateAfterDecision(pending(twoStepChain, 5), admin, "APPROVE")).toEqual({

@@ -2,7 +2,7 @@ import { can, type Capability } from "@enmo/shared";
 import type { FastifyInstance, FastifyRequest, RouteOptions } from "fastify";
 import fp from "fastify-plugin";
 import { AppError } from "../lib/errors";
-import { authenticate, currentUser } from "./auth";
+import { authenticate, authenticateWithoutRefresh, currentUser } from "./auth";
 
 /*
  * RBAC (DESIGN §E, matrix in @enmo/shared rbac.ts).
@@ -10,6 +10,7 @@ import { authenticate, currentUser } from "./auth";
  * Every route states who may call it, one of:
  *   onRequest: requireCap("clients.write")    capability check (implies a session)
  *   onRequest: authenticate                   any signed-in user
+ *     (or authenticateWithoutRefresh, for a hijacked reply that can't re-issue the cookie)
  *   config: { public: true }                  no session (login, invite preview, health)
  * Guards are onRequest hooks so they decide before the body is parsed and validated: a caller
  * without a session gets 401 (and a role without the capability 403) whatever it sends, never a
@@ -42,7 +43,10 @@ declare module "fastify" {
 
 type Guard = (request: FastifyRequest) => Promise<void>;
 
-const guardAccess = new WeakMap<Guard, RouteAccess>([[authenticate, "session"]]);
+const guardAccess = new WeakMap<Guard, RouteAccess>([
+  [authenticate, "session"],
+  [authenticateWithoutRefresh, "session"],
+]);
 
 /** onRequest guard factory: 401 without a session, 403 when the role lacks `capability`. */
 export function requireCap(capability: Capability): Guard {

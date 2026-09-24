@@ -3,6 +3,16 @@ export * from "./rbac";
 export * from "./approval-chain";
 export * from "./visual-style";
 export * from "./status";
+export * from "./pricing";
+export * from "./task-graph";
+export * from "./banned-words";
+export * from "./progress";
+export * from "./events";
+
+export * from "./contracts/issues";
+export * from "./contracts/common";
+export * from "./contracts/manager";
+export * from "./contracts/copywriter";
 
 export * from "./dto/common";
 export * from "./dto/user";
@@ -12,3 +22,10 @@ export * from "./dto/client";
 export * from "./dto/social-account";
 export * from "./dto/capabilities";
 export * from "./dto/audit";
+export * from "./dto/campaign";
+export * from "./dto/thread";
+export * from "./dto/task-graph";
+export * from "./dto/post";
+export * from "./dto/approval";
+export * from "./dto/budget";
+export * from "./dto/agent-task";

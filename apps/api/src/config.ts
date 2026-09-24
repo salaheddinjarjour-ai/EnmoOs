@@ -1,7 +1,12 @@
+import { EFFORT_LEVELS, parseMockFaults, type Effort } from "@enmo/agents";
 import {
+  AgentName,
+  DEFAULT_LLM_MODEL,
   Email,
   LlmProviderName,
+  MAX_QA_REVISIONS as DEFAULT_MAX_QA_REVISIONS,
   NewPassword,
+  orderPipelineActions,
   PipelineAction,
   PublishMode,
   StorageDriver,
@@ -23,9 +28,14 @@ export class ConfigError extends Error {
   override readonly name = "ConfigError";
 }
 
+/** Every plan drafts copy and ends in Manager QA, which opens the approval round. */
+export const REQUIRED_PIPELINE_ACTIONS: readonly PipelineAction[] = ["write", "qa"];
+
 const bool = (fallback: boolean) => z.stringbool().default(fallback);
 const int = (min: number, max: number) => z.coerce.number().int().min(min).max(max);
 const secret = z.string().trim().min(1);
+
+const EffortLevel = z.enum(EFFORT_LEVELS);
 
 const HttpUrl = z.url({ protocol: /^https?$/ }).transform((url) => url.replace(/\/+$/, ""));
 
@@ -106,8 +116,11 @@ const EnvSchema = z.object({
     .string()
     .regex(/^[A-Za-z0-9:_-]{1,64}$/)
     .default("enmo"),
-  /** Seconds an idle BullMQ worker blocks waiting for jobs (5 in dev, 20 in prod keeps Upstash cheap). */
-  BULLMQ_DRAIN_DELAY_SEC: int(1, 300).default(5),
+  /**
+   * Seconds an idle BullMQ worker blocks waiting for jobs. Defaults to 20 in production, which
+   * keeps Upstash command costs down, and 5 elsewhere.
+   */
+  BULLMQ_DRAIN_DELAY_SEC: int(1, 300).optional(),
   /** Run the queue consumers inside the API process (dev, Render free tier). */
   EMBEDDED_WORKER: bool(false),
   SCHEDULERS_ENABLED: bool(true),
@@ -118,15 +131,30 @@ const EnvSchema = z.object({
   ANTHROPIC_API_KEY: secret.optional(),
   /** Deliberately not ANTHROPIC_BASE_URL, so a developer shell's value is never picked up. */
   ENMO_ANTHROPIC_BASE_URL: HttpUrl.default("https://api.anthropic.com"),
-  ANTHROPIC_MODEL: z.string().trim().min(1).default("claude-sonnet-5"),
+  ANTHROPIC_MODEL: z.string().trim().min(1).default(DEFAULT_LLM_MODEL),
   /** Daily input+output token budget across all agents (UTC day). */
   DAILY_TOKEN_CAP: int(0, Number.MAX_SAFE_INTEGER).default(2_000_000),
   AGENT_CONCURRENCY: int(1, 64).default(4),
   MEDIA_CONCURRENCY: int(1, 64).default(4),
-  /** Per-post actions the Manager may plan; widened phase by phase. */
+  /**
+   * Per-post actions the Manager may plan, in any order; widened phase by phase as their agents
+   * arrive (Phase 3 adds direct, Phase 5 adapt, Phase 6 strategy).
+   */
   PIPELINE_ACTIONS: commaList(PipelineAction).default(["write", "qa"]),
+  /** Automatic QA → revision loops per post before it goes to humans with qaNotes anyway. */
+  MAX_QA_REVISIONS: int(0, 3).default(DEFAULT_MAX_QA_REVISIONS),
   /** MockLlm fault injection, e.g. "COPYWRITER.write:invalid*2,VISUAL_DIRECTOR.review:weak*3". */
   MOCK_LLM_FAULTS: z.string().trim().min(1).optional(),
+  /** MockLlm latency per call, so local demos show progress arriving live instead of at once. */
+  MOCK_LLM_DELAY_MS: int(0, 60_000).default(0),
+  /** `output_config.effort` for every action of one agent, over the DESIGN §C defaults. */
+  AGENT_EFFORT_MANAGER: EffortLevel.optional(),
+  AGENT_EFFORT_STRATEGIST: EffortLevel.optional(),
+  AGENT_EFFORT_COPYWRITER: EffortLevel.optional(),
+  AGENT_EFFORT_VISUAL_DIRECTOR: EffortLevel.optional(),
+  AGENT_EFFORT_ADAPTER: EffortLevel.optional(),
+  AGENT_EFFORT_ANALYST: EffortLevel.optional(),
+  AGENT_EFFORT_PUBLISHER: EffortLevel.optional(),
 
   // ── Visuals ──
   VISUAL_PROVIDER: VisualProviderName.default("mock"),
@@ -182,13 +210,50 @@ function decodeKey(value: string): Buffer | null {
   return bytes.length === 32 ? bytes : null;
 }
 
+/** PIPELINE_ACTIONS de-duplicated in pipeline order, plus what is wrong with the combination. */
+function resolvePipelineActions(listed: readonly PipelineAction[]) {
+  const actions = orderPipelineActions(listed);
+  const problems: string[] = [];
+  const missing = REQUIRED_PIPELINE_ACTIONS.filter((action) => !actions.includes(action));
+  if (missing.length > 0) {
+    problems.push(`PIPELINE_ACTIONS must include ${missing.join(" and ")}`);
+  }
+  if (actions.includes("adapt") && !actions.includes("direct")) {
+    problems.push(
+      "PIPELINE_ACTIONS: adapt reframes the Visual Director's masters, so it needs direct",
+    );
+  }
+  return { actions, problems };
+}
+
+/** The AGENT_EFFORT_<AGENT> values that are set. */
+function agentEffortOverrides(env: Env): Readonly<Partial<Record<AgentName, Effort>>> {
+  const overrides: Partial<Record<AgentName, Effort>> = {};
+  for (const agent of AgentName.options) {
+    const effort = env[`AGENT_EFFORT_${agent}`];
+    if (effort) overrides[agent] = effort;
+  }
+  return Object.freeze(overrides);
+}
+
 function resolveConfig(env: Env) {
   const problems: string[] = [];
   const isTest = env.NODE_ENV === "test";
 
+  const pipeline = resolvePipelineActions(env.PIPELINE_ACTIONS);
+  problems.push(...pipeline.problems);
+
   const llmProvider = env.LLM_PROVIDER ?? (env.ANTHROPIC_API_KEY ? "anthropic" : "mock");
   if (llmProvider === "anthropic" && !env.ANTHROPIC_API_KEY) {
     problems.push("LLM_PROVIDER=anthropic requires ANTHROPIC_API_KEY");
+  }
+  if (env.MOCK_LLM_FAULTS) {
+    // createLlm never throws, so a typo would otherwise only surface on the first mock call.
+    try {
+      parseMockFaults(env.MOCK_LLM_FAULTS);
+    } catch (error) {
+      problems.push(error instanceof Error ? error.message : String(error));
+    }
   }
   if (
     env.VISUAL_PROVIDER === "higgsfield" &&
@@ -232,7 +297,12 @@ function resolveConfig(env: Env) {
     ...env,
     LOG_LEVEL: env.LOG_LEVEL ?? (isTest ? "silent" : "info"),
     COOKIE_SECURE: env.COOKIE_SECURE ?? env.NODE_ENV === "production",
+    BULLMQ_DRAIN_DELAY_SEC: env.BULLMQ_DRAIN_DELAY_SEC ?? (env.NODE_ENV === "production" ? 20 : 5),
     LLM_PROVIDER: llmProvider,
+    /** In pipeline order, de-duplicated. */
+    PIPELINE_ACTIONS: pipeline.actions,
+    /** AGENT_EFFORT_<AGENT> overrides by agent; unset agents keep their definition's effort. */
+    AGENT_EFFORT: agentEffortOverrides(env),
     API_PUBLIC_URL: apiPublicUrl,
     PUBLIC_ASSET_BASE_URL:
       env.PUBLIC_ASSET_BASE_URL ??

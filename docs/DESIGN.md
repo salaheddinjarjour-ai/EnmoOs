@@ -543,6 +543,7 @@ Models, fields and relations (every model has `id String @id @default(cuid())`, 
 - **Sweeper:**
   - RUNNING for more than 15 minutes with no live job → re-queue once, then FAILED with an alert
   - BLOCKED_BUDGET → re-queue after the UTC day rolls over
+  - an APPROVED graph with PENDING tasks whose dependencies all SUCCEEDED → `advance` (the post-commit `advance` was lost to a crash or a failed follow-up)
   - drive any stale WAITING render polls
 - **Request Changes:**
   - the ApprovalDecision is saved with the verbatim feedback and a target; the post goes to CHANGES_REQUESTED and `revision` goes up by one
@@ -564,7 +565,7 @@ Models, fields and relations (every model has `id String @id @default(cuid())`, 
   - `learning.created`
   - `budget.updated`
   - `resync`
-- **Publisher** (`realtime/publisher.ts`): `publish(channel, type, payload)` inserts a RealtimeEvent row, then `PUBLISH enmo:rt {id, channel, type, payload}`. It works from both the worker and the API.
+- **Publisher** (`realtime/publisher.ts`): `publish(channel, type, payload)` inserts a RealtimeEvent row, then `PUBLISH <BULLMQ_PREFIX>:rt {id, channel, type, payload}` (`enmo:rt` by default; scoped by the prefix so deployments or test runs sharing a Redis never receive each other's events). It works from both the worker and the API.
 - **Hub** (`realtime/hub.ts`): one SUBSCRIBE connection per API process, fanning out to in-memory subscriber sets keyed by channel.
 - **Endpoint** `GET /v1/events?threadId=` (needs a session):
   - subscribes to `global`, plus `thread:<id>` when a thread is given

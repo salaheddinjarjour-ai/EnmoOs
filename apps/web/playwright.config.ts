@@ -76,6 +76,8 @@ export default defineConfig({
         LLM_PROVIDER: "mock",
         ANTHROPIC_API_KEY: "",
         MOCK_LLM_FAULTS: "",
+        // A little latency per mock call, so drafting progress streams in over SSE as it would live.
+        MOCK_LLM_DELAY_MS: "150",
         VISUAL_PROVIDER: "mock",
         PUBLISH_MODE: "dry-run",
         STORAGE_DRIVER: "local",

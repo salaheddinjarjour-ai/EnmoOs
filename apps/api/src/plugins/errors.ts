@@ -71,6 +71,20 @@ function messageOf(error: unknown): string {
     : "Request failed";
 }
 
+const WRITE_CONFLICT_SQLSTATES = new Set(["40001", "40P01"]);
+
+/** P2034, or a raw query's driver error carrying the same Postgres SQLSTATE. */
+function isWriteConflict(error: Prisma.PrismaClientKnownRequestError): boolean {
+  if (error.code === "P2034") return true;
+  const cause = (error.meta?.driverAdapterError as { cause?: unknown } | undefined)?.cause;
+  if (typeof cause !== "object" || cause === null) return false;
+  const { kind, originalCode } = cause as { kind?: unknown; originalCode?: unknown };
+  return (
+    kind === "TransactionWriteConflict" ||
+    (typeof originalCode === "string" && WRITE_CONFLICT_SQLSTATES.has(originalCode))
+  );
+}
+
 const zodIssues = (issues: readonly z.core.$ZodIssue[]) =>
   issues.map((issue) => ({ path: issue.path.map(String).join("."), message: issue.message }));
 
@@ -100,6 +114,11 @@ export function toErrorResponse(error: unknown): ErrorResponse {
   if (error instanceof Prisma.PrismaClientKnownRequestError) {
     if (error.code === "P2002") return response(409, "CONFLICT", "That already exists");
     if (error.code === "P2025") return response(404, "NOT_FOUND", "Resource not found");
+    if (isWriteConflict(error)) {
+      // Postgres aborted this transaction for another one (40P01 deadlock, 40001 serialization):
+      // nothing of it was stored, and the same click again will see what the other one did.
+      return response(409, "CONFLICT", "Someone else changed this at the same moment; try again");
+    }
   }
 
   const status = statusCodeOf(error);

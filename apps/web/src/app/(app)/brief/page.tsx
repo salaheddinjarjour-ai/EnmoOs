@@ -1,14 +1,9 @@
 import type { Metadata } from "next";
-import { ScreenPlaceholder } from "@/components/shell/ScreenPlaceholder";
+import { BriefScreen } from "@/components/chat/BriefScreen";
 
 export const metadata: Metadata = { title: "The Brief" };
 
-export default function BriefPage() {
-  return (
-    <ScreenPlaceholder
-      eyebrow="The Brief · Phase 2"
-      title="Where you run the agency."
-      description="One thread per campaign: brief the Manager, approve the plan, and watch the Arsenal draft every post live."
-    />
-  );
+export default async function BriefPage({ searchParams }: PageProps<"/brief">) {
+  const { clientId } = await searchParams;
+  return <BriefScreen clientId={typeof clientId === "string" ? clientId : undefined} />;
 }

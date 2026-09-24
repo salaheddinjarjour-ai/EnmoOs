@@ -1,13 +1,20 @@
 "use client";
 
 import type { ReactNode } from "react";
+import { BudgetMeter } from "@/components/dashboard/BudgetMeter";
+import { LiveStatus } from "@/components/dashboard/LiveStatus";
 import { Sidebar } from "@/components/ui/Sidebar";
 import { ToastProvider } from "@/components/ui/Toast";
 import { Topbar } from "@/components/ui/Topbar";
 import { AuthGate, useSession } from "@/lib/auth";
+import { RealtimeProvider } from "@/lib/realtime";
 import { SessionLoading, SessionUnavailable } from "./SessionScreens";
 
-/** The authenticated shell: session gate, primary navigation, top bar and toasts. */
+/**
+ * The authenticated shell: session gate, primary navigation, top bar (with the live-updates
+ * indicator and the daily token budget) and toasts. The one realtime stream lives here, so it
+ * opens with the session and survives navigation between screens.
+ */
 export function AppShell({ children }: { children: ReactNode }) {
   return (
     <AuthGate
@@ -15,7 +22,9 @@ export function AppShell({ children }: { children: ReactNode }) {
       failed={(retry) => <SessionUnavailable onRetry={retry} />}
     >
       <ToastProvider>
-        <SignedInLayout>{children}</SignedInLayout>
+        <RealtimeProvider>
+          <SignedInLayout>{children}</SignedInLayout>
+        </RealtimeProvider>
       </ToastProvider>
     </AuthGate>
   );
@@ -27,7 +36,10 @@ function SignedInLayout({ children }: { children: ReactNode }) {
     <div className="flex min-h-dvh">
       <Sidebar capabilities={capabilities} />
       <div className="flex min-w-0 flex-1 flex-col">
-        <Topbar />
+        <Topbar>
+          <LiveStatus />
+          <BudgetMeter />
+        </Topbar>
         <main className="flex-1 px-10 py-10">
           <div className="mx-auto w-full max-w-6xl">{children}</div>
         </main>

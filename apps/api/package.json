@@ -17,6 +17,8 @@
     "create-admin": "tsx --env-file-if-exists=.env src/scripts/create-admin.ts"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "0.128.0",
+    "@enmo/agents": "workspace:*",
     "@enmo/db": "workspace:*",
     "@enmo/shared": "workspace:*",
     "@fastify/cookie": "11.1.2",
@@ -25,6 +27,7 @@
     "@node-rs/argon2": "2.2.1",
     "@prisma/adapter-pg": "7.10.0",
     "@prisma/client": "7.10.0",
+    "bullmq": "6.3.8",
     "dotenv": "18.0.3",
     "fastify": "5.12.5",
     "fastify-plugin": "6.0.0",

@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { ConfigError, TEST_TOKEN_ENC_KEY, configuredIntegrations, loadConfig } from "./config";
+import {
+  ConfigError,
+  REQUIRED_PIPELINE_ACTIONS,
+  TEST_TOKEN_ENC_KEY,
+  configuredIntegrations,
+  loadConfig,
+} from "./config";
 
 const KEY_HEX = "ab".repeat(32);
 
@@ -63,13 +69,96 @@ describe("loadConfig", () => {
       EMBEDDED_WORKER: "true",
       COOKIE_SECURE: "1",
       SESSION_TTL_DAYS: "7",
-      PIPELINE_ACTIONS: "strategy,write,direct,adapt,qa",
     });
     expect(config.APP_ORIGINS).toEqual(["https://app.enmo.marketing", "http://localhost:3000"]);
     expect(config.EMBEDDED_WORKER).toBe(true);
     expect(config.COOKIE_SECURE).toBe(true);
     expect(config.SESSION_TTL_DAYS).toBe(7);
-    expect(config.PIPELINE_ACTIONS).toHaveLength(5);
+  });
+
+  it("orders and de-duplicates PIPELINE_ACTIONS", () => {
+    const config = loadConfig({ NODE_ENV: "test", PIPELINE_ACTIONS: "qa, write,qa" });
+    expect(config.PIPELINE_ACTIONS).toEqual(["write", "qa"]);
+  });
+
+  it("requires write and qa in every pipeline, and direct wherever adapt runs", () => {
+    expect(REQUIRED_PIPELINE_ACTIONS).toEqual(["write", "qa"]);
+    expect(
+      loadConfig({ NODE_ENV: "test", PIPELINE_ACTIONS: "qa,adapt,direct,write,strategy" })
+        .PIPELINE_ACTIONS,
+    ).toEqual(["strategy", "write", "direct", "adapt", "qa"]);
+    expect(() => loadConfig({ NODE_ENV: "test", PIPELINE_ACTIONS: "write" })).toThrow(
+      /PIPELINE_ACTIONS must include qa/,
+    );
+    expect(() => loadConfig({ NODE_ENV: "test", PIPELINE_ACTIONS: "direct,qa" })).toThrow(
+      /PIPELINE_ACTIONS must include write/,
+    );
+    expect(() => loadConfig({ NODE_ENV: "test", PIPELINE_ACTIONS: "write,adapt,qa" })).toThrow(
+      /adapt .* needs direct/,
+    );
+  });
+
+  it("parses the LLM pipeline knobs", () => {
+    const defaults = loadConfig({ NODE_ENV: "test" });
+    expect(defaults).toMatchObject({
+      ANTHROPIC_MODEL: "claude-sonnet-5",
+      ENMO_ANTHROPIC_BASE_URL: "https://api.anthropic.com",
+      DAILY_TOKEN_CAP: 2_000_000,
+      AGENT_CONCURRENCY: 4,
+      MEDIA_CONCURRENCY: 4,
+      MAX_QA_REVISIONS: 1,
+      MOCK_LLM_DELAY_MS: 0,
+      AGENT_EFFORT: {},
+    });
+    expect(defaults.MOCK_LLM_FAULTS).toBeUndefined();
+
+    const config = loadConfig({
+      NODE_ENV: "test",
+      DAILY_TOKEN_CAP: "1",
+      MAX_QA_REVISIONS: "0",
+      MOCK_LLM_FAULTS: "COPYWRITER.write:invalid*2",
+      MOCK_LLM_DELAY_MS: "250",
+      AGENT_EFFORT_COPYWRITER: "high",
+      AGENT_EFFORT_VISUAL_DIRECTOR: "low",
+    });
+    expect(config.DAILY_TOKEN_CAP).toBe(1);
+    expect(config.MAX_QA_REVISIONS).toBe(0);
+    expect(config.MOCK_LLM_FAULTS).toBe("COPYWRITER.write:invalid*2");
+    expect(config.MOCK_LLM_DELAY_MS).toBe(250);
+    expect(config.AGENT_EFFORT).toEqual({ COPYWRITER: "high", VISUAL_DIRECTOR: "low" });
+
+    expect(() => loadConfig({ NODE_ENV: "test", AGENT_EFFORT_MANAGER: "extreme" })).toThrow(
+      /AGENT_EFFORT_MANAGER/,
+    );
+    expect(() => loadConfig({ NODE_ENV: "test", MAX_QA_REVISIONS: "9" })).toThrow(
+      /MAX_QA_REVISIONS/,
+    );
+    expect(() => loadConfig({ NODE_ENV: "test", MOCK_LLM_DELAY_MS: "-1" })).toThrow(
+      /MOCK_LLM_DELAY_MS/,
+    );
+  });
+
+  it("checks MOCK_LLM_FAULTS at boot instead of on the first mock call", () => {
+    expect(() =>
+      loadConfig({
+        NODE_ENV: "test",
+        MOCK_LLM_FAULTS: "COPYWRITER.write:invalid*2,MANAGER.qa:oops",
+      }),
+    ).toThrow(/Invalid MOCK_LLM_FAULTS entry "MANAGER.qa:oops"/);
+    expect(() => loadConfig({ NODE_ENV: "test", MOCK_LLM_FAULTS: "WRITER.write:invalid" })).toThrow(
+      /unknown agent WRITER/,
+    );
+  });
+
+  it("drains idle workers slower in production", () => {
+    expect(loadConfig({ NODE_ENV: "test" }).BULLMQ_DRAIN_DELAY_SEC).toBe(5);
+    expect(
+      loadConfig({ NODE_ENV: "production", TOKEN_ENC_KEY: KEY_HEX }).BULLMQ_DRAIN_DELAY_SEC,
+    ).toBe(20);
+    expect(
+      loadConfig({ NODE_ENV: "production", TOKEN_ENC_KEY: KEY_HEX, BULLMQ_DRAIN_DELAY_SEC: "8" })
+        .BULLMQ_DRAIN_DELAY_SEC,
+    ).toBe(8);
   });
 
   it("rejects origins with paths and unknown pipeline actions", () => {

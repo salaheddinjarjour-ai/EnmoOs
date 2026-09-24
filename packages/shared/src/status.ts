@@ -71,6 +71,17 @@ export function postPlacement(
 }
 
 /**
+ * Statuses a human may edit a post's copy in (PATCH /posts/:id/copy): waiting on a human, or
+ * approved and not yet published. Anywhere earlier an agent still owes the post its copy, and a
+ * human edit would be overwritten by it; anywhere later the content is out in the world.
+ */
+export const COPY_EDITABLE_STATUSES: readonly PostStatus[] = [
+  "PENDING_APPROVAL",
+  "APPROVED",
+  "SCHEDULED",
+];
+
+/**
  * Best-effort stage for a FAILED post from fields every Post row carries: published posts fail
  * in Live, approved ones while scheduling/publishing, drafted ones in production, the rest while
  * drafting.
