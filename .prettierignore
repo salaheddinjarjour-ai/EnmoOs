@@ -1,0 +1,4 @@
+pnpm-lock.yaml
+**/src/generated
+**/prisma/migrations/**/migration.sql
+docs/*.md

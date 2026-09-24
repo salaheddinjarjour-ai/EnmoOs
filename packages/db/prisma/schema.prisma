@@ -1,0 +1,785 @@
+// ENMO OS — full data model for all six phases (DESIGN §B).
+// Every enum here is mirrored in packages/shared/src/enums.ts; packages/db/test/enums.test.ts
+// fails if they drift. The datasource URL comes from prisma.config.ts.
+
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated"
+  moduleFormat = "esm"
+  runtime      = "nodejs"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  ADMIN
+  MANAGER
+  EDITOR
+}
+
+enum Platform {
+  INSTAGRAM
+  FACEBOOK
+  TIKTOK
+}
+
+enum PostType {
+  REEL
+  TIKTOK
+  CAROUSEL
+  STATIC
+  STORY
+}
+
+enum PostStatus {
+  IDEA
+  DRAFTING
+  VISUALIZING
+  ADAPTING
+  QA
+  PENDING_APPROVAL
+  CHANGES_REQUESTED
+  APPROVED
+  SCHEDULED
+  PUBLISHING
+  LIVE
+  SCORED
+  FAILED
+}
+
+enum VariantFormat {
+  VERTICAL_9_16
+  PORTRAIT_4_5
+  SQUARE_1_1
+}
+
+enum AgentName {
+  MANAGER
+  STRATEGIST
+  COPYWRITER
+  VISUAL_DIRECTOR
+  ADAPTER
+  ANALYST
+  PUBLISHER
+}
+
+enum CampaignStatus {
+  BRIEFING
+  PLANNING
+  PRODUCING
+  ACTIVE
+  COMPLETED
+  ARCHIVED
+}
+
+enum TaskGraphStatus {
+  PROPOSED
+  APPROVED
+  REJECTED
+  SUPERSEDED
+  COMPLETED
+}
+
+enum TaskStatus {
+  PENDING
+  QUEUED
+  RUNNING
+  WAITING
+  SUCCEEDED
+  ESCALATED
+  FAILED
+  BLOCKED_BUDGET
+  CANCELLED
+}
+
+enum RunOutcome {
+  OK
+  INVALID_OUTPUT
+  REFUSED
+  TRUNCATED
+  API_ERROR
+}
+
+enum AssetKind {
+  IMAGE
+  VIDEO
+}
+
+enum AssetRole {
+  SHOT
+  MASTER
+  VARIANT_FRAME
+}
+
+enum AssetStatus {
+  QUEUED
+  RENDERING
+  READY
+  FAILED
+  REJECTED
+}
+
+enum ApprovalStatus {
+  PENDING
+  APPROVED
+  CHANGES_REQUESTED
+  CANCELLED
+}
+
+enum Decision {
+  APPROVE
+  REQUEST_CHANGES
+}
+
+enum FeedbackTarget {
+  COPY
+  VISUAL
+  BOTH
+}
+
+enum PublishStatus {
+  SCHEDULED
+  QUEUED
+  PUBLISHING
+  PUBLISHED
+  FAILED
+  CANCELLED
+}
+
+enum MessageRole {
+  USER
+  AGENT
+  SYSTEM
+}
+
+enum MessageKind {
+  TEXT
+  CLARIFY
+  BRIEF
+  PLAN
+  PROGRESS
+  POST_CARD
+  ESCALATION
+}
+
+enum AccountStatus {
+  ACTIVE
+  EXPIRED
+  REVOKED
+  ERROR
+}
+
+enum Confidence {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+// ───────────────────────────── People and access ─────────────────────────────
+
+model User {
+  id           String    @id @default(cuid())
+  /// Stored lowercased.
+  email        String    @unique
+  name         String
+  /// argon2id PHC string.
+  passwordHash String
+  role         Role
+  isActive     Boolean   @default(true)
+  lastLoginAt  DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  sessions          Session[]
+  invitesSent       Invite[]           @relation("InviteSender")
+  decisions         ApprovalDecision[]
+  messages          ChatMessage[]
+  auditLogs         AuditLog[]
+  campaignsCreated  Campaign[]         @relation("CampaignCreator")
+  graphsApproved    TaskGraph[]        @relation("GraphApprover")
+  accountsConnected SocialAccount[]    @relation("AccountConnector")
+  assetsCreated     Asset[]            @relation("AssetCreator")
+}
+
+model Session {
+  id         String   @id @default(cuid())
+  /// sha256 of the cookie token; the raw token is never stored.
+  tokenHash  String   @unique
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt  DateTime
+  lastSeenAt DateTime @default(now())
+  ip         String?
+  userAgent  String?
+  createdAt  DateTime @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model Invite {
+  id          String    @id @default(cuid())
+  email       String
+  role        Role
+  /// sha256 of the one-time token in the /invite/<token> link.
+  tokenHash   String    @unique
+  invitedById String
+  invitedBy   User      @relation("InviteSender", fields: [invitedById], references: [id])
+  expiresAt   DateTime
+  acceptedAt  DateTime?
+  revokedAt   DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([email])
+}
+
+// ───────────────────────────────── Clients ─────────────────────────────────
+
+model Client {
+  id               String     @id @default(cuid())
+  name             String
+  slug             String     @unique
+  /// IANA zone; slots and "best time" priors are computed in client-local time.
+  timezone         String     @default("UTC")
+  brandVoice       String     @default("")
+  /// VisualStyleTokens (@enmo/shared).
+  visualStyle      Json
+  bannedWords      String[]   @default([])
+  /// ApprovalChain (@enmo/shared); snapshotted onto each ApprovalRequest.
+  approvalChain    Json
+  enabledPlatforms Platform[] @default([INSTAGRAM, FACEBOOK, TIKTOK])
+  archivedAt       DateTime?
+  createdAt        DateTime   @default(now())
+  updatedAt        DateTime   @updatedAt
+
+  socialAccounts SocialAccount[]
+  campaigns      Campaign[]
+  posts          Post[]
+  assets         Asset[]
+  agentRuns      AgentRun[]
+  slotScores     SlotScore[]
+  baselines      AccountBaseline[]
+  analystReports AnalystReport[]
+  learnings      LearningLog[]
+
+  @@index([archivedAt])
+}
+
+model SocialAccount {
+  id               String        @id @default(cuid())
+  clientId         String
+  client           Client        @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  platform         Platform
+  externalId       String
+  handle           String
+  displayName      String?
+  /// "v1:<iv>:<tag>:<ct>", AES-256-GCM with TOKEN_ENC_KEY.
+  accessTokenEnc   String
+  refreshTokenEnc  String?
+  tokenExpiresAt   DateTime?
+  refreshExpiresAt DateTime?
+  scopes           String[]      @default([])
+  /// Non-secret ids: pageId, igUserId, username.
+  meta             Json          @default("{}")
+  status           AccountStatus @default(ACTIVE)
+  lastCheckedAt    DateTime?
+  connectedById    String?
+  connectedBy      User?         @relation("AccountConnector", fields: [connectedById], references: [id], onDelete: SetNull)
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+
+  publishJobs PublishJob[]
+
+  @@unique([platform, externalId])
+  @@index([clientId])
+}
+
+// ──────────────────────────── Campaigns and chat ────────────────────────────
+
+model Campaign {
+  id            String         @id @default(cuid())
+  /// Null until the brief resolves a client.
+  clientId      String?
+  client        Client?        @relation(fields: [clientId], references: [id])
+  name          String
+  status        CampaignStatus @default(BRIEFING)
+  brief         Json?
+  /// Enforces the one-consolidated-question rule.
+  clarifyCount  Int            @default(0)
+  /// Starts the North Star Brief → Live clock.
+  briefAt       DateTime       @default(now())
+  briefLockedAt DateTime?
+  createdById   String
+  createdBy     User           @relation("CampaignCreator", fields: [createdById], references: [id])
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  thread           ChatThread?
+  taskGraphs       TaskGraph[]
+  posts            Post[]
+  assets           Asset[]
+  agentRuns        AgentRun[]
+  appliedLearnings LearningLog[]
+
+  @@index([clientId, status])
+  @@index([status, createdAt])
+}
+
+model ChatThread {
+  id         String   @id @default(cuid())
+  campaignId String   @unique
+  campaign   Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  messages ChatMessage[]
+}
+
+model ChatMessage {
+  id        String      @id @default(cuid())
+  threadId  String
+  thread    ChatThread  @relation(fields: [threadId], references: [id], onDelete: Cascade)
+  role      MessageRole
+  kind      MessageKind @default(TEXT)
+  /// Set when an agent signs the message.
+  agent     AgentName?
+  userId    String?
+  user      User?       @relation(fields: [userId], references: [id], onDelete: SetNull)
+  content   String
+  payload   Json?
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+
+  @@index([threadId, createdAt])
+}
+
+// ─────────────────────────── Task graph and agent runs ───────────────────────────
+
+model TaskGraph {
+  id            String          @id @default(cuid())
+  campaignId    String
+  campaign      Campaign        @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  version       Int
+  status        TaskGraphStatus @default(PROPOSED)
+  summary       String
+  /// The validated manager.plan output.
+  graph         Json
+  /// Code-computed {calls, inputTokens, outputTokens, usd}.
+  estimate      Json
+  /// Plan feedback, verbatim.
+  changeRequest String?
+  approvedById  String?
+  approvedBy    User?           @relation("GraphApprover", fields: [approvedById], references: [id], onDelete: SetNull)
+  approvedAt    DateTime?
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+
+  tasks AgentTask[]
+
+  @@unique([campaignId, version])
+}
+
+model AgentTask {
+  id               String     @id @default(cuid())
+  graphId          String
+  graph            TaskGraph  @relation(fields: [graphId], references: [id], onDelete: Cascade)
+  /// "n7", or "n7.r1" for a revision node.
+  nodeKey          String
+  agent            AgentName
+  /// strategy | write | direct | adapt | qa
+  action           String
+  postId           String?
+  post             Post?      @relation(fields: [postId], references: [id], onDelete: SetNull)
+  /// AgentTask ids that must SUCCEED before this one is queued.
+  dependsOn        String[]   @default([])
+  status           TaskStatus @default(PENDING)
+  revision         Int        @default(0)
+  contractAttempts Int        @default(0)
+  input            Json?
+  output           Json?
+  /// {verbatim, source: HUMAN|QA, decisionId?}
+  feedback         Json?
+  error            String?
+  queuedAt         DateTime?
+  startedAt        DateTime?
+  finishedAt       DateTime?
+  createdAt        DateTime   @default(now())
+  updatedAt        DateTime   @updatedAt
+
+  runs AgentRun[]
+
+  @@unique([graphId, nodeKey])
+  @@index([status, updatedAt])
+  @@index([postId])
+}
+
+/// Ledger: one row per LLM attempt.
+model AgentRun {
+  id               String     @id @default(cuid())
+  taskId           String?
+  task             AgentTask? @relation(fields: [taskId], references: [id], onDelete: SetNull)
+  campaignId       String?
+  campaign         Campaign?  @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+  clientId         String?
+  client           Client?    @relation(fields: [clientId], references: [id], onDelete: SetNull)
+  agent            AgentName
+  action           String
+  attempt          Int
+  model            String
+  promptVersion    String
+  outcome          RunOutcome
+  stopReason       String?
+  inputSnapshot    Json?
+  /// Capped at 64 KB.
+  responseText     String?
+  validationErrors Json?
+  inputTokens      Int        @default(0)
+  outputTokens     Int        @default(0)
+  cacheReadTokens  Int        @default(0)
+  cacheWriteTokens Int        @default(0)
+  latencyMs        Int        @default(0)
+  createdAt        DateTime   @default(now())
+
+  analystReports AnalystReport[]
+
+  @@index([taskId])
+  @@index([campaignId, createdAt])
+  @@index([createdAt])
+}
+
+/// Daily (UTC) token totals backing DAILY_TOKEN_CAP.
+model TokenUsage {
+  day              DateTime @id @db.Date
+  inputTokens      BigInt   @default(0)
+  outputTokens     BigInt   @default(0)
+  cacheReadTokens  BigInt   @default(0)
+  cacheWriteTokens BigInt   @default(0)
+  calls            Int      @default(0)
+  costUsdMicros    BigInt   @default(0)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+}
+
+// ───────────────────────────── Posts and assets ─────────────────────────────
+
+model Post {
+  id              String     @id @default(cuid())
+  campaignId      String
+  campaign        Campaign   @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  clientId        String
+  client          Client     @relation(fields: [clientId], references: [id])
+  /// "p1", "p2", … unique per campaign.
+  ref             String
+  type            PostType
+  platforms       Platform[]
+  status          PostStatus @default(IDEA)
+  targetDate      DateTime?  @db.Date
+  pillar          String?
+  angle           String?
+  hook            String?
+  /// The current CopywriterOutput.
+  copy            Json?
+  humanEditCount  Int        @default(0)
+  revision        Int        @default(0)
+  needsAttention  Boolean    @default(false)
+  attentionReason String?
+  qaNotes         String?
+  approvedAt      DateTime?
+  liveAt          DateTime?
+  scoredAt        DateTime?
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+
+  variants         PostVariant[]
+  assets           Asset[]
+  tasks            AgentTask[]
+  approvalRequests ApprovalRequest[]
+
+  @@unique([campaignId, ref])
+  @@index([clientId, status])
+}
+
+/// One per platform.
+model PostVariant {
+  id             String        @id @default(cuid())
+  postId         String
+  post           Post          @relation(fields: [postId], references: [id], onDelete: Cascade)
+  platform       Platform
+  format         VariantFormat
+  caption        String        @default("")
+  hashtags       String[]      @default([])
+  overlay        Json?
+  engagementRate Float?
+  baselineRate   Float?
+  score          Float?
+  scoredAt       DateTime?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  frames     Asset[]             @relation("VariantFrames")
+  publishJob PublishJob?
+  metrics    PerformanceMetric[]
+
+  @@unique([postId, platform])
+}
+
+model Asset {
+  id             String       @id @default(cuid())
+  clientId       String
+  client         Client       @relation(fields: [clientId], references: [id])
+  campaignId     String?
+  campaign       Campaign?    @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+  postId         String?
+  post           Post?        @relation(fields: [postId], references: [id], onDelete: SetNull)
+  variantId      String?
+  variant        PostVariant? @relation("VariantFrames", fields: [variantId], references: [id], onDelete: SetNull)
+  /// Frame order within a variant (carousel slides).
+  position       Int?
+  role           AssetRole    @default(SHOT)
+  parentAssetId  String?
+  parent         Asset?       @relation("AssetLineage", fields: [parentAssetId], references: [id], onDelete: SetNull)
+  children       Asset[]      @relation("AssetLineage")
+  /// First version of this lineage (null on the root itself).
+  rootAssetId    String?
+  version        Int          @default(1)
+  isCurrent      Boolean      @default(true)
+  kind           AssetKind    @default(IMAGE)
+  status         AssetStatus  @default(QUEUED)
+  /// mock | higgsfield | sharp
+  provider       String
+  providerModel  String?
+  providerJobId  String?
+  prompt         String
+  negativePrompt String?
+  params         Json         @default("{}")
+  shotId         String?
+  sceneIndex     Int?
+  storageKey     String?
+  url            String?
+  posterUrl      String?
+  mimeType       String?
+  width          Int?
+  height         Int?
+  durationSec    Float?
+  bytes          Int?
+  /// Latest Visual Director review.
+  review         Json?
+  regenCount     Int          @default(0)
+  createdById    String?
+  createdBy      User?        @relation("AssetCreator", fields: [createdById], references: [id], onDelete: SetNull)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  @@index([clientId, createdAt])
+  @@index([postId])
+  @@index([rootAssetId, version])
+  @@index([variantId, position])
+}
+
+// ─────────────────────────── Approvals and publishing ───────────────────────────
+
+model ApprovalRequest {
+  id          String         @id @default(cuid())
+  postId      String
+  post        Post           @relation(fields: [postId], references: [id], onDelete: Cascade)
+  round       Int
+  status      ApprovalStatus @default(PENDING)
+  /// Snapshot of the client's ApprovalChain when the round opened.
+  chain       Json
+  currentStep Int            @default(0)
+  /// sha256 of the copy, the variant captions and the current asset ids.
+  contentHash String
+  resolvedAt  DateTime?
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  decisions ApprovalDecision[]
+
+  @@unique([postId, round])
+  @@index([status, createdAt])
+}
+
+model ApprovalDecision {
+  id            String          @id @default(cuid())
+  requestId     String
+  request       ApprovalRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  step          Int
+  userId        String
+  user          User            @relation(fields: [userId], references: [id])
+  decision      Decision
+  /// Reviewer feedback, verbatim (it reaches the agent byte-for-byte).
+  feedback      String?
+  target        FeedbackTarget?
+  viaApproveAll Boolean         @default(false)
+  auditLogId    String?
+  auditLog      AuditLog?       @relation(fields: [auditLogId], references: [id], onDelete: SetNull)
+  createdAt     DateTime        @default(now())
+
+  @@unique([requestId, step, userId])
+}
+
+model PublishJob {
+  id              String         @id @default(cuid())
+  variantId       String         @unique
+  variant         PostVariant    @relation(fields: [variantId], references: [id], onDelete: Cascade)
+  /// Null only in dry-run.
+  socialAccountId String?
+  socialAccount   SocialAccount? @relation(fields: [socialAccountId], references: [id], onDelete: SetNull)
+  platform        Platform
+  status          PublishStatus  @default(SCHEDULED)
+  scheduledFor    DateTime
+  /// publisher | optimizer | manual
+  slotSource      String
+  slotReason      String?
+  dryRun          Boolean        @default(true)
+  attempts        Int            @default(0)
+  /// Persisted as soon as it exists so a retry resumes the same container.
+  containerId     String?
+  externalId      String?
+  liveUrl         String?
+  lastError       String?
+  publishedAt     DateTime?
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  @@index([status, scheduledFor])
+}
+
+/// Learned slot quality per client-local day of week (0–6) and 3-hour bucket (0–7).
+model SlotScore {
+  id         String   @id @default(cuid())
+  clientId   String
+  client     Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  platform   Platform
+  dayOfWeek  Int
+  hourBucket Int
+  meanScore  Float    @default(0)
+  samples    Int      @default(0)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([clientId, platform, dayOfWeek, hourBucket])
+}
+
+// ─────────────────────────── Metrics and learning ───────────────────────────
+
+model PerformanceMetric {
+  id             String      @id @default(cuid())
+  variantId      String
+  variant        PostVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+  platform       Platform
+  capturedAt     DateTime    @default(now())
+  /// Capture checkpoint: 20 (IG stories), 24, 72 or 168.
+  ageHours       Int
+  views          Int?
+  reach          Int?
+  likes          Int?
+  comments       Int?
+  shares         Int?
+  saves          Int?
+  engagements    Int         @default(0)
+  engagementRate Float?
+  /// meta | tiktok | synthetic
+  source         String
+  raw            Json?
+  createdAt      DateTime    @default(now())
+
+  @@index([variantId, capturedAt])
+}
+
+model AccountBaseline {
+  id             String   @id @default(cuid())
+  clientId       String
+  client         Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  platform       Platform
+  computedAt     DateTime @default(now())
+  windowDays     Int      @default(90)
+  engagementRate Float
+  sampleSize     Int      @default(0)
+  /// platform_history | enmo_history | default_benchmark
+  source         String
+
+  @@index([clientId, platform, computedAt])
+}
+
+model AnalystReport {
+  id              String    @id @default(cuid())
+  clientId        String
+  client          Client    @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  weekOf          DateTime  @db.Date
+  summary         String
+  strategistBrief String
+  stats           Json
+  agentRunId      String?
+  agentRun        AgentRun? @relation(fields: [agentRunId], references: [id], onDelete: SetNull)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  learnings LearningLog[]
+
+  @@unique([clientId, weekOf])
+}
+
+model LearningLog {
+  id                  String         @id @default(cuid())
+  clientId            String
+  client              Client         @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  reportId            String?
+  report              AnalystReport? @relation(fields: [reportId], references: [id], onDelete: SetNull)
+  takeaway            String
+  recommendation      String
+  metric              String
+  claimedLift         Float
+  /// Recomputed in code from the evidence posts; the model's claim is kept for comparison.
+  computedLift        Float
+  confidence          Confidence
+  evidencePostIds     String[]       @default([])
+  /// {platforms[], postTypes[]}
+  appliesTo           Json
+  /// Set once the Strategist uses it, so each insight surfaces once.
+  applied             Boolean        @default(false)
+  appliedAt           DateTime?
+  appliedInCampaignId String?
+  appliedInCampaign   Campaign?      @relation(fields: [appliedInCampaignId], references: [id], onDelete: SetNull)
+  createdAt           DateTime       @default(now())
+  updatedAt           DateTime       @updatedAt
+
+  @@index([clientId, applied, createdAt])
+}
+
+// ───────────────────────────────── System ─────────────────────────────────
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorId    String?
+  actor      User?    @relation(fields: [actorId], references: [id], onDelete: SetNull)
+  /// e.g. auth.login, user.invite, plan.approve, approval.approve_all, publish.reschedule
+  action     String
+  entityType String
+  entityId   String?
+  data       Json?
+  ip         String?
+  createdAt  DateTime @default(now())
+
+  decisions ApprovalDecision[]
+
+  @@index([createdAt])
+  @@index([entityType, entityId])
+  @@index([actorId, createdAt])
+}
+
+/// Durable SSE log: replayed by Last-Event-ID, pruned after 7 days.
+model RealtimeEvent {
+  id        BigInt   @id @default(autoincrement())
+  /// "global" | "thread:<id>"
+  channel   String
+  type      String
+  payload   Json
+  createdAt DateTime @default(now())
+
+  @@index([channel, id])
+  @@index([createdAt])
+}

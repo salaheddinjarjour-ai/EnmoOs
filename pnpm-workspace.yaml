@@ -1,0 +1,14 @@
+packages:
+  - apps/*
+  - packages/*
+
+# pnpm 10 blocks dependency install scripts unless approved here (allowBuilds, pnpm >= 10.26).
+allowBuilds:
+  esbuild: true
+  prisma: true
+  "@prisma/engines": true
+  msgpackr-extract: true
+  workerd: true
+  sharp: true
+  # Its postinstall only re-checks the native binding that pnpm already installs as an optional dep.
+  unrs-resolver: false

@@ -229,7 +229,7 @@ render.yaml  docker-compose.dev.yml  .github/workflows/ci.yml  scripts/{services
 apps/api/src/{server.ts,worker.ts,app.ts,deps.ts,config.ts}
          src/plugins/{auth,rbac,security,errors}.ts   src/routes/<resource>.ts + index.ts
          src/services/  src/orchestrator/{intake,plan,graph,post-status,progress,feedback,escalation,visuals,variants,strategy}.ts
-         src/jobs/{connection,queues,registry,schedulers}.ts + processors/*.ts   src/realtime/{publisher,hub,sse}.ts
+         src/jobs/{connection,queues,registry,runtime,schedulers}.ts + processors/*.ts   src/realtime/{publisher,hub,sse}.ts
          src/publishing/{slot-optimizer,guards,publish-service}.ts   src/learning/{metrics,baseline,scoring,features}.ts
          src/lib/{crypto,clock,tokens,logger,errors}.ts   src/scripts/create-admin.ts
          test/{helpers,fakes,integration,e2e}/
@@ -512,7 +512,7 @@ Models, fields and relations (every model has `id String @id @default(cuid())`, 
   | tick.tokens | hourly |
   | tick.analyst | Mondays 06:00 UTC |
   | tick.sweeper | every 5 min |
-  | tick.prune | daily |
+  | tick.prune | daily (RealtimeEvent rows older than 7 days, and Session rows past `expiresAt`) |
 
 - Worker settings:
   - `drainDelay` comes from env (5s dev, 20s prod)
@@ -583,12 +583,13 @@ Models, fields and relations (every model has `id String @id @default(cuid())`, 
 - A session token is 32 random bytes in base64url. The database stores its sha256.
 - Cookie `enmo_session`: `HttpOnly; Secure (COOKIE_SECURE); SameSite=Lax; Domain=COOKIE_DOMAIN; Path=/; Max-Age=SESSION_TTL_DAYS (30)`.
 - Sessions roll: `lastSeenAt` and the expiry are extended at most every 5 minutes.
-- Logout deletes the session row. Deactivating a user deletes all of their sessions.
+- Logout deletes the session row. Deactivating a user deletes all of their sessions. Signing in deletes the user's expired sessions; `tick.prune` (Phase 2) sweeps the rest.
 - Login is rate-limited (`@fastify/rate-limit`): 10 per minute per IP and 5 per minute per email. A failed login returns a generic 401 and writes an audit row.
+- The client IP (per-IP limits, `Session.ip`, `AuditLog.ip`, request logs) is `request.clientIp` (`lib/trusted-proxies.ts`), never `request.ip`. `TRUST_PROXY` lists our own hops, whose `X-Forwarded-For` entries are believed. `cloudflare` in that list means a Cloudflare edge's `CF-Connecting-IP` is believed; its `X-Forwarded-For` never is, because any Cloudflare Worker sends from Cloudflare's ranges with a header it wrote. Render sets `loopback,uniquelocal,cloudflare`. `TRUST_PROXY=true` is refused in production.
 
 **CSRF and CORS:**
 - `@fastify/cors`: exact `APP_ORIGINS` list, `credentials: true`.
-- Non-GET requests must send an `Origin` in `APP_ORIGINS` and a JSON content type. Combined with SameSite=Lax, that covers CSRF.
+- Non-GET requests must send an `Origin` in `APP_ORIGINS`. A request with a body must also send it as JSON: other content types get 415 before the body is read. Bodyless mutations (logout, archive, check, disconnect, revoke) need only the `Origin`, although the web client sends `Content-Type: application/json` on every mutation. Combined with SameSite=Lax, that covers CSRF.
 
 **Passwords:** at least 12 characters. Setting one requires an invite token or the current password.
 
@@ -608,7 +609,7 @@ Models, fields and relations (every model has `id String @id @default(cuid())`, 
 
 | Capability | ADMIN | MANAGER | EDITOR |
 |---|---|---|---|
-| users.manage, invites.manage, audit.read | ✓ | – | – |
+| users.manage, invites.manage, audit.read (the team directory, names and roles only, needs just clients.read) | ✓ | – | – |
 | clients.read, campaigns.read, posts.read, assets.read, calendar.read, dashboard.read, budget.read | ✓ | ✓ | ✓ |
 | clients.write (brand voice, style, banned words, approval chain) | ✓ | ✓ | – |
 | clients.archive, socialAccounts.manage (connect/disconnect/check, OAuth) | ✓ | – | – |
@@ -620,7 +621,7 @@ Models, fields and relations (every model has `id String @id @default(cuid())`, 
 
 **API routes** (all under `/v1`; each route declares its required capability):
 - **auth:** `POST /auth/login` · `POST /auth/logout` · `GET /auth/me` · `POST /auth/password` · `GET /invites/:token` (public) · `POST /invites/:token/accept` (public)
-- **users:** `GET /users` · `PATCH /users/:id {role?, isActive?}` (you can't demote or deactivate the last active ADMIN, or yourself) · `POST /invites {email, role}` · `GET /invites` · `DELETE /invites/:id`
+- **users:** `GET /users` · `PATCH /users/:id {role?, isActive?}` (you can't demote or deactivate the last active ADMIN, or yourself) · `POST /invites {email, role}` · `GET /invites` · `DELETE /invites/:id` · `GET /users/directory` (clients.read: every account's id, name, role and isActive, no emails; for naming approvers and checking chains)
 - **system:** `GET /capabilities` (LLM/visual/publish modes, which integrations are configured) · `GET /budget` · `GET /audit` · `GET /healthz` · `GET /readyz`
 - **clients:**
   - `GET /clients` · `GET /clients/:id` · `POST /clients` · `PATCH /clients/:id` · `PUT /clients/:id/approval-chain` · `POST /clients/:id/archive`
@@ -848,7 +849,7 @@ Env is loaded with `node --env-file-if-exists=.env`.
   - U4: `render.yaml`, CI, tsup config, `smoke-api`, docker-compose, README
 - **Phase 2:**
   - U1: `packages/agents` (runner, anthropic, mock, prompts and definitions for manager and copywriter, validators)
-  - U2: `orchestrator/*`, `jobs/{connection,queues,schedulers}`, processors `manager-intake`, `manager-plan`, `task-run`, `tick-sweeper`, `tick-prune`, `realtime/publisher`, `services/{budget,approvals,campaigns}`, embedded worker mode
+  - U2: `orchestrator/*`, `jobs/{connection,queues,schedulers}`, processors `manager-intake`, `manager-plan`, `task-run`, `tick-sweeper`, `tick-prune`, `realtime/publisher`, `services/{budget,approvals,campaigns}`, embedded worker mode (`jobs/runtime.ts`)
   - U3: `routes/{campaigns,threads,task-graphs,posts,approvals,events,budget,agent-tasks}`, `realtime/{hub,sse}`
   - U4: `web (app)/brief/**`, `chat/*`, `post/{PostCard,PlatformChips,RequestChangesDialog,CopyEditor}`, `lib/realtime`, basic kanban, AlertsPanel, `e2e/phase2`
 - **Phase 3:**

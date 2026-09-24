@@ -1,0 +1,158 @@
+# Render Blueprint for the ENMO OS backend (DESIGN §H): the API web service, the queue worker and
+# Postgres 16. The web app deploys to Cloudflare Workers instead (apps/web, see README "Deploy"),
+# and Redis is Upstash (REDIS_URL, eviction off). Both services run the same build: one bundle,
+# two entrypoints.
+#
+# Configuration comes from three places, because a Blueprint env group can hold neither
+# `fromDatabase` references nor `sync: false` secrets:
+#   - enmo-shared   (defined below) non-secret settings shared by both services;
+#   - enmo-secrets  created by hand in the Dashboard (Environment Groups → New) BEFORE the first
+#                   Blueprint sync, so no secret ever lives in git. Keys:
+#                     REDIS_URL, TOKEN_ENC_KEY, ANTHROPIC_API_KEY,
+#                     R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY,
+#                   and later META_APP_ID, META_APP_SECRET, TIKTOK_CLIENT_KEY, TIKTOK_CLIENT_SECRET,
+#                   HIGGSFIELD_KEY_ID, HIGGSFIELD_KEY_SECRET, HIGGSFIELD_IMAGE_MODEL,
+#                   HIGGSFIELD_VIDEO_MODEL (optionally SEED_ADMIN_EMAIL / SEED_ADMIN_PASSWORD for the
+#                   very first boot). The README's env reference explains each one;
+#   - DATABASE_URL, wired per service from enmo-db.
+# The API and the worker refuse to boot without TOKEN_ENC_KEY, the Anthropic key while
+# LLM_PROVIDER=anthropic, and the R2 credentials while STORAGE_DRIVER=r2.
+#
+# Free-tier fallback (free instances get neither background workers nor pre-deploy commands):
+#   1. delete the enmo-worker service;
+#   2. on enmo-api set `plan: free`, set EMBEDDED_WORKER to "true", remove preDeployCommand and
+#      run migrations at start instead:
+#        startCommand: (cd packages/db && ./node_modules/.bin/prisma migrate deploy) && node --enable-source-maps apps/api/dist/server.js
+#   3. set enmo-db to `plan: free` (Render deletes free databases after 30 days).
+# A free instance sleeps after 15 idle minutes; the Cloudflare cron in apps/web/worker.ts pings
+# https://api.enmo.marketing/healthz every 5 minutes to keep it awake.
+
+envVarGroups:
+  - name: enmo-shared
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: LOG_LEVEL
+        value: info
+      # Public URL of the API: OAuth callbacks and absolute links.
+      - key: API_PUBLIC_URL
+        value: https://api.enmo.marketing
+      # Build and pre-deploy run `pnpm` through Corepack; never wait on its download prompt.
+      - key: COREPACK_ENABLE_DOWNLOAD_PROMPT
+        value: "0"
+      # Queues live in Upstash: one prefix, and a longer idle poll to keep the command bill low.
+      - key: BULLMQ_PREFIX
+        value: enmo
+      - key: BULLMQ_DRAIN_DELAY_SEC
+        value: "20"
+      # LLM: the key lives in enmo-secrets.
+      - key: LLM_PROVIDER
+        value: anthropic
+      - key: ANTHROPIC_MODEL
+        value: claude-sonnet-5
+      - key: DAILY_TOKEN_CAP
+        value: "2000000"
+      # Visuals stay mocked until Higgsfield access exists (then: higgsfield + HIGGSFIELD_*).
+      - key: VISUAL_PROVIDER
+        value: mock
+      # Nothing reaches Instagram, Facebook or TikTok until this is flipped to "live".
+      - key: PUBLISH_MODE
+        value: dry-run
+      # Render's disk is ephemeral and Meta/TikTok fetch media by public URL, so production uses R2.
+      - key: STORAGE_DRIVER
+        value: r2
+      - key: R2_BUCKET
+        value: enmo-assets
+      - key: PUBLIC_ASSET_BASE_URL
+        value: https://assets.enmo.marketing
+      - key: META_GRAPH_VERSION
+        value: v26.0
+      # Unaudited TikTok apps may only post SELF_ONLY; set "true" once the audit passes.
+      - key: TIKTOK_APP_AUDITED
+        value: "false"
+
+services:
+  - type: web
+    name: enmo-api
+    runtime: node
+    plan: starter
+    # Render's closest region to the Middle East. Keep every resource (and Upstash, eu-central-1)
+    # in one region; a database's region cannot change after creation.
+    region: frankfurt
+    # --prod=false: NODE_ENV=production is set at build time too, and the build needs devDependencies
+    # (turbo, tsup, the Prisma CLI). Node comes from .node-version, pnpm from package.json.
+    buildCommand: corepack enable && pnpm install --frozen-lockfile --prod=false && pnpm turbo run build --filter=@enmo/api...
+    preDeployCommand: pnpm --filter @enmo/db db:deploy
+    startCommand: node --enable-source-maps apps/api/dist/server.js
+    # Liveness only; /readyz additionally checks Postgres and Redis.
+    healthCheckPath: /healthz
+    # Deploy a commit only once GitHub Actions (.github/workflows/ci.yml) is green.
+    autoDeployTrigger: checksPass
+    domains:
+      - api.enmo.marketing
+    buildFilter:
+      ignoredPaths:
+        - apps/web/**
+        - docs/**
+        - "**/*.md"
+    envVars:
+      - fromGroup: enmo-shared
+      - fromGroup: enmo-secrets
+      - key: DATABASE_URL
+        fromDatabase:
+          name: enmo-db
+          property: connectionString
+      # Queue consumers run in enmo-worker.
+      - key: EMBEDDED_WORKER
+        value: "false"
+      # CORS + CSRF origin check: only the web app.
+      - key: APP_ORIGINS
+        value: https://app.enmo.marketing
+      # app. and api. share the session cookie; both are subdomains, so SameSite=Lax still applies.
+      - key: COOKIE_DOMAIN
+        value: .enmo.marketing
+      - key: COOKIE_SECURE
+        value: "true"
+      # Requests reach Node as `X-Forwarded-For: client, <Cloudflare edge>, <Render 10.x hop>`
+      # with `CF-Connecting-IP: client`. X-Forwarded-For is believed only from Render's private
+      # hops; a Cloudflare edge is believed only for CF-Connecting-IP, which it overwrites, because
+      # any Cloudflare Worker can send from Cloudflare's ranges with a forged X-Forwarded-For. A
+      # hop count ("1") would key the per-IP login limit and every session and audit IP on a shared
+      # address; "true" is refused in production. Check `remoteAddress` in the request logs after
+      # the first deploy.
+      - key: TRUST_PROXY
+        value: loopback,uniquelocal,cloudflare
+
+  - type: worker
+    name: enmo-worker
+    runtime: node
+    plan: starter
+    region: frankfurt
+    buildCommand: corepack enable && pnpm install --frozen-lockfile --prod=false && pnpm turbo run build --filter=@enmo/api...
+    startCommand: node --enable-source-maps apps/api/dist/worker.js
+    autoDeployTrigger: checksPass
+    buildFilter:
+      ignoredPaths:
+        - apps/web/**
+        - docs/**
+        - "**/*.md"
+    envVars:
+      - fromGroup: enmo-shared
+      - fromGroup: enmo-secrets
+      - key: DATABASE_URL
+        fromDatabase:
+          name: enmo-db
+          property: connectionString
+      # Registers the repeatable ticks (publish, metrics, tokens, analyst, sweeper, prune) on boot.
+      - key: SCHEDULERS_ENABLED
+        value: "true"
+
+databases:
+  - name: enmo-db
+    databaseName: enmo
+    user: enmo
+    plan: basic-256mb
+    region: frankfurt
+    postgresMajorVersion: "16"
+    # Private network only; add a CIDR here to reach it with psql from outside Render.
+    ipAllowList: []

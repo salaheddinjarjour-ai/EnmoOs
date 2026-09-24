@@ -1,0 +1,45 @@
+{
+  "name": "@enmo/api",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "EMBEDDED_WORKER=true tsx watch --env-file-if-exists=.env src/server.ts",
+    "dev:worker": "tsx watch --env-file-if-exists=.env src/worker.ts",
+    "start": "node --env-file-if-exists=.env --enable-source-maps dist/server.js",
+    "start:worker": "node --env-file-if-exists=.env --enable-source-maps dist/worker.js",
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "test:unit": "vitest run --project unit",
+    "test:integration": "vitest run --project integration",
+    "create-admin": "tsx --env-file-if-exists=.env src/scripts/create-admin.ts"
+  },
+  "dependencies": {
+    "@enmo/db": "workspace:*",
+    "@enmo/shared": "workspace:*",
+    "@fastify/cookie": "11.1.2",
+    "@fastify/cors": "11.3.0",
+    "@fastify/rate-limit": "11.2.0",
+    "@node-rs/argon2": "2.2.1",
+    "@prisma/adapter-pg": "7.10.0",
+    "@prisma/client": "7.10.0",
+    "dotenv": "18.0.3",
+    "fastify": "5.12.5",
+    "fastify-plugin": "6.0.0",
+    "fastify-type-provider-zod": "7.0.0",
+    "ioredis": "5.11.1",
+    "pg": "8.23.0",
+    "pino": "10.3.1",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.4",
+    "@types/pg": "8.23.1",
+    "tsup": "8.5.1",
+    "tsx": "4.23.15",
+    "typescript": "6.0.3",
+    "vitest": "5.0.1"
+  }
+}

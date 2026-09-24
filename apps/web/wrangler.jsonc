@@ -1,0 +1,33 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "enmo-web",
+  // Custom entry: the OpenNext handler plus a cron that keeps the Render API awake.
+  "main": "worker.ts",
+  "compatibility_date": "2026-09-20",
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "assets": {
+    "directory": ".open-next/assets",
+    "binding": "ASSETS",
+  },
+  "services": [
+    {
+      // OpenNext self-reference binding; must match "name".
+      "binding": "WORKER_SELF_REFERENCE",
+      "service": "enmo-web",
+    },
+  ],
+  "routes": [{ "pattern": "app.enmo.marketing", "custom_domain": true }],
+  "triggers": {
+    // Render's free tier sleeps after 15 idle minutes.
+    "crons": ["*/5 * * * *"],
+  },
+  "vars": {
+    "KEEPALIVE_URL": "https://api.enmo.marketing/healthz",
+  },
+  "observability": {
+    "enabled": true,
+    // Invocation logs record every request URL, and /invite/<token> carries a one-time secret
+    // (only its hash is stored). console output from the worker is still collected.
+    "logs": { "invocation_logs": false },
+  },
+}

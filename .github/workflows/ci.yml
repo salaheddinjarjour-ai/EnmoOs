@@ -1,0 +1,164 @@
+# CI (DESIGN §H "Verification"): the per-phase checks, against real Postgres 16 and Redis 7.
+# Everything runs offline: mock LLM, mock visuals, dry-run publishing, no credentials.
+# Render deploys a commit only after these checks pass (render.yaml: autoDeployTrigger: checksPass).
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+env:
+  # Only disposable databases exist here, so DATABASE_URL may point at the test database too.
+  DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/enmo_test
+  TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/enmo_test
+  REDIS_URL: redis://127.0.0.1:6379
+  LLM_PROVIDER: mock
+  VISUAL_PROVIDER: mock
+  PUBLISH_MODE: dry-run
+  # Fixed, public, test-only AES-256 key (32 bytes, base64). Never used outside CI.
+  TOKEN_ENC_KEY: ZW5tby1jaS10ZXN0LWtleS1ub3QtYS1zZWNyZXQtMDA=
+  # Inlined into the web bundle at build time; nothing listens there during `build:cf`.
+  NEXT_PUBLIC_API_URL: http://localhost:4000
+  TURBO_TELEMETRY_DISABLED: "1"
+  NEXT_TELEMETRY_DISABLED: "1"
+
+jobs:
+  verify:
+    name: Lint, typecheck, test, build, smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: enmo_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d enmo_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v7
+
+      # Version from package.json "packageManager"; must run before setup-node's pnpm cache.
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint and typecheck
+        run: pnpm turbo run lint typecheck
+
+      - name: Formatting
+        run: pnpm format:check
+
+      - name: Migrate the test database
+        run: pnpm --filter @enmo/db db:deploy
+        env:
+          DATABASE_URL: ${{ env.TEST_DATABASE_URL }}
+
+      - name: Test
+        run: pnpm turbo run test
+
+      - name: Build
+        run: pnpm turbo run build
+
+      - name: Build the Cloudflare worker (OpenNext)
+        run: pnpm --filter @enmo/web build:cf
+
+      # Boots apps/api/dist/server.js as Render does: catches runtime deps missing from package.json.
+      - name: Smoke-test the API bundle
+        run: node scripts/smoke-api.mjs
+
+  web-e2e:
+    name: Playwright (Chromium)
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: enmo_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d enmo_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      # The Playwright API server runs from source (tsx) and needs the generated Prisma client.
+      - name: Generate the Prisma client
+        run: pnpm turbo run build --filter=@enmo/db
+
+      # CI is the only place browsers are downloaded; locally they come from /opt/pw-browsers.
+      - name: Install Chromium
+        working-directory: apps/web
+        run: pnpm exec playwright install --with-deps chromium
+
+      # playwright.config.ts starts the API (embedded worker, mock LLM) on a fresh enmo_e2e database
+      # derived from TEST_DATABASE_URL, and the web app with `next build && next start`.
+      - name: Playwright
+        run: pnpm --filter @enmo/web test:e2e
+
+      - name: Upload the Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report
+          path: |
+            apps/web/playwright-report/
+            apps/web/test-results/
+          retention-days: 14
+          if-no-files-found: ignore

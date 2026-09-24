@@ -1,0 +1,53 @@
+{
+  "$schema": "https://turborepo.com/schema.json",
+  "ui": "stream",
+  "globalDependencies": ["tsconfig.base.json"],
+  "globalEnv": ["NODE_ENV"],
+  "globalPassThroughEnv": ["CI", "PLAYWRIGHT_BROWSERS_PATH", "ENMO_PG_DIR"],
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "env": ["NEXT_PUBLIC_*"],
+      "outputs": ["dist/**", ".next/**", "!.next/cache/**", ".open-next/**", "src/generated/**"]
+    },
+    "typecheck": {
+      "dependsOn": ["^build"],
+      "outputs": []
+    },
+    "lint": {
+      "dependsOn": ["^build"],
+      "inputs": ["$TURBO_DEFAULT$", "$TURBO_ROOT$/eslint.config.mjs"],
+      "outputs": []
+    },
+    "@enmo/web#lint": {
+      "dependsOn": ["^build", "@enmo/web#typecheck"],
+      "inputs": ["$TURBO_DEFAULT$", "$TURBO_ROOT$/eslint.config.mjs"],
+      "outputs": []
+    },
+    "test": {
+      "dependsOn": ["^build"],
+      "env": ["LLM_PROVIDER", "VISUAL_PROVIDER", "PUBLISH_MODE", "MOCK_LLM_FAULTS"],
+      "passThroughEnv": ["DATABASE_URL", "TEST_DATABASE_URL", "REDIS_URL", "BULLMQ_PREFIX"],
+      "outputs": []
+    },
+    "@enmo/api#test": {
+      "dependsOn": ["^build"],
+      "cache": false,
+      "passThroughEnv": [
+        "DATABASE_URL",
+        "TEST_DATABASE_URL",
+        "REDIS_URL",
+        "BULLMQ_PREFIX",
+        "LLM_PROVIDER",
+        "VISUAL_PROVIDER",
+        "PUBLISH_MODE",
+        "MOCK_LLM_FAULTS"
+      ]
+    },
+    "dev": {
+      "dependsOn": ["^build"],
+      "cache": false,
+      "persistent": true
+    }
+  }
+}

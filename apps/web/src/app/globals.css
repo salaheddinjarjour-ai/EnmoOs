@@ -1,0 +1,107 @@
+@import "tailwindcss";
+
+/* ENMO design tokens (DESIGN §G, MASTER_PLAN §04). Enmo Green is for actions only. */
+@theme {
+  --color-void: #060606;
+  --color-panel: #0c0c0d;
+  --color-enmo: #4ade80;
+  --color-paper: #f5f5f4;
+  --color-steel: #8b8b90;
+  --color-line: rgb(245 245 244 / 0.08);
+
+  --color-ig: #c13584;
+  --color-fb: #5b7ff0;
+  --color-tt: #25f4ee;
+
+  --ease-enmo: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --default-transition-duration: 250ms;
+  --default-transition-timing-function: var(--ease-enmo);
+
+  --animate-agent-pulse: agent-pulse 2.4s var(--ease-enmo) infinite;
+  --animate-shimmer: shimmer 1.6s linear infinite;
+
+  /* Soft green halo for active agents: grows and fades, never bounces. */
+  @keyframes agent-pulse {
+    0% {
+      box-shadow: 0 0 0 0 rgb(74 222 128 / 0.45);
+    }
+    70% {
+      box-shadow: 0 0 0 6px rgb(74 222 128 / 0);
+    }
+    100% {
+      box-shadow: 0 0 0 0 rgb(74 222 128 / 0);
+    }
+  }
+
+  @keyframes shimmer {
+    from {
+      background-position: 200% 0;
+    }
+    to {
+      background-position: -200% 0;
+    }
+  }
+}
+
+/* next/font/local sets these variables on <html>; `inline` makes utilities use them directly. */
+@theme inline {
+  --font-display: var(--font-space-grotesk), ui-sans-serif, system-ui, sans-serif;
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-jetbrains-mono), ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+/* Skeleton surface for anything still rendering (post previews, lists). */
+@utility shimmer {
+  background-image: linear-gradient(
+    100deg,
+    rgb(245 245 244 / 0.03) 20%,
+    rgb(245 245 244 / 0.09) 50%,
+    rgb(245 245 244 / 0.03) 80%
+  );
+  background-size: 200% 100%;
+  animation: var(--animate-shimmer);
+}
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+
+  html,
+  body {
+    background-color: var(--color-void);
+    color: var(--color-paper);
+  }
+
+  body {
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+
+  *,
+  ::before,
+  ::after {
+    border-color: var(--color-line);
+  }
+
+  ::selection {
+    background-color: rgb(245 245 244 / 0.16);
+  }
+
+  :focus-visible {
+    outline: 1px solid var(--color-paper);
+    outline-offset: 2px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  ::before,
+  ::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

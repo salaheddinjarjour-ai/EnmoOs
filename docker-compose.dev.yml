@@ -1,0 +1,60 @@
+# Local Postgres 16 + Redis 7 for machines without the native binaries.
+#
+# scripts/services.sh falls back to this file on its own when /usr/lib/postgresql/16/bin or
+# redis-server is missing, and then creates the enmo_dev / enmo_test databases itself. Ports,
+# user and trust auth match the native setup, so `scripts/services.sh env` prints the same URLs
+# either way. Both services bind to 127.0.0.1 only.
+#
+#   docker compose -f docker-compose.dev.yml up -d --wait
+#   docker compose -f docker-compose.dev.yml down -v     # also drops the data volume
+name: enmo-dev
+
+services:
+  postgres:
+    image: postgres:16
+    # Disposable dev/test data: durability is traded for speed, as in scripts/services.sh.
+    command:
+      - postgres
+      - -c
+      - fsync=off
+      - -c
+      - synchronous_commit=off
+      - -c
+      - full_page_writes=off
+      - -c
+      - max_connections=200
+    environment:
+      POSTGRES_USER: postgres
+      # No password, like the native cluster: DATABASE_URL is postgresql://postgres@127.0.0.1:54329/…
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "127.0.0.1:54329:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7
+    # BullMQ requires noeviction; no persistence because queue state here is disposable.
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory-policy
+      - noeviction
+    ports:
+      - "127.0.0.1:63799:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  postgres-data:
