@@ -1,10 +1,20 @@
 "use client";
 
-import { PLATFORM_LABEL, type CopywriterOutput, type PostDto } from "@enmo/shared";
+import {
+  aspectRatioFor,
+  PLATFORM_LABEL,
+  type AssetThumbDto,
+  type CopywriterOutput,
+  type PostDto,
+} from "@enmo/shared";
 import Link from "next/link";
 import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { Badge } from "@/components/ui/Badge";
 import { cx } from "@/components/ui/cx";
+import { frameSizeOf, isVideoTake } from "@/components/vault/media";
+import { TakeStatusPill } from "@/components/vault/TakeBadges";
+import { TakeFrame } from "@/components/vault/TakeFrame";
+import { vaultTakeHref } from "@/components/vault/vault-model";
 import { useClient } from "@/hooks/useClients";
 import { formatCalendarDay, formatSeconds } from "./format";
 import { CopyEditor } from "./CopyEditor";
@@ -14,10 +24,11 @@ import { PostPreview } from "./PostPreview";
 import { StatusPill } from "./StatusPill";
 
 /*
- * Everything about one post in a side sheet: the preview, the full copy (captions per platform,
- * script scenes, slides, on-screen text), QA notes and where its approval stands, with the same
- * actions as the card. "Edit" swaps the reading view for the CopyEditor in place. Built on the
- * native <dialog> (focus trap, Escape, inert page) like ui/Dialog, anchored to the right edge.
+ * Everything about one post in a side sheet: the preview, its shots (the current take of each,
+ * linked to the Vault), the full copy (captions per platform, script scenes, slides, on-screen
+ * text), QA notes and where its approval stands, with the same actions as the card. "Edit" swaps
+ * the reading view for the CopyEditor in place. Built on the native <dialog> (focus trap, Escape,
+ * inert page) like ui/Dialog, anchored to the right edge.
  */
 
 export type DrawerMode = "view" | "edit";
@@ -177,6 +188,7 @@ function DrawerBody({
                 ) : null}
               </div>
             </div>
+            {post.currentAssets.length > 0 ? <ShotsStrip post={post} /> : null}
             {copy ? (
               <CopyDetails copy={copy} />
             ) : (
@@ -193,6 +205,63 @@ function DrawerBody({
         )}
       </div>
     </div>
+  );
+}
+
+/** Where a shot sits in the post: "Slide 2", "Scene 3", else its shot id. */
+function shotPlace(take: AssetThumbDto): string {
+  if (take.slideIndex !== null) return `Slide ${take.slideIndex + 1}`;
+  if (take.sceneIndex !== null) return `Scene ${take.sceneIndex + 1}`;
+  return take.shotId ?? "Shot";
+}
+
+/** The current take of each shot, in the order the post reads; each opens in the Vault. */
+function ShotsStrip({ post }: { post: PostDto }) {
+  const ratio = aspectRatioFor(post.type);
+  const shots = post.currentAssets;
+  return (
+    <Detail label={`Shots · ${shots.length}`}>
+      <ul aria-label="Shots" className="flex gap-2.5 overflow-x-auto pb-1">
+        {shots.map((take) => {
+          const name = [take.shotId, `v${take.version}`].filter(Boolean).join(" · ");
+          return (
+            <li key={take.id} className="shrink-0">
+              <Link
+                href={vaultTakeHref(take.id)}
+                aria-label={`Open ${name} in the Vault`}
+                className="flex w-24 flex-col gap-1.5 rounded-lg border border-line p-1.5 transition duration-200 ease-enmo hover:-translate-y-px hover:border-paper/25"
+              >
+                <TakeFrame
+                  take={take}
+                  size={frameSizeOf(take, ratio)}
+                  alt={`${post.ref} ${shotPlace(take).toLowerCase()}`}
+                  className="h-28 w-full"
+                  frameClassName="rounded-sm"
+                >
+                  {take.status === "READY" ? null : (
+                    <TakeStatusPill
+                      status={take.status}
+                      onMedia
+                      className="pointer-events-none absolute top-1 left-1"
+                    />
+                  )}
+                </TakeFrame>
+                <span className="flex items-center justify-between gap-1 font-mono text-[10px] leading-none">
+                  <span className="truncate text-paper">
+                    {take.shotId ?? "shot"}
+                    {isVideoTake(take) ? <span className="text-steel"> · clip</span> : null}
+                  </span>
+                  <span className="text-steel">v{take.version}</span>
+                </span>
+                <span className="truncate text-[11px] leading-none text-steel">
+                  {shotPlace(take)}
+                </span>
+              </Link>
+            </li>
+          );
+        })}
+      </ul>
+    </Detail>
   );
 }
 

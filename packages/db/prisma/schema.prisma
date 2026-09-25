@@ -542,7 +542,8 @@ model Asset {
   parentAssetId  String?
   parent         Asset?       @relation("AssetLineage", fields: [parentAssetId], references: [id], onDelete: SetNull)
   children       Asset[]      @relation("AssetLineage")
-  /// First version of this lineage (null on the root itself).
+  /// First version of this lineage. The visual loop writes v1's own id on v1; rows written with
+  /// null on the root are read the same way (null means "this asset is the root").
   rootAssetId    String?
   version        Int          @default(1)
   isCurrent      Boolean      @default(true)
@@ -574,6 +575,8 @@ model Asset {
   updatedAt      DateTime     @updatedAt
 
   @@index([clientId, createdAt])
+  /// The Vault's campaign filter.
+  @@index([campaignId, createdAt])
   @@index([postId])
   @@index([rootAssetId, version])
   @@index([variantId, position])

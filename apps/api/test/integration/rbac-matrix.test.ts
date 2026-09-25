@@ -8,8 +8,8 @@ import { testCopy } from "../helpers/route-fixtures";
 
 /*
  * The RBAC matrix (DESIGN §E) against every route: Phase 1's auth, users, audit, invites, clients,
- * social accounts, capabilities and health, and Phase 2's campaigns, threads, plans, tasks, posts,
- * approvals, budget and the SSE stream.
+ * social accounts, capabilities and health, Phase 2's campaigns, threads, plans, tasks, posts,
+ * approvals, budget and the SSE stream, and Phase 3's vault and local files.
  *
  * 1. Statically: the access rule each route declares (recorded by plugins/rbac.ts) must equal the
  *    table below, and every registered route must appear in it. A new route (e.g. Phase 6's
@@ -277,6 +277,29 @@ const ROUTES: readonly RouteCase[] = [
   // ── realtime (Phase 2) ──
   // An unknown thread answers 404 before the stream opens, so allowed calls return.
   { method: "GET", route: "/v1/events", access: "session", url: `/v1/events?threadId=${MISSING}` },
+
+  // ── vault and files (Phase 3) ──
+  { method: "GET", route: "/v1/assets", access: "assets.read" },
+  {
+    method: "GET",
+    route: "/v1/assets/:id",
+    access: "assets.read",
+    url: `/v1/assets/${MISSING}`,
+  },
+  {
+    method: "POST",
+    route: "/v1/assets/:id/regenerate",
+    access: "assets.regenerate",
+    url: `/v1/assets/${MISSING}/regenerate`,
+    payload: () => ({ instruction: null }),
+  },
+  // Public like the R2 bucket that replaces it in production; a missing key answers 404.
+  {
+    method: "GET",
+    route: "/files/*",
+    access: "public",
+    url: "/files/clients/x/assets/missing.png",
+  },
 ];
 
 /*
@@ -366,8 +389,8 @@ describe("enforced access", () => {
 });
 
 /**
- * Invalid for every query schema that has these keys (audit limit, clients flag, campaign and post
- * filters, the SSE cursor).
+ * Invalid for every query schema that has these keys (audit and vault limits, clients flag, campaign
+ * and post filters, the SSE cursor).
  */
 const INVALID_QUERY = "limit=0&includeArchived=maybe&status=NOPE&platform=NOPE&lastEventId=x";
 /** Not an object, so no body schema accepts it. */

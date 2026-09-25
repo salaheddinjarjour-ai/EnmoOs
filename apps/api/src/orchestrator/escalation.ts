@@ -1,5 +1,6 @@
 import type { AgentEscalation, BudgetExceeded, InvalidAgentInput } from "@enmo/agents";
-import type { AlertKind, Issue, TaskStatus } from "@enmo/shared";
+import type { DbTransaction } from "@enmo/db";
+import type { AgentName, AlertKind, Issue, TaskStatus } from "@enmo/shared";
 import type { Deps } from "../deps";
 import { getBudget } from "../services/budget";
 import { EventBatch } from "./events";
@@ -11,7 +12,8 @@ import { describeTask, loadTask, type TaskWithContext } from "./tasks";
 /*
  * When a task can't finish on its own (DESIGN §D "task.run"): an AgentEscalation or a task that
  * failed for good becomes ESCALATED/FAILED, its post needs attention, the Manager signs an
- * ESCALATION message in the thread and an `alert` goes out. A budget stop is not a failure: the
+ * ESCALATION message in the thread (unless the hand-off is an agent's own call, like the Visual
+ * Director giving up on weak takes) and an `alert` goes out. A budget stop is not a failure: the
  * task waits in BLOCKED_BUDGET for the sweeper.
  */
 
@@ -22,6 +24,8 @@ export interface HandOff {
   issues: Issue[];
   /** One sentence for people. */
   message: string;
+  /** Who signs the ESCALATION message: the Manager unless an agent made the call itself. */
+  signedBy?: AgentName;
 }
 
 const REASON_TEXT: Readonly<Record<string, string>> = {
@@ -75,72 +79,116 @@ export function failTask(
   return handOffTask(deps, taskId, "FAILED", handOff, alert);
 }
 
+/** What a task can still be handed off from: at work, or WAITING on its renders (visuals.ts). */
+const HAND_OFF_FROM: readonly TaskStatus[] = ["QUEUED", "RUNNING", "WAITING"];
+
+export type HandOffStatus = Extract<TaskStatus, "ESCALATED" | "FAILED">;
+type HandOffAlert = Extract<AlertKind, "escalated" | "failed" | "stuck">;
+
+/** What the ESCALATION message asks people to do (POST /agent-tasks/:id/resolve). */
+function nextStep(task: Pick<TaskWithContext, "agent" | "action">): string {
+  return task.agent === "VISUAL_DIRECTOR" && task.action === "direct"
+    ? "accept the best take or retry it from the task list"
+    : "retry it from the task list once the cause is fixed";
+}
+
 /**
- * Moves a queued or running task to `status` and tells people. Returns false when the task had
- * already left those states (cancelled with its campaign, or handled by another worker).
+ * Moves a queued, running or waiting task to `status` and tells people. Returns false when the task
+ * had already left those states (cancelled with its campaign, or handled by another worker).
  */
 async function handOffTask(
   deps: Deps,
   taskId: string,
-  status: Extract<TaskStatus, "ESCALATED" | "FAILED">,
+  status: HandOffStatus,
   handOff: HandOff,
-  alert: Extract<AlertKind, "escalated" | "failed" | "stuck">,
+  alert: HandOffAlert,
 ): Promise<boolean> {
-  const task = await loadTask(deps.prisma, taskId);
-  if (!task) return false;
   const events = new EventBatch();
-  const text = asSentence(`${describeTask(task)} ${handOff.message}`);
-
-  const changed = await deps.prisma.$transaction(async (tx) => {
-    const { count } = await tx.agentTask.updateMany({
-      where: { id: task.id, status: { in: ["QUEUED", "RUNNING"] } },
-      data: { status, error: text.slice(0, 2000), finishedAt: deps.clock.now() },
-    });
-    if (count === 0) return false;
-
-    if (task.postId) {
-      const post = await tx.post.update({
-        where: { id: task.postId },
-        data: { needsAttention: true, attentionReason: text.slice(0, 500) },
-      });
-      postUpdated(events, post);
-    }
-
-    const threadId = task.graph.campaign.thread?.id;
-    if (threadId) {
-      const message = await createAgentMessage(tx, {
-        threadId,
-        agent: "MANAGER",
-        kind: "ESCALATION",
-        content: `${text} It needs a human: retry it from the task list once the cause is fixed.`,
-        payload: {
-          taskId: task.id,
-          agent: task.agent,
-          action: task.action,
-          postId: task.postId,
-          postRef: task.post?.ref ?? null,
-          reason: handOff.reason,
-          issues: handOff.issues,
-        },
-      });
-      messageCreated(events, message);
-    }
-
-    events.alert({
-      kind: alert,
-      entityType: "AgentTask",
-      entityId: task.id,
-      message: text,
-      clientId: task.graph.campaign.clientId,
-      campaignId: task.graph.campaignId,
-    });
-    return true;
-  });
-  if (!changed) return false;
+  const task = await deps.prisma.$transaction((tx) =>
+    handOffTaskIn(tx, deps, { taskId, status, handOff, alert }, events),
+  );
+  if (!task) return false;
 
   await events.publish(deps);
-  await reportTransition(deps, task, "escalated");
+  await reportHandOff(deps, task);
   return true;
+}
+
+export interface HandOffRequest {
+  taskId: string;
+  status: HandOffStatus;
+  handOff: HandOff;
+  alert: HandOffAlert;
+  /** The statuses the task may be handed off from (default: queued, running or waiting). */
+  from?: readonly TaskStatus[];
+}
+
+/**
+ * A hand-off's writes inside the caller's transaction, for a change that must commit together
+ * with it (a take marked FAILED and the task that waited on it): the task moves to `status`, its
+ * post needs attention, and the ESCALATION message and the alert join `events`. Returns the task
+ * when it moved, null when it had already left `from`. Once committed, the caller publishes
+ * `events` and calls reportHandOff.
+ */
+export async function handOffTaskIn(
+  tx: DbTransaction,
+  deps: Pick<Deps, "clock">,
+  request: HandOffRequest,
+  events: EventBatch,
+): Promise<TaskWithContext | null> {
+  const { handOff } = request;
+  const task = await loadTask(tx, request.taskId);
+  if (!task) return null;
+  const text = asSentence(`${describeTask(task)} ${handOff.message}`);
+
+  const { count } = await tx.agentTask.updateMany({
+    where: { id: task.id, status: { in: [...(request.from ?? HAND_OFF_FROM)] } },
+    data: { status: request.status, error: text.slice(0, 2000), finishedAt: deps.clock.now() },
+  });
+  if (count === 0) return null;
+
+  if (task.postId) {
+    const post = await tx.post.update({
+      where: { id: task.postId },
+      data: { needsAttention: true, attentionReason: text.slice(0, 500) },
+    });
+    postUpdated(events, post);
+  }
+
+  const threadId = task.graph.campaign.thread?.id;
+  if (threadId) {
+    const message = await createAgentMessage(tx, {
+      threadId,
+      agent: handOff.signedBy ?? "MANAGER",
+      kind: "ESCALATION",
+      content: `${text} It needs a human: ${nextStep(task)}.`,
+      payload: {
+        taskId: task.id,
+        agent: task.agent,
+        action: task.action,
+        postId: task.postId,
+        postRef: task.post?.ref ?? null,
+        reason: handOff.reason,
+        issues: handOff.issues,
+      },
+    });
+    messageCreated(events, message);
+  }
+
+  events.alert({
+    kind: request.alert,
+    entityType: "AgentTask",
+    entityId: task.id,
+    message: text,
+    clientId: task.graph.campaign.clientId,
+    campaignId: task.graph.campaignId,
+  });
+  return task;
+}
+
+/** The progress line after a committed hand-off (handOffTaskIn). */
+export function reportHandOff(deps: Deps, task: TaskWithContext): Promise<void> {
+  return reportTransition(deps, task, "escalated");
 }
 
 /*

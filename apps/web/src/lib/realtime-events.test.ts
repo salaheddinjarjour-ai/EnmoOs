@@ -38,6 +38,7 @@ function post(overrides: Partial<PostDto> = {}): PostDto {
     angle: "Iced line",
     hook: null,
     copy: null,
+    currentAssets: [],
     humanEditCount: 0,
     editable: false,
     revision: 0,
@@ -151,6 +152,23 @@ describe("effectsOf", () => {
         },
       }),
     ).toEqual([queryKeyId(queryKeys.campaigns.tasks("c1"))]);
+  });
+
+  it("refreshes post cards and the Vault when a take changes", () => {
+    expect(
+      invalidated({
+        type: "asset.updated",
+        payload: {
+          assetId: "a1",
+          clientId: "cl1",
+          campaignId: "c1",
+          postId: "post1",
+          status: "READY",
+          version: 2,
+          isCurrent: true,
+        },
+      }),
+    ).toEqual([queryKeyId(queryKeys.posts.all), queryKeyId(queryKeys.assets.all)]);
   });
 });
 

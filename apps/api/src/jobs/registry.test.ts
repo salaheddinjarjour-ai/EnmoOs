@@ -29,8 +29,8 @@ describe("processors", () => {
 });
 
 describe("activeQueues", () => {
-  it("starts consumers for agents and ops in Phase 2", () => {
-    expect(activeQueues(processors)).toEqual(["agents", "ops"]);
+  it("starts consumers for every queue once Phase 3 renders on media", () => {
+    expect(activeQueues(processors)).toEqual(["agents", "media", "ops"]);
   });
 
   it("lists the queues that have processors, in queue order", () => {

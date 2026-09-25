@@ -10,3 +10,12 @@ export {
 export { validateIntake } from "./intake";
 export { validatePlan } from "./plan";
 export { validateQa } from "./qa";
+export {
+  SHOTS_CHECK,
+  automatedShotCheck,
+  postShotSlots,
+  shotCoverageIssues,
+  validateVisualDirect,
+  validateVisualReview,
+  type ShotSlot,
+} from "./visual-director";

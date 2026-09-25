@@ -11,7 +11,7 @@
 #                     REDIS_URL, TOKEN_ENC_KEY, ANTHROPIC_API_KEY,
 #                     R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY,
 #                   and later META_APP_ID, META_APP_SECRET, TIKTOK_CLIENT_KEY, TIKTOK_CLIENT_SECRET,
-#                   HIGGSFIELD_KEY_ID, HIGGSFIELD_KEY_SECRET, HIGGSFIELD_IMAGE_MODEL,
+#                   HIGGSFIELD_CREDENTIALS, HIGGSFIELD_IMAGE_MODEL,
 #                   HIGGSFIELD_VIDEO_MODEL (optionally SEED_ADMIN_EMAIL / SEED_ADMIN_PASSWORD for the
 #                   very first boot). The README's env reference explains each one;
 #   - DATABASE_URL, wired per service from enmo-db.
@@ -64,7 +64,8 @@ envVarGroups:
         value: r2
       - key: R2_BUCKET
         value: enmo-assets
-      - key: PUBLIC_ASSET_BASE_URL
+      # The bucket's custom domain (README "Cloudflare R2"); every asset URL starts with it.
+      - key: R2_PUBLIC_BASE_URL
         value: https://assets.enmo.marketing
       - key: META_GRAPH_VERSION
         value: v26.0

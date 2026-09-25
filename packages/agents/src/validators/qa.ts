@@ -58,7 +58,8 @@ export function validateQa(output: ManagerQaOutput, input: ManagerQaInput): Issu
         }
         break;
       case "VISUAL_DIRECTOR":
-        if (!input.visuals?.length) {
+        // [] still has visuals under review: shots were planned, none of them current.
+        if (input.visuals === null) {
           issues.push({
             path: `issues[${i}].target`,
             message:

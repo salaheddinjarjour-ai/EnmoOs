@@ -11,6 +11,11 @@ export const COPY_LIMITS = {
   hookMaxSec: 3,
   /** Allowed gap/overlap between contiguous scenes and between Σ durations and the total. */
   durationToleranceSec: 0.25,
+  /**
+   * The Visual Director plans one shot per scene and at most VISUAL_LIMITS.shotsMax shots, which
+   * is derived from this: a longer script could never get its visuals.
+   */
+  scenesMax: 12,
   slidesMin: 3,
   slidesMax: 10,
 } as const;

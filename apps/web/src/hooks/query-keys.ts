@@ -1,4 +1,9 @@
-import type { ApprovalListQuery, CampaignListQuery, PostListQuery } from "@enmo/shared";
+import type {
+  ApprovalListQuery,
+  AssetListQuery,
+  CampaignListQuery,
+  PostListQuery,
+} from "@enmo/shared";
 
 /*
  * TanStack Query keys, in one place so invalidation stays consistent. Client lists are invalidated
@@ -41,6 +46,15 @@ export const queryKeys = {
     lists: () => ["posts", "list"] as const,
     list: (filters: PostListQuery = {}) => ["posts", "list", filters] as const,
     detail: (postId: string) => ["posts", "detail", postId] as const,
+  },
+  /** The Vault: GET /assets (searchable, paginated) and GET /assets/:id (with lineage). */
+  assets: {
+    all: ["assets"] as const,
+    lists: () => ["assets", "list"] as const,
+    /** Filters without the cursor: an infinite query pages through them. */
+    list: (filters: Partial<Omit<AssetListQuery, "cursor">> = {}) =>
+      ["assets", "list", filters] as const,
+    detail: (assetId: string) => ["assets", "detail", assetId] as const,
   },
   approvals: {
     all: ["approvals"] as const,

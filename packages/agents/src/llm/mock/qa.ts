@@ -5,11 +5,13 @@ import {
   type ManagerQaOutput,
   type QaIssue,
 } from "@enmo/shared";
+import { SHOTS_CHECK } from "../../validators/visual-director";
 import { POST_TYPE_NOUN, joinList } from "./text";
 
 /*
  * manager.qa for MockLlm: passes unless an automated check failed, in which case each failure
- * goes back to the Copywriter as a concrete instruction. The `weak` fault forces one revise.
+ * goes back as a concrete instruction: to the Visual Director when the shots no longer fit the copy
+ * (the "shots" check), to the Copywriter otherwise. The `weak` fault forces one revise.
  */
 
 /** The copy field an automated check is about, by its name. */
@@ -37,12 +39,21 @@ export function mockQa(input: ManagerQaInput): ManagerQaOutput {
       summaryForReviewer: `On brief and on voice: this ${describe(input)} lands the angle "${input.post.angle}" and clears every automated check.`,
     };
   }
-  const issues: QaIssue[] = failed.map((check) => ({
-    target: "COPYWRITER",
-    field: fieldFor(check),
-    problem: `Automated check "${check.name}" failed${check.detail ? `: ${check.detail}` : "."}`,
-    instruction: `Fix the ${fieldFor(check)} so "${check.name}" passes, keeping the angle and voice intact.`,
-  }));
+  const issues: QaIssue[] = failed.map((check) =>
+    check.name === SHOTS_CHECK
+      ? {
+          target: "VISUAL_DIRECTOR",
+          field: "shots",
+          problem: `Automated check "${check.name}" failed${check.detail ? `: ${check.detail}` : "."}`,
+          instruction: "Plan exactly one shot for each scene or slide the copy has now.",
+        }
+      : {
+          target: "COPYWRITER",
+          field: fieldFor(check),
+          problem: `Automated check "${check.name}" failed${check.detail ? `: ${check.detail}` : "."}`,
+          instruction: `Fix the ${fieldFor(check)} so "${check.name}" passes, keeping the angle and voice intact.`,
+        },
+  );
   return {
     verdict: "revise",
     issues,

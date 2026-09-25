@@ -13,10 +13,14 @@ export interface LlmSystemBlock {
 
 export type LlmImageMediaType = "image/png" | "image/jpeg" | "image/webp" | "image/gif";
 
-export type LlmContentBlock =
-  | { type: "text"; text: string }
-  /** `data` is base64 (Visual Director review sends the render downscaled to 1568px). */
-  | { type: "image"; mediaType: LlmImageMediaType; data: string };
+/** `data` is base64 (Visual Director review sends the render downscaled to a 1568px long edge). */
+export interface LlmImageBlock {
+  type: "image";
+  mediaType: LlmImageMediaType;
+  data: string;
+}
+
+export type LlmContentBlock = { type: "text"; text: string } | LlmImageBlock;
 
 export interface LlmMessage {
   role: "user" | "assistant";

@@ -130,6 +130,8 @@ function childEnv(port, storageDir) {
     VISUAL_PROVIDER: "mock",
     PUBLISH_MODE: "dry-run",
     STORAGE_DRIVER: "local",
+    // Production refuses the local driver (Render's disk is ephemeral); the smoke run's is a temp dir.
+    ALLOW_LOCAL_STORAGE_IN_PRODUCTION: "true",
     STORAGE_LOCAL_DIR: storageDir,
     TOKEN_ENC_KEY: process.env.TOKEN_ENC_KEY || SMOKE_TOKEN_ENC_KEY,
   };

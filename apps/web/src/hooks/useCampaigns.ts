@@ -72,6 +72,8 @@ export function useResolveTask(campaignId: string) {
       Promise.all([
         queryClient.invalidateQueries({ queryKey: queryKeys.campaigns.tasks(campaignId) }),
         queryClient.invalidateQueries({ queryKey: queryKeys.posts.all }),
+        // accept_best moves which take of each shot is current.
+        queryClient.invalidateQueries({ queryKey: queryKeys.assets.all }),
       ]),
   });
 }

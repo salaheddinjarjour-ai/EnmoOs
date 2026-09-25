@@ -9,6 +9,20 @@ import {
 
 const KEY_HEX = "ab".repeat(32);
 
+/** Production with the key it requires and the local disk explicitly allowed. */
+const PRODUCTION = {
+  NODE_ENV: "production",
+  TOKEN_ENC_KEY: KEY_HEX,
+  ALLOW_LOCAL_STORAGE_IN_PRODUCTION: "true",
+} as const;
+
+const R2_CREDENTIALS = {
+  R2_ACCOUNT_ID: "account",
+  R2_ACCESS_KEY_ID: "access",
+  R2_SECRET_ACCESS_KEY: "secret",
+  R2_BUCKET: "enmo-assets",
+} as const;
+
 describe("loadConfig", () => {
   it("has working dev defaults once TOKEN_ENC_KEY is provided", () => {
     const config = loadConfig({ TOKEN_ENC_KEY: KEY_HEX });
@@ -25,10 +39,14 @@ describe("loadConfig", () => {
       VISUAL_PROVIDER: "mock",
       PUBLISH_MODE: "dry-run",
       STORAGE_DRIVER: "local",
-      PIPELINE_ACTIONS: ["write", "qa"],
+      PIPELINE_ACTIONS: ["write", "direct", "qa"],
       META_GRAPH_VERSION: "v26.0",
       API_PUBLIC_URL: "http://localhost:4000",
-      PUBLIC_ASSET_BASE_URL: "http://localhost:4000/v1/files",
+      STORAGE_LOCAL_DIR: ".data/assets",
+      PUBLIC_ASSET_BASE_URL: "http://localhost:4000/files",
+      R2_PUBLIC_BASE_URL: "https://assets.enmo.marketing",
+      MAX_VISUAL_REGENERATIONS: 2,
+      RENDER_POLL_DELAY_MS: 3_000,
     });
     expect(config.TOKEN_ENC_KEY).toEqual(Buffer.from(KEY_HEX, "hex"));
   });
@@ -152,13 +170,10 @@ describe("loadConfig", () => {
 
   it("drains idle workers slower in production", () => {
     expect(loadConfig({ NODE_ENV: "test" }).BULLMQ_DRAIN_DELAY_SEC).toBe(5);
-    expect(
-      loadConfig({ NODE_ENV: "production", TOKEN_ENC_KEY: KEY_HEX }).BULLMQ_DRAIN_DELAY_SEC,
-    ).toBe(20);
-    expect(
-      loadConfig({ NODE_ENV: "production", TOKEN_ENC_KEY: KEY_HEX, BULLMQ_DRAIN_DELAY_SEC: "8" })
-        .BULLMQ_DRAIN_DELAY_SEC,
-    ).toBe(8);
+    expect(loadConfig(PRODUCTION).BULLMQ_DRAIN_DELAY_SEC).toBe(20);
+    expect(loadConfig({ ...PRODUCTION, BULLMQ_DRAIN_DELAY_SEC: "8" }).BULLMQ_DRAIN_DELAY_SEC).toBe(
+      8,
+    );
   });
 
   it("rejects origins with paths and unknown pipeline actions", () => {
@@ -189,15 +204,9 @@ describe("loadConfig", () => {
   });
 
   it("refuses TRUST_PROXY=true in production, where it would let clients pick their IP", () => {
-    expect(() =>
-      loadConfig({ NODE_ENV: "production", TOKEN_ENC_KEY: KEY_HEX, TRUST_PROXY: "true" }),
-    ).toThrow(/TRUST_PROXY=true/);
+    expect(() => loadConfig({ ...PRODUCTION, TRUST_PROXY: "true" })).toThrow(/TRUST_PROXY=true/);
     expect(
-      loadConfig({
-        NODE_ENV: "production",
-        TOKEN_ENC_KEY: KEY_HEX,
-        TRUST_PROXY: "loopback,uniquelocal,cloudflare",
-      }).TRUST_PROXY,
+      loadConfig({ ...PRODUCTION, TRUST_PROXY: "loopback,uniquelocal,cloudflare" }).TRUST_PROXY,
     ).toEqual(["loopback", "uniquelocal", "cloudflare"]);
     expect(
       loadConfig({ NODE_ENV: "development", TRUST_PROXY: "true", TOKEN_ENC_KEY: KEY_HEX })
@@ -206,7 +215,7 @@ describe("loadConfig", () => {
   });
 
   it("defaults secure cookies on in production", () => {
-    expect(loadConfig({ NODE_ENV: "production", TOKEN_ENC_KEY: KEY_HEX }).COOKIE_SECURE).toBe(true);
+    expect(loadConfig(PRODUCTION).COOKIE_SECURE).toBe(true);
   });
 
   it("picks the LLM provider from the key unless told otherwise", () => {
@@ -227,6 +236,119 @@ describe("loadConfig", () => {
       /HIGGSFIELD/,
     );
     expect(() => loadConfig({ NODE_ENV: "test", STORAGE_DRIVER: "r2" })).toThrow(/R2_ACCOUNT_ID/);
+  });
+
+  it("refuses Higgsfield without an image model, which every post type needs; video is optional", () => {
+    const keys = {
+      NODE_ENV: "test",
+      VISUAL_PROVIDER: "higgsfield",
+      HIGGSFIELD_CREDENTIALS: "id:s",
+    };
+    expect(() => loadConfig(keys)).toThrow(/requires HIGGSFIELD_IMAGE_MODEL/);
+    // A blank value in a .env file counts as unset.
+    expect(() => loadConfig({ ...keys, HIGGSFIELD_IMAGE_MODEL: " " })).toThrow(
+      /HIGGSFIELD_IMAGE_MODEL/,
+    );
+    expect(() => loadConfig({ ...keys, HIGGSFIELD_VIDEO_MODEL: "kling" })).toThrow(
+      /HIGGSFIELD_IMAGE_MODEL/,
+    );
+    const stills = loadConfig({ ...keys, HIGGSFIELD_IMAGE_MODEL: "soul" });
+    expect(stills).toMatchObject({ HIGGSFIELD_IMAGE_MODEL: "soul" });
+    expect(stills.HIGGSFIELD_VIDEO_MODEL).toBeUndefined();
+    // The mock provider needs neither.
+    expect(loadConfig({ NODE_ENV: "test", VISUAL_PROVIDER: "mock" }).VISUAL_PROVIDER).toBe("mock");
+  });
+
+  it("takes the Higgsfield key as one credentials value or as an id/secret pair", () => {
+    const combined = loadConfig({
+      NODE_ENV: "test",
+      VISUAL_PROVIDER: "higgsfield",
+      HIGGSFIELD_CREDENTIALS: "key-id:key-secret",
+      HIGGSFIELD_IMAGE_MODEL: "soul",
+    });
+    expect(combined).toMatchObject({
+      HIGGSFIELD_KEY_ID: "key-id",
+      HIGGSFIELD_KEY_SECRET: "key-secret",
+      HIGGSFIELD_BASE_URL: "https://api.higgsfield.ai",
+    });
+    const pair = loadConfig({
+      NODE_ENV: "test",
+      VISUAL_PROVIDER: "higgsfield",
+      HIGGSFIELD_KEY_ID: "id",
+      HIGGSFIELD_KEY_SECRET: "secret",
+      HIGGSFIELD_IMAGE_MODEL: "soul",
+    });
+    expect(pair).toMatchObject({ HIGGSFIELD_KEY_ID: "id", HIGGSFIELD_KEY_SECRET: "secret" });
+    expect(configuredIntegrations(pair).higgsfield).toBe(true);
+
+    expect(() => loadConfig({ NODE_ENV: "test", HIGGSFIELD_CREDENTIALS: "no-secret" })).toThrow(
+      /HIGGSFIELD_CREDENTIALS/,
+    );
+    expect(() =>
+      loadConfig({
+        NODE_ENV: "test",
+        HIGGSFIELD_CREDENTIALS: "key-id:key-secret",
+        HIGGSFIELD_KEY_ID: "id",
+      }),
+    ).toThrow(/not both/);
+  });
+
+  it("parses the visual loop knobs", () => {
+    const config = loadConfig({
+      NODE_ENV: "test",
+      MAX_VISUAL_REGENERATIONS: "0",
+      RENDER_POLL_DELAY_MS: "50",
+    });
+    expect(config.MAX_VISUAL_REGENERATIONS).toBe(0);
+    expect(config.RENDER_POLL_DELAY_MS).toBe(50);
+    // The spec caps regenerations at 2: the env may lower that cost guard, never raise it.
+    expect(loadConfig({ NODE_ENV: "test" }).MAX_VISUAL_REGENERATIONS).toBe(2);
+    expect(() => loadConfig({ NODE_ENV: "test", MAX_VISUAL_REGENERATIONS: "3" })).toThrow(
+      /MAX_VISUAL_REGENERATIONS/,
+    );
+    expect(() => loadConfig({ NODE_ENV: "test", RENDER_POLL_DELAY_MS: "60000" })).toThrow(
+      /RENDER_POLL_DELAY_MS/,
+    );
+  });
+
+  it("serves local files from this API and R2 files from the bucket's domain", () => {
+    expect(
+      loadConfig({ NODE_ENV: "test", API_PUBLIC_URL: "https://api.enmo.test/" })
+        .PUBLIC_ASSET_BASE_URL,
+    ).toBe("https://api.enmo.test/files");
+    expect(
+      loadConfig({ NODE_ENV: "test", PUBLIC_ASSET_BASE_URL: "https://cdn.enmo.test/files/" })
+        .PUBLIC_ASSET_BASE_URL,
+    ).toBe("https://cdn.enmo.test/files");
+    const r2 = loadConfig({
+      NODE_ENV: "test",
+      STORAGE_DRIVER: "r2",
+      ...R2_CREDENTIALS,
+      R2_PUBLIC_BASE_URL: "https://media.enmo.test",
+    });
+    expect(r2.R2_PUBLIC_BASE_URL).toBe("https://media.enmo.test");
+    expect(() =>
+      loadConfig({
+        NODE_ENV: "test",
+        STORAGE_DRIVER: "r2",
+        ...R2_CREDENTIALS,
+        PUBLIC_ASSET_BASE_URL: "https://assets.enmo.marketing",
+      }),
+    ).toThrow(/R2_PUBLIC_BASE_URL/);
+  });
+
+  it("refuses local storage in production unless the disk is declared durable", () => {
+    const production = { NODE_ENV: "production", TOKEN_ENC_KEY: KEY_HEX } as const;
+    expect(() => loadConfig(production)).toThrow(/STORAGE_DRIVER=local in production/);
+    expect(loadConfig({ ...production, ALLOW_LOCAL_STORAGE_IN_PRODUCTION: "true" })).toMatchObject({
+      STORAGE_DRIVER: "local",
+    });
+    expect(
+      loadConfig({ ...production, STORAGE_DRIVER: "r2", ...R2_CREDENTIALS }).STORAGE_DRIVER,
+    ).toBe("r2");
+    expect(loadConfig({ NODE_ENV: "development", TOKEN_ENC_KEY: KEY_HEX }).STORAGE_DRIVER).toBe(
+      "local",
+    );
   });
 
   it("validates the seed admin pair", () => {

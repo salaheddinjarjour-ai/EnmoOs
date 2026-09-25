@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import cookie from "@fastify/cookie";
-import Fastify, { type FastifyBaseLogger } from "fastify";
+import Fastify, { type FastifyBaseLogger, type FastifyReply } from "fastify";
 import {
   serializerCompiler,
   validatorCompiler,
@@ -9,7 +9,7 @@ import {
 import type { Deps } from "./deps";
 import { clientIpGetter, clientIpPolicy } from "./lib/trusted-proxies";
 import { authPlugin } from "./plugins/auth";
-import { errorsPlugin } from "./plugins/errors";
+import { errorsPlugin, toErrorResponse } from "./plugins/errors";
 import { rbacPlugin } from "./plugins/rbac";
 import { securityPlugin } from "./plugins/security";
 import { registerRoutes } from "./routes/index";
@@ -24,6 +24,13 @@ export async function buildApp(deps: Deps): Promise<ApiApp> {
     trustProxy: clientIp.trustProxy,
     genReqId: () => randomUUID(),
     routerOptions: { ignoreTrailingSlash: true },
+    // Errors the router raises before any route or hook runs (a malformed percent-encoding such as
+    // /files/%zz, an over-long param) answer in the same { error } shape as everything else.
+    frameworkErrors: (error, _request, reply) => {
+      const { status, body } = toErrorResponse(error);
+      // The option is generic over route types; outside any route the reply is a plain one.
+      void (reply as unknown as FastifyReply).status(status).send(body);
+    },
   }).withTypeProvider<ZodTypeProvider>();
 
   app.setValidatorCompiler(validatorCompiler);

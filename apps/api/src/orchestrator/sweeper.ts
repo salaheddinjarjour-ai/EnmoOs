@@ -7,6 +7,7 @@ import { afterCommit } from "./after-commit";
 import { failTask } from "./escalation";
 import { advance } from "./graph";
 import { reportProgress } from "./progress";
+import { driveStaleRenders } from "./visuals";
 
 /*
  * tick.sweeper (DESIGN §D "Sweeper"), every 5 minutes:
@@ -16,8 +17,9 @@ import { reportProgress } from "./progress";
  *     day rolls over (or the cap was raised);
  *   - an approved graph with PENDING tasks whose dependencies all SUCCEEDED is advanced: advance()
  *     runs after a commit (plan approval, a decision, a finished task), and a crash or a failure
- *     in between would otherwise leave those tasks unqueued for good.
- * Stale WAITING render polls join this sweep in Phase 3, when renders exist.
+ *     in between would otherwise leave those tasks unqueued for good;
+ *   - renders whose next job was lost (a WAITING direct task's QUEUED, RENDERING or unreviewed
+ *     assets) get it again (visuals.ts driveStaleRenders).
  */
 
 export const STUCK_AFTER_MS = 15 * MINUTE_MS;
@@ -41,6 +43,8 @@ export interface SweepReport {
   requeuedBudget: number;
   /** Ready PENDING tasks that nothing had queued. */
   queuedReady: number;
+  /** render.submit / render.poll / visual.review jobs queued again for stale assets. */
+  drivenRenders: number;
 }
 
 export async function sweep(deps: Deps): Promise<SweepReport> {
@@ -49,10 +53,12 @@ export async function sweep(deps: Deps): Promise<SweepReport> {
     failedStuck: 0,
     requeuedBudget: 0,
     queuedReady: 0,
+    drivenRenders: 0,
   };
   await sweepStuck(deps, report);
   await sweepBudget(deps, report);
   await sweepReady(deps, report);
+  report.drivenRenders = await driveStaleRenders(deps);
   return report;
 }
 

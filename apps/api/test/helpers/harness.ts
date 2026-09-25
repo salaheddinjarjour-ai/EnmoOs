@@ -2,31 +2,34 @@ import type { AddressInfo } from "node:net";
 import { inspect } from "node:util";
 import type { LlmClient } from "@enmo/agents";
 import type { Client, User } from "@enmo/db";
+import type { Storage, VisualProvider } from "@enmo/providers";
 import {
   canonicalGraph,
   estimatePlan,
   type Brief,
   type ManagerPlanOutput,
+  type PipelineAction,
   type PostType,
 } from "@enmo/shared";
 import { buildApp } from "../../src/app";
-import type { EnvSource } from "../../src/config";
+import type { Config, EnvSource } from "../../src/config";
 import { createDeps, type Deps } from "../../src/deps";
 import { JOB_QUEUE, QUEUE_NAMES, type TickJobName } from "../../src/jobs/queues";
 import { processorFor, processors } from "../../src/jobs/registry";
 import { startWorkers, type WorkerRuntime } from "../../src/jobs/runtime";
 import { DAY_MS, FakeClock } from "../../src/lib/clock";
 import type { ApiApp, RouteModule } from "../../src/types";
-import { testConfig } from "./app";
+import { createTempStorageDir, testConfig } from "./app";
 import { testDb } from "./db";
 import { createClient, createUser } from "./factories";
 
 /*
  * The pipeline e2e harness (DESIGN §H "Pipeline e2e", test/e2e/phaseN.*): the real app listening
  * on a free port, in-process queue workers on a unique BULLMQ_PREFIX, the MockLlm (fault
- * injection through env MOCK_LLM_FAULTS) and a FakeClock. Scheduler ticks never fire on their own
- * (SCHEDULERS_ENABLED=false); tests call runTick(). Runs in the vitest "integration" project, whose
- * setup truncates every table before each test.
+ * injection through env MOCK_LLM_FAULTS), MockProvider, LocalStorage in a temporary directory and
+ * a FakeClock. Scheduler ticks never fire on their own (SCHEDULERS_ENABLED=false); tests call
+ * runTick(). Runs in the vitest "integration" project, whose setup truncates every table before
+ * each test.
  */
 
 export interface HarnessOptions {
@@ -39,6 +42,14 @@ export interface HarnessOptions {
   clock?: FakeClock;
   /** Replaces the LlmClient createLlm() builds from the env (MockLlm). */
   llm?: LlmClient;
+  /** Replaces the VisualProvider VISUAL_PROVIDER builds (MockProvider). */
+  visual?: VisualProvider;
+  /** Replaces the Storage STORAGE_DRIVER builds (LocalStorage in `storageDir`). */
+  storage?: Storage;
+  /** deps.fetch: what the providers call and renders download through (e.g. a fake Higgsfield). */
+  fetch?: typeof globalThis.fetch;
+  /** PIPELINE_ACTIONS for this harness (the config default otherwise); `env` may also set it. */
+  pipeline?: readonly PipelineAction[];
   /** Start the in-process queue workers (default true). */
   workers?: boolean;
   /** Extra routes mounted under /v1 before the app starts listening. */
@@ -55,6 +66,8 @@ export interface Harness {
   clock: FakeClock;
   /** deps.llm. */
   llm: LlmClient;
+  /** STORAGE_LOCAL_DIR: a temporary directory removed on stop() (unless `env` set its own). */
+  storageDir: string;
   /** http://127.0.0.1:<port>, for SSE clients and fetch. */
   url: string;
   /**
@@ -72,6 +85,12 @@ export interface Harness {
 }
 
 export const DEFAULT_WAIT_FOR_TIMEOUT_MS = 15_000;
+
+/**
+ * The Phase 2 suites' pipeline: copy, then Manager QA. They keep testing that flow on its own; the
+ * Visual Director's direct (default since Phase 3) has its own suites.
+ */
+export const PHASE2_PIPELINE: readonly PipelineAction[] = ["write", "qa"];
 const POLL_INTERVAL_MS = 50;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -103,8 +122,27 @@ export async function waitFor<T>(
 
 export async function startHarness(options: HarnessOptions = {}): Promise<Harness> {
   const clock = options.clock ?? new FakeClock();
-  const config = testConfig({ ...options.env, SCHEDULERS_ENABLED: "false" });
-  const deps = createDeps(config, { clock, ...(options.llm ? { llm: options.llm } : {}) });
+  const tempDir = await createTempStorageDir();
+  let config: Config;
+  let deps: Deps;
+  try {
+    config = testConfig({
+      STORAGE_LOCAL_DIR: tempDir.path,
+      ...(options.pipeline ? { PIPELINE_ACTIONS: options.pipeline.join(",") } : {}),
+      ...options.env,
+      SCHEDULERS_ENABLED: "false",
+    });
+    deps = createDeps(config, {
+      clock,
+      ...(options.llm ? { llm: options.llm } : {}),
+      ...(options.visual ? { visual: options.visual } : {}),
+      ...(options.storage ? { storage: options.storage } : {}),
+      ...(options.fetch ? { fetch: options.fetch } : {}),
+    });
+  } catch (error) {
+    await tempDir.remove();
+    throw error;
+  }
 
   let app: ApiApp | undefined;
   let workers: WorkerRuntime | undefined;
@@ -125,6 +163,7 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
         }
       } finally {
         await deps.close();
+        await tempDir.remove();
       }
     })());
 
@@ -149,6 +188,7 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
       deps,
       clock,
       llm: deps.llm,
+      storageDir: config.STORAGE_LOCAL_DIR,
       url,
       waitFor,
       async runTick(name) {
@@ -192,11 +232,14 @@ export interface SeedPlanOptions {
   admin?: User;
   /** Defaults to STATIC. */
   type?: PostType;
+  /** The per-post actions planned; defaults to the harness config's PIPELINE_ACTIONS. */
+  actions?: readonly PipelineAction[];
 }
 
 /**
- * A campaign whose brief is locked and whose plan v1 (write → qa per post, PROPOSED) waits for
- * approval, written straight to the database so a test's MockLlm calls start at the Copywriter.
+ * A campaign whose brief is locked and whose plan v1 (PROPOSED: write → [direct] → qa per post, as
+ * PIPELINE_ACTIONS enables) waits for approval, written straight to the database so a test's
+ * MockLlm calls start at the Copywriter.
  */
 export async function seedProposedPlan(h: Harness, options: SeedPlanOptions): Promise<SeededPlan> {
   const db = testDb();
@@ -229,10 +272,11 @@ export async function seedProposedPlan(h: Harness, options: SeedPlanOptions): Pr
     angle: `Golden hour ${i + 1}: the iced line as the day winds down`,
     pillarHint: null,
   }));
+  const actions = options.actions ?? h.deps.config.PIPELINE_ACTIONS;
   const plan: ManagerPlanOutput = {
-    summary: `${options.postCount} ${type.toLowerCase()} posts for Instagram, each drafted then checked.`,
+    summary: `${options.postCount} ${type.toLowerCase()} posts for Instagram, each ${actions.includes("direct") ? "drafted, directed" : "drafted"} then checked.`,
     posts,
-    nodes: canonicalGraph(posts, ["write", "qa"]),
+    nodes: canonicalGraph(posts, actions),
   };
 
   const campaign = await db.campaign.create({

@@ -10,7 +10,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { BANNED_HITS_REPORTED_MAX } from "../../src/services/posts";
 import { buildTestApp, type TestApp } from "../helpers/app";
 import { testDb } from "../helpers/db";
-import { createClient } from "../helpers/factories";
+import { createAsset, createAssetVersion, createClient } from "../helpers/factories";
 import {
   createTeam,
   obliterateQueues,
@@ -117,6 +117,56 @@ describe("GET /v1/posts/:id", () => {
 
   it("answers 404 for an unknown post", async () => {
     expect((await send("GET", "/v1/posts/nope", team.cookies.editor)).statusCode).toBe(404);
+  });
+
+  it("shows the current take of each shot in post order, renders in flight included", async () => {
+    const client = await createClient();
+    const { campaign, posts } = await seedPipeline({
+      createdBy: team.manager,
+      client,
+      postCount: 2,
+    });
+    const [post, otherPost] = posts;
+    const onPost = { client, campaignId: campaign.id, postId: post?.id };
+    const second = await createAsset({ ...onPost, shotId: "s2", slideIndex: 1 });
+    const firstV1 = await createAsset({ ...onPost, shotId: "s1", slideIndex: 0 });
+    const firstV2 = await createAssetVersion(firstV1, { status: "RENDERING" });
+    const third = await createAsset({ ...onPost, shotId: "s3", slideIndex: 2, status: "QUEUED" });
+    // Not shots on show: a rejected take, a master and another post's take.
+    await createAsset({ ...onPost, shotId: "s4", status: "REJECTED", isCurrent: false });
+    await createAsset({ ...onPost, role: "MASTER" });
+    await createAsset({ ...onPost, postId: otherPost?.id });
+
+    const response = await send("GET", `/v1/posts/${post?.id}`, team.cookies.editor);
+    expect(response.statusCode, response.body).toBe(200);
+    const { currentAssets } = response.json<PostDto>();
+    expect(currentAssets.map(({ id, status, version }) => ({ id, status, version }))).toEqual([
+      { id: firstV2.id, status: "RENDERING", version: 2 },
+      { id: second.id, status: "READY", version: 1 },
+      { id: third.id, status: "QUEUED", version: 1 },
+    ]);
+    expect(currentAssets[1]).toEqual({
+      id: second.id,
+      kind: "IMAGE",
+      status: "READY",
+      version: 1,
+      shotId: "s2",
+      sceneIndex: null,
+      slideIndex: 1,
+      url: second.url,
+      posterUrl: null,
+      mimeType: "image/png",
+      width: 1080,
+      height: 1920,
+      durationSec: null,
+    });
+    expect(currentAssets[0]).toMatchObject({ url: null, width: null, height: null });
+
+    // The board's list carries the same thumbnails.
+    const board = await send("GET", `/v1/posts?campaignId=${campaign.id}`, team.cookies.editor);
+    const items = board.json<PostListResponse>().items;
+    expect(items.find((item) => item.id === post?.id)?.currentAssets).toEqual(currentAssets);
+    expect(items.find((item) => item.id === otherPost?.id)?.currentAssets).toHaveLength(1);
   });
 });
 
@@ -312,6 +362,27 @@ describe("PATCH /v1/posts/:id/copy", () => {
       [
         "slides",
         { ...copy, slides: Array.from({ length: 11 }, (_, index) => ({ ...slide, index })) },
+      ],
+      // One more scene than the Visual Director can give a shot each (COPY_LIMITS.scenesMax).
+      [
+        "script.scenes",
+        {
+          ...copy,
+          onScreenText: null,
+          script: {
+            totalDurationSec: 26,
+            hookTimestampSec: 1,
+            hookText: "Wait for it",
+            scenes: Array.from({ length: 13 }, (_, index) => ({
+              index,
+              startSec: index * 2,
+              durationSec: 2,
+              voiceover: "Cold.",
+              overlayText: "",
+              visualNote: "Glass",
+            })),
+          },
+        },
       ],
     ] as const) {
       const response = await send("PATCH", url, team.cookies.editor, { copy: edit });

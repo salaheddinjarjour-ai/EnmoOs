@@ -9,15 +9,19 @@ import { errorMessage } from "@/lib/api";
 import { useCan } from "@/lib/auth";
 
 /*
- * A task the Arsenal gave up on after its contract retries (DESIGN §C: invalid output, refusal,
- * truncation), signed by the Manager. The contract issues are listed as the runner saw them; a
- * Manager or Admin can send the task round again with fresh attempts.
+ * A task the Arsenal gave up on (DESIGN §C/§D: contract retries used up, a refusal, a render the
+ * provider refused or failed, weak takes after every regeneration). The issues are listed as the
+ * agent saw them; a Manager or Admin can send the task round again with fresh attempts or, for the
+ * Visual Director's shots, keep the best-scored take of each shot and let the post move on.
  */
 
 const REASON: Readonly<Record<string, string>> = {
   INVALID_OUTPUT: "Output kept failing its contract",
   REFUSED: "The model refused",
   TRUNCATED: "The answer kept running out of room",
+  WEAK_TAKES: "Takes stayed weak after every regeneration",
+  RENDER_REJECTED: "The visual provider refused the render",
+  RENDER_FAILED: "The render failed",
 };
 
 const OPEN = new Set<AgentTaskDto["status"]>(["ESCALATED", "FAILED"]);
@@ -37,6 +41,8 @@ export function EscalationCard({
   const resolve = useResolveTask(campaignId);
   const stillOpen = task ? OPEN.has(task.status) : true;
   const subject = payload.postRef ? `${payload.postRef}` : "the campaign";
+  // Only the Visual Director's shots have takes to choose between (POST /agent-tasks/:id/resolve).
+  const hasTakes = payload.agent === "VISUAL_DIRECTOR" && payload.action === "direct";
 
   function retry() {
     resolve.mutate(
@@ -47,6 +53,16 @@ export function EscalationCard({
             `${AGENT_LABEL[payload.agent]} is retrying ${subject}`,
             "Fresh attempts, same brief.",
           ),
+      },
+    );
+  }
+
+  function acceptBest() {
+    resolve.mutate(
+      { taskId: payload.taskId, action: "accept_best" },
+      {
+        onSuccess: () =>
+          toast.success(`Kept the best takes for ${subject}`, "The post moves on to QA."),
       },
     );
   }
@@ -77,14 +93,37 @@ export function EscalationCard({
       ) : null}
       {stillOpen ? (
         canResolve ? (
-          <div className="flex items-center gap-3">
-            <Button variant="primary" size="sm" onClick={retry} loading={resolve.isPending}>
+          <div className="flex flex-wrap items-center gap-3">
+            {hasTakes ? (
+              <Button
+                variant="primary"
+                size="sm"
+                onClick={acceptBest}
+                disabled={resolve.isPending}
+                loading={resolve.isPending && resolve.variables?.action === "accept_best"}
+              >
+                Accept best take
+              </Button>
+            ) : null}
+            <Button
+              variant={hasTakes ? "secondary" : "primary"}
+              size="sm"
+              onClick={retry}
+              disabled={resolve.isPending}
+              loading={resolve.isPending && resolve.variables?.action === "retry"}
+            >
               Retry
             </Button>
-            <span className="text-xs text-steel">Runs the task again with fresh attempts.</span>
+            <span className="text-xs text-steel">
+              {hasTakes
+                ? "Keep each shot's best-scored take, or run the shots again."
+                : "Runs the task again with fresh attempts."}
+            </span>
           </div>
         ) : (
-          <p className="text-xs text-steel">A Manager or Admin can retry it.</p>
+          <p className="text-xs text-steel">
+            A Manager or Admin can {hasTakes ? "accept the best take or retry it" : "retry it"}.
+          </p>
         )
       ) : (
         <p className="font-mono text-[11px] tracking-[0.12em] text-steel uppercase">

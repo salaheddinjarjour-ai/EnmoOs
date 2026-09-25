@@ -99,6 +99,12 @@ function scriptIssues(script: Script, post: PostContext): Issue[] {
   if (blank(script.hookText)) {
     issues.push({ path: "script.hookText", message: "Write the hook line the first scene lands." });
   }
+  if (scenes.length > COPY_LIMITS.scenesMax) {
+    issues.push({
+      path: "script.scenes",
+      message: `The script has ${scenes.length} scenes; use at most ${COPY_LIMITS.scenesMax} (each scene gets its own shot), merging beats that share a visual.`,
+    });
+  }
 
   let expectedStart = 0;
   let total = 0;

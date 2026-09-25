@@ -1,10 +1,11 @@
 import { expect, test, type BrowserContext, type Locator, type Page } from "@playwright/test";
-import { API_URL, E2E_ADMIN } from "./env";
+import { API_URL, E2E_ADMIN, PIPELINE_ACTIONS } from "./env";
 import { addChips, primaryNav, signIn, toast } from "./helpers";
 
 /*
- * Phase 2 exit (DESIGN "Phase 2 — First words"): brief → caption drafts → approve in the UI, text
- * only, against the mock LLM with the embedded worker (see playwright.config.ts). The admin briefs
+ * Phase 2 exit (DESIGN "Phase 2 — First words"): brief → caption drafts → approve in the UI,
+ * against the mock LLM with the embedded worker (see playwright.config.ts). The copy story is told
+ * here; the Visual Director's shots that the Phase 3 pipeline adds are covered by phase3.spec.ts. The admin briefs
  * a new client's Ramadan campaign in chat; the Manager asks exactly one consolidated question,
  * then proposes a plan, and nothing is generated until a human approves it. A change request on
  * the plan comes back as version 2 quoting the note verbatim. Approving it drafts twelve posts
@@ -203,10 +204,15 @@ test("one post is approved on its own; Request Changes reaches the Copywriter ve
     await p3.getByRole("button", { name: "Request changes" }).click();
     const dialog = page.getByRole("dialog", { name: "Request changes to p3" });
     await dialog.getByLabel("What should change?").fill(POST_FEEDBACK);
-    // Text only until the Visual Director joins: Copy is the target.
+    // Copy is the default target. The Visual Director is in the pipeline (write,direct,qa), so
+    // Visual and Both are offered too; a pipeline without it (E2E_PIPELINE_ACTIONS=write,qa)
+    // offers Copy only.
     await expect(dialog.getByRole("radio", { name: "Copy" })).toBeChecked();
-    await expect(dialog.getByRole("radio", { name: "Visual" })).toBeDisabled();
-    await expect(dialog.getByRole("radio", { name: "Both" })).toBeDisabled();
+    const withVisuals = PIPELINE_ACTIONS.split(",").includes("direct");
+    for (const target of ["Visual", "Both"]) {
+      const radio = dialog.getByRole("radio", { name: target });
+      await (withVisuals ? expect(radio).toBeEnabled() : expect(radio).toBeDisabled());
+    }
     await dialog.getByRole("button", { name: "Request changes" }).click();
     await expect(toast(page, "Changes requested on p3")).toBeVisible();
 

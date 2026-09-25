@@ -23,6 +23,7 @@ function pending(currentStep: number, stepCount: number): PostDto {
     angle: null,
     hook: null,
     copy: null,
+    currentAssets: [],
     humanEditCount: 0,
     editable: false,
     revision: 0,

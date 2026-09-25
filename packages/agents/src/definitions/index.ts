@@ -7,10 +7,15 @@ import type {
   ManagerPlanOutput,
   ManagerQaInput,
   ManagerQaOutput,
+  VisualDirectInput,
+  VisualDirectOutput,
+  VisualReviewInput,
+  VisualReviewOutput,
 } from "@enmo/shared";
 import type { AgentDefinition } from "../definition";
 import { copywriterWrite } from "./copywriter";
 import { managerIntake, managerPlan, managerQa } from "./manager";
+import { visualDirectorDirect, visualDirectorReview } from "./visual-director";
 
 export { copywriterWrite } from "./copywriter";
 export {
@@ -20,6 +25,7 @@ export {
   managerPlan,
   managerQa,
 } from "./manager";
+export { visualDirectorDirect, visualDirectorReview } from "./visual-director";
 
 /** Every agent action the orchestrator runs, by `${agent}.${action}`. Later phases add theirs. */
 export interface AgentDefinitions {
@@ -27,6 +33,8 @@ export interface AgentDefinitions {
   "MANAGER.plan": AgentDefinition<ManagerPlanInput, ManagerPlanOutput>;
   "MANAGER.qa": AgentDefinition<ManagerQaInput, ManagerQaOutput>;
   "COPYWRITER.write": AgentDefinition<CopywriterInput, CopywriterOutput>;
+  "VISUAL_DIRECTOR.direct": AgentDefinition<VisualDirectInput, VisualDirectOutput>;
+  "VISUAL_DIRECTOR.review": AgentDefinition<VisualReviewInput, VisualReviewOutput>;
 }
 
 export type AgentKey = keyof AgentDefinitions;
@@ -38,6 +46,8 @@ export const AGENT_DEFINITIONS: AgentRegistry = {
   "MANAGER.plan": managerPlan,
   "MANAGER.qa": managerQa,
   "COPYWRITER.write": copywriterWrite,
+  "VISUAL_DIRECTOR.direct": visualDirectorDirect,
+  "VISUAL_DIRECTOR.review": visualDirectorReview,
 };
 
 /** The definition for `key`; throws if it hasn't been registered. */

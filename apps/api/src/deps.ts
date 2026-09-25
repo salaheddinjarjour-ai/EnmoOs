@@ -1,5 +1,13 @@
 import { createLlm, type LlmClient, type LlmConfig } from "@enmo/agents";
 import { createPrisma, type DbClient } from "@enmo/db";
+import {
+  createStorage,
+  createVisualProvider,
+  type Storage,
+  type StorageConfig,
+  type VisualProvider,
+  type VisualProviderConfig,
+} from "@enmo/providers";
 import { realtimeRedisChannel } from "@enmo/shared";
 import type { Redis } from "ioredis";
 import type { Config } from "./config";
@@ -13,7 +21,7 @@ import { createRealtimePublisher, type RealtimePublisher } from "./realtime/publ
 /*
  * The process-wide dependency container. Routes read it as `app.deps` (or `request.server.deps`),
  * services, orchestrator modules and job processors take it as their first argument. Later phases
- * add visual, storage and publishers here.
+ * add publishers here.
  */
 export interface Deps {
   readonly config: Config;
@@ -30,12 +38,24 @@ export interface Deps {
   readonly queues: JobQueues;
   /** RealtimeEvent row + Redis PUBLISH, from the API and the worker alike. */
   readonly realtime: RealtimePublisher;
+  /** VISUAL_PROVIDER's renderer (MockProvider or HiggsfieldProvider). */
+  readonly visual: VisualProvider;
+  /** STORAGE_DRIVER's file store (local disk served at /files/*, or R2). */
+  readonly storage: Storage;
+  /**
+   * Outbound HTTP for providers and render downloads (DESIGN §F: all of it goes through an
+   * injected fetch, so tests aim it at fakes). The global fetch unless overridden.
+   */
+  readonly fetch: typeof globalThis.fetch;
   /** Releases what createDeps opened; injected overrides are left to their owner. */
   close(): Promise<void>;
 }
 
 export interface DepsOverrides extends Partial<
-  Pick<Deps, "prisma" | "redis" | "clock" | "logger" | "llm" | "realtime">
+  Pick<
+    Deps,
+    "prisma" | "redis" | "clock" | "logger" | "llm" | "realtime" | "visual" | "storage" | "fetch"
+  >
 > {
   /** Replaces BULLMQ_PREFIX for this container's queues (and the workers started from it). */
   queuePrefix?: string;
@@ -58,6 +78,37 @@ export function llmConfigFrom(config: Config): LlmConfig {
   };
 }
 
+/** Everything createVisualProvider needs, taken from the config. */
+export function visualProviderConfigFrom(config: Config): VisualProviderConfig {
+  return {
+    provider: config.VISUAL_PROVIDER,
+    higgsfield: {
+      keyId: config.HIGGSFIELD_KEY_ID ?? null,
+      keySecret: config.HIGGSFIELD_KEY_SECRET ?? null,
+      baseUrl: config.HIGGSFIELD_BASE_URL,
+      imageModel: config.HIGGSFIELD_IMAGE_MODEL ?? null,
+      videoModel: config.HIGGSFIELD_VIDEO_MODEL ?? null,
+    },
+  };
+}
+
+/** Everything createStorage needs, taken from the config. */
+export function storageConfigFrom(config: Config): StorageConfig {
+  return {
+    driver: config.STORAGE_DRIVER,
+    publicBaseUrl:
+      config.STORAGE_DRIVER === "r2" ? config.R2_PUBLIC_BASE_URL : config.PUBLIC_ASSET_BASE_URL,
+    localDir: config.STORAGE_LOCAL_DIR,
+    r2: {
+      accountId: config.R2_ACCOUNT_ID ?? null,
+      accessKeyId: config.R2_ACCESS_KEY_ID ?? null,
+      secretAccessKey: config.R2_SECRET_ACCESS_KEY ?? null,
+      bucket: config.R2_BUCKET ?? null,
+      endpoint: config.R2_ENDPOINT ?? null,
+    },
+  };
+}
+
 export function createDeps(config: Config, overrides: DepsOverrides = {}): Deps {
   const logger = overrides.logger ?? createLogger({ level: config.LOG_LEVEL, name: "enmo-api" });
   const prisma = overrides.prisma ?? createPrisma(config.DATABASE_URL);
@@ -65,6 +116,11 @@ export function createDeps(config: Config, overrides: DepsOverrides = {}): Deps 
   const clock = overrides.clock ?? systemClock;
   const tokenCipher = createTokenCipher(config.TOKEN_ENC_KEY);
   const llm = overrides.llm ?? createLlm(llmConfigFrom(config));
+  const fetch = overrides.fetch ?? globalThis.fetch;
+  // Neither does I/O at construction; a misconfigured provider fails on its first call.
+  const visual =
+    overrides.visual ?? createVisualProvider(visualProviderConfigFrom(config), { fetch });
+  const storage = overrides.storage ?? createStorage(storageConfigFrom(config));
   const queues = createJobQueues({
     redisUrl: config.REDIS_URL,
     prefix: overrides.queuePrefix ?? config.BULLMQ_PREFIX,
@@ -92,5 +148,19 @@ export function createDeps(config: Config, overrides: DepsOverrides = {}): Deps 
       }
     })());
 
-  return { config, prisma, redis, clock, logger, tokenCipher, llm, queues, realtime, close };
+  return {
+    config,
+    prisma,
+    redis,
+    clock,
+    logger,
+    tokenCipher,
+    llm,
+    queues,
+    realtime,
+    visual,
+    storage,
+    fetch,
+    close,
+  };
 }

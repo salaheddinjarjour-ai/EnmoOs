@@ -41,7 +41,13 @@ import { editCopy, getPost, listPosts } from "../../src/services/posts";
 import { approvePlan, getTaskGraph, requestPlanChanges } from "../../src/services/task-graphs";
 import { testDb } from "../helpers/db";
 import { createClient, createUser } from "../helpers/factories";
-import { seedProposedPlan, startHarness, type Harness } from "../helpers/harness";
+import {
+  PHASE2_PIPELINE,
+  seedProposedPlan,
+  startHarness as startAnyHarness,
+  type Harness,
+  type HarnessOptions,
+} from "../helpers/harness";
 
 /*
  * The Phase 2 domain services around the pipeline: intake's client, plan change requests, QA's
@@ -49,6 +55,10 @@ import { seedProposedPlan, startHarness, type Harness } from "../helpers/harness
  * archiving and the thread cursor. Every DTO a service returns is checked against its shared
  * schema.
  */
+
+/** Phase 2's copy pipeline (write → qa); the Visual Director's direct has its own suites. */
+const startHarness = (options: HarnessOptions = {}) =>
+  startAnyHarness({ pipeline: PHASE2_PIPELINE, ...options });
 
 let harness: Harness | undefined;
 

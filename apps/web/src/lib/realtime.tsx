@@ -61,6 +61,7 @@ const LIVE_ROOTS: readonly QueryKey[] = [
   queryKeys.threads.all,
   queryKeys.taskGraphs.all,
   queryKeys.posts.all,
+  queryKeys.assets.all,
   queryKeys.approvals.all,
   queryKeys.budget,
 ];

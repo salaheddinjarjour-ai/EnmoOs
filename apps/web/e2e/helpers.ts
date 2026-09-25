@@ -1,4 +1,4 @@
-import { expect, type Locator, type Page } from "@playwright/test";
+import { expect, test, type Locator, type Page } from "@playwright/test";
 
 /* Small page helpers shared by the browser specs. */
 
@@ -7,12 +7,40 @@ export interface Credentials {
   password: string;
 }
 
-/** Signs in through the login form and waits for the Command Center. */
+/** How many times signIn waits out the sign-in rate limit before giving up. */
+const RATE_LIMIT_WAITS = 2;
+/** How long one sign-in click may take to land on the Command Center or on the limit. */
+const SIGN_IN_TIMEOUT = 15_000;
+
+/**
+ * Signs in through the login form and waits for the Command Center. The API allows five sign-ins
+ * per email per minute (DESIGN §E) and the specs share one admin, so when earlier specs spent that
+ * budget the form says when to try again: wait that long, then sign in.
+ */
 export async function signIn(page: Page, { email, password }: Credentials): Promise<void> {
-  await page.goto("/login");
-  await page.getByLabel("Email").fill(email);
-  await page.getByLabel("Password", { exact: true }).fill(password);
-  await page.getByRole("button", { name: "Sign in" }).click();
+  const limited = page.getByRole("alert").filter({ hasText: /Too many sign-in attempts/ });
+  for (let waits = 0; ; waits += 1) {
+    // A fresh form each time, so an earlier attempt's alert can't be mistaken for this one's.
+    await page.goto("/login");
+    await page.getByLabel("Email").fill(email);
+    await page.getByLabel("Password", { exact: true }).fill(password);
+    await page.getByRole("button", { name: "Sign in" }).click();
+    const outcome = await Promise.race([
+      page.waitForURL(/\/command$/, { timeout: SIGN_IN_TIMEOUT }).then(
+        () => "signed-in" as const,
+        () => null,
+      ),
+      limited.waitFor({ timeout: SIGN_IN_TIMEOUT }).then(
+        () => "limited" as const,
+        () => null,
+      ),
+    ]);
+    if (outcome !== "limited" || waits === RATE_LIMIT_WAITS) break;
+    const waitMs = (Number(/in (\d+)s/.exec(await limited.innerText())?.[1] ?? 60) + 1) * 1_000;
+    // The wait is the API's, not the test's: give the test that much more time.
+    test.info().setTimeout(test.info().timeout + waitMs);
+    await page.waitForTimeout(waitMs);
+  }
   await expect(page).toHaveURL(/\/command$/);
 }
 

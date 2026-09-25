@@ -1,4 +1,8 @@
 import { randomUUID } from "node:crypto";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import type { Storage, VisualProvider } from "@enmo/providers";
 import { buildApp } from "../../src/app";
 import { loadConfig, TEST_TOKEN_ENC_KEY, type Config, type EnvSource } from "../../src/config";
 import { createDeps, type Deps } from "../../src/deps";
@@ -28,9 +32,22 @@ export function testEnv(overrides: EnvSource = {}): EnvSource {
     VISUAL_PROVIDER: "mock",
     PUBLISH_MODE: "dry-run",
     STORAGE_DRIVER: "local",
+    // MockProvider settles on its second poll; at 20ms the visual loop takes milliseconds.
+    RENDER_POLL_DELAY_MS: "20",
     TOKEN_ENC_KEY: TEST_TOKEN_ENC_KEY,
     ...overrides,
   };
+}
+
+/** A fresh directory for LocalStorage, so no test sees another's files. */
+export interface TempStorageDir {
+  path: string;
+  remove(): Promise<void>;
+}
+
+export async function createTempStorageDir(): Promise<TempStorageDir> {
+  const dir = await mkdtemp(path.join(tmpdir(), "enmo-assets-"));
+  return { path: dir, remove: () => rm(dir, { recursive: true, force: true }) };
 }
 
 export function testConfig(overrides: EnvSource = {}): Config {
@@ -41,6 +58,8 @@ export interface TestApp {
   app: ApiApp;
   deps: Deps;
   clock: FakeClock;
+  /** STORAGE_LOCAL_DIR: a temporary directory removed on close() (unless `env` set its own). */
+  storageDir: string;
   close(): Promise<void>;
 }
 
@@ -52,14 +71,22 @@ export interface BuildTestAppOptions {
   routes?: RouteModule;
   /** Replaces the (silent) config logger, e.g. to inspect what a request writes to the logs. */
   logger?: Logger;
+  /** Replaces the VisualProvider VISUAL_PROVIDER builds (MockProvider). */
+  visual?: VisualProvider;
+  /** Replaces the Storage STORAGE_DRIVER builds (LocalStorage in `storageDir`). */
+  storage?: Storage;
 }
 
 /** A ready app wired to the test database and Redis, with a FakeClock. Call close() in afterAll. */
 export async function buildTestApp(options: BuildTestAppOptions = {}): Promise<TestApp> {
   const clock = options.clock ?? new FakeClock();
-  const deps = createDeps(testConfig(options.env), {
+  const tempDir = await createTempStorageDir();
+  const config = testConfig({ STORAGE_LOCAL_DIR: tempDir.path, ...options.env });
+  const deps = createDeps(config, {
     clock,
     ...(options.logger ? { logger: options.logger } : {}),
+    ...(options.visual ? { visual: options.visual } : {}),
+    ...(options.storage ? { storage: options.storage } : {}),
   });
   try {
     const app = await buildApp(deps);
@@ -77,13 +104,19 @@ export async function buildTestApp(options: BuildTestAppOptions = {}): Promise<T
       app,
       deps,
       clock,
+      storageDir: config.STORAGE_LOCAL_DIR,
       close: async () => {
-        await app.close();
-        await deps.close();
+        try {
+          await app.close();
+          await deps.close();
+        } finally {
+          await tempDir.remove();
+        }
       },
     };
   } catch (error) {
     await deps.close();
+    await tempDir.remove();
     throw error;
   }
 }

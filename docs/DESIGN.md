@@ -83,8 +83,10 @@ Other pins: bullmq 6.3.8, fastify 5.12.5, zod 4.6.5, @anthropic-ai/sdk 0.128.0, 
   - `Last-Event-ID` replays missed events from the table; a heartbeat goes out every 15s.
   - CORS is exact-origin with credentials. Cookie: `Domain=.enmo.marketing`, `SameSite=Lax`, `Secure`, `HttpOnly`.
 - **Visual loop:** submit → poll → store → Visual Director review (LLM looks at the image).
+  - Every master is rendered 9:16 (1080×1920), whatever the post type; the Adapter crops the 4:5 and 1:1 feed frames from it (Phase 5), so no platform frame needs upscaling.
   - A weak take is regenerated at most 2 times as new Asset versions (`parentAssetId`/`rootAssetId`), then escalated.
-  - Regenerating from the Vault gives the Visual Director its original context back.
+  - Regenerating from the Vault gives the Visual Director its original context back. The new take is on trial: it goes through the same review loop (at most 2 regenerations, then escalation) and becomes current only once accepted, so the post keeps its current take meanwhile.
+  - The takes follow the copy, one per scene or slide: when a copy revision or a human edit adds or drops one, the Visual Director re-plans before the post goes back to approval (see Request Changes in §D).
 - **Learning loop:**
   - Metrics are captured at 24h, 72h and 168h after publishing. `score = engagementRate / accountBaseline`.
   - The Analyst runs weekly and writes `LearningLog` entries; code recomputes each lift from the evidence.
@@ -455,6 +457,7 @@ Models, fields and relations (every model has `id String @id @default(cuid())`, 
     - scenes are contiguous and their durations sum to the total, within ±0.25s
     - the hook lands within 3s and inside the first scene
     - total length ≤ 90s
+    - at most 12 scenes (`COPY_LIMITS.scenesMax`): the Visual Director shoots one per scene and plans at most 12 shots; a human copy edit is held to the same cap
     - captions ≤ 2200 characters; ≤ 30 hashtags
     - exactly one caption per platform
     - no banned words in any text field
@@ -463,7 +466,9 @@ Models, fields and relations (every model has `id String @id @default(cuid())`, 
   - Output: {consistency{characterDescription|null, palette[], lighting, styleKeywords[]}, shots[1–12]{shotId /^s\d+$/, sceneIndex|null, slideIndex|null, kind IMAGE|VIDEO, aspectRatio, durationSec|null, prompt, negativePrompt, cameraNote, seed|null}}
   - One shot per scene, per slide, or one shot for single-image posts.
 - **Visual Director, review:**
-  - Input: {shot, render, attempt, brand}, plus the image
+  - Input: {shot, render, attempt, maxAttempts, brand}, plus the image
+  - `maxAttempts` is the shot's last take (1 + `MAX_VISUAL_REGENERATIONS`, which the env may lower from 2 but never raise), so the prompt and the loop agree on when the team decides
+  - `render.placeholder` is true for a MockProvider take: the prompt then judges only its frame and palette, since a placeholder shows printed words instead of the subject by design
   - Output: {verdict: accept|regenerate, score, issues[], revisedPrompt|null}
 - **Adapter** (Phase 5):
   - Input: {brand, post, masters[], copy{slides, onScreenText, overlays}, targets[{platform, format}]}
@@ -544,10 +549,11 @@ Models, fields and relations (every model has `id String @id @default(cuid())`, 
   - RUNNING for more than 15 minutes with no live job → re-queue once, then FAILED with an alert
   - BLOCKED_BUDGET → re-queue after the UTC day rolls over
   - an APPROVED graph with PENDING tasks whose dependencies all SUCCEEDED → `advance` (the post-commit `advance` was lost to a crash or a failed follow-up)
-  - drive any stale WAITING render polls
+  - drive any stale WAITING render polls: only takes someone still waits on (a WAITING direct task's, or an off-plan Vault take on trial), paging past takes whose job is still live; and hand on a WAITING direct task whose take failed while its hand-off was lost (a take's FAILED status and its task's hand-off otherwise commit in one transaction)
 - **Request Changes:**
   - the ApprovalDecision is saved with the verbatim feedback and a target; the post goes to CHANGES_REQUESTED and `revision` goes up by one
   - a revision subgraph is appended: COPY is `write.rN → [adapt.rN] → qa.rN`, VISUAL is `direct.rN → [adapt] → qa`, BOTH is `write → direct → adapt → qa`
+  - the takes follow the copy (one per scene or slide): when a COPY revision's rewrite adds or drops a scene or slide, `direct.rN` (no feedback) is spliced in right after `write.rN`; a human copy edit (`PATCH /posts/:id/copy`) that does the same appends `direct.rN → [adapt] → qa.rN` instead of reopening approval directly (409 for a post outside any plan); and QA's automated `shots` check gates the round like banned words: takes that don't fit the copy go back to the Visual Director, or escalate once QA is out of revisions
   - `AgentTask.feedback = {verbatim, source: HUMAN, decisionId}`
   - a new approval round starts once QA finishes
 - **Plan request-changes:** the feedback becomes `changeRequest`, passed verbatim to `manager.plan`. That produces graph version n+1, and the old one becomes SUPERSEDED.
@@ -630,9 +636,9 @@ Models, fields and relations (every model has `id String @id @default(cuid())`, 
   - OAuth: `GET /oauth/{meta,tiktok}/start?clientId` · `GET /oauth/{meta,tiktok}/callback`. The state and PKCE verifier are kept in Redis for 10 minutes, bound to the admin's session.
 - **campaigns and chat:** `GET /campaigns?clientId&status` · `POST /campaigns {clientId?, message}` · `GET /campaigns/:id` · `POST /campaigns/:id/archive` · `GET /threads/:id/messages?after` · `POST /threads/:id/messages {content}`
 - **plans and tasks:** `GET /task-graphs/:id` · `POST /task-graphs/:id/approve` · `POST /task-graphs/:id/request-changes {feedback}` · `GET /campaigns/:id/tasks` · `POST /agent-tasks/:id/resolve {action: retry|accept_best}`
-- **posts:** `GET /posts?clientId&campaignId&status&platform` · `GET /posts/:id` · `PATCH /posts/:id/copy` (increments `humanEditCount`; returns 422 on banned words; after approval it reopens approval)
+- **posts:** `GET /posts?clientId&campaignId&status&platform` · `GET /posts/:id` · `PATCH /posts/:id/copy` (increments `humanEditCount`; returns 422 on banned words; after approval it reopens approval; an edit that adds or drops a scene or slide goes back through the Visual Director and QA instead)
 - **approvals:** `GET /approvals?clientId&platform&campaignId` (pending, newest first, with a `canDecide` flag) · `POST /approvals/:id/decision {decision, feedback?, target?}` · `POST /approvals/approve-all {requestIds[]}`
-- **vault:** `GET /assets?q&clientId&campaignId&sceneIndex&kind&allVersions&cursor` · `GET /assets/:id` (includes lineage) · `POST /assets/:id/regenerate {instruction?}`
+- **vault:** `GET /assets?q&clientId&campaignId&sceneIndex&slideIndex&kind&allVersions&cursor` (the Vault's scene/slide filter sends one of the two indexes) · `GET /assets/:id` (includes lineage) · `POST /assets/:id/regenerate {instruction?}`
 - **calendar:** `GET /calendar?from&to&clientId` (publish jobs plus ghost slots) · `PATCH /publish-jobs/:id {date}` · `POST /publish-jobs/:id/retry` · `POST /publish-jobs/:id/cancel`
 - **dashboard:** `GET /dashboard/{pipeline,alerts,learnings,growth}?clientId` · `POST /clients/:id/analyze`
 - **realtime and files:** `GET /events` (SSE) · `GET /files/*` (only when `STORAGE_DRIVER=local`)
@@ -663,6 +669,7 @@ Models, fields and relations (every model has `id String @id @default(cuid())`, 
 | STATIC | 4:5 | 1:1 | 9:16 photo |
 | CAROUSEL | 4:5 | 1:1 multi-photo | 9:16 photo mode |
 
+- Every variant is cut from the post's 9:16 master (1080×1920, Phase 3): 4:5 and 1:1 frames are crops, 9:16 frames are the master as is, so nothing is upscaled.
 - sharp does the extract and resize around the focus point and zoom, then renders overlay text with the brand fonts over an SVG scrim.
 - Video targets are always 9:16. Multi-scene assembly needs ffmpeg (set `FFMPEG_PATH`); otherwise `NoopAssembler` uses the first clip, and the overlays stay as metadata that CSS draws in the preview.
 

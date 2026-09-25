@@ -7,6 +7,8 @@ import {
   ManagerIntakeOutput,
   ManagerPlanOutput,
   ManagerQaOutput,
+  VisualDirectOutput,
+  VisualReviewOutput,
   type ManagerIntakeOutput as ManagerIntakeOutputT,
 } from "@enmo/shared";
 import { AgentEscalation, BudgetExceeded, agentKey, defaultEffort } from "../src";
@@ -18,6 +20,8 @@ describe("contracts through the SDK's zodOutputFormat", () => {
     ["ManagerPlanOutput", ManagerPlanOutput],
     ["ManagerQaOutput", ManagerQaOutput],
     ["CopywriterOutput", CopywriterOutput],
+    ["VisualDirectOutput", VisualDirectOutput],
+    ["VisualReviewOutput", VisualReviewOutput],
   ] as const)("%s builds a strict object schema", (_name, schema) => {
     const format = zodOutputFormat(schema);
     expect(format.type).toBe("json_schema");

@@ -7,3 +7,9 @@ export const WEB_URL = `http://localhost:${WEB_PORT}`;
 
 /** Created on API boot from SEED_ADMIN_EMAIL / SEED_ADMIN_PASSWORD (the database starts empty). */
 export const E2E_ADMIN = { email: "admin@enmo.test", password: "enmo-admin-pass-123" } as const;
+
+/**
+ * The API's PIPELINE_ACTIONS: the whole Phase 3 pipeline (copy, the Visual Director's shots, then
+ * Manager QA). E2E_PIPELINE_ACTIONS narrows it, e.g. write,qa to replay the Phase 2 story alone.
+ */
+export const PIPELINE_ACTIONS = process.env.E2E_PIPELINE_ACTIONS ?? "write,direct,qa";

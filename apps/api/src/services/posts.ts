@@ -2,13 +2,16 @@ import { COPY_BANNED_SCAN_IGNORE, editedCopyIssues } from "@enmo/agents";
 import type { DbTransaction, Post, Prisma } from "@enmo/db";
 import {
   ApprovalChain,
+  AssetParams,
   canDecideRequest,
+  compareShotPosition,
   COPY_EDITABLE_STATUSES,
   CopywriterOutput,
   inferFailedStage,
   postPlacement,
   scanForBannedWords,
   type ApprovalSummary,
+  type AssetThumbDto,
   type BannedWordsErrorDetails,
   type CampaignStatus,
   type CopyRuleErrorDetails,
@@ -27,11 +30,15 @@ import {
   lockReopenableRounds,
   openApprovalRound,
 } from "../orchestrator/approval-round";
+import { afterCommit } from "../orchestrator/after-commit";
 import { isoDate, postContextOf } from "../orchestrator/context";
 import { EventBatch } from "../orchestrator/events";
+import { plannedGraphOf, routeVisualRevision } from "../orchestrator/feedback";
+import { advance } from "../orchestrator/graph";
 import { lockPost, shareLockCampaign } from "../orchestrator/locks";
 import { postUpdated, requireTransition } from "../orchestrator/post-status";
 import { refNumber } from "../orchestrator/progress";
+import { shotGaps } from "../orchestrator/takes";
 import { UNFINISHED_STATUSES } from "../orchestrator/tasks";
 import type { ServiceUser } from "./actor";
 
@@ -52,11 +59,31 @@ export const POST_INCLUDE = {
     take: 1,
     include: { decisions: { select: { step: true, userId: true, decision: true } } },
   },
+  // PostDto.currentAssets: the current take of each shot.
+  assets: {
+    where: { role: "SHOT", isCurrent: true },
+    select: {
+      id: true,
+      kind: true,
+      status: true,
+      version: true,
+      shotId: true,
+      sceneIndex: true,
+      params: true,
+      url: true,
+      posterUrl: true,
+      mimeType: true,
+      width: true,
+      height: true,
+      durationSec: true,
+    },
+  },
   ...EDIT_STATE_INCLUDE,
 } as const satisfies Prisma.PostInclude;
 
 export type PostRow = Prisma.PostGetPayload<{ include: typeof POST_INCLUDE }>;
 type ApprovalRow = PostRow["approvalRequests"][number];
+type CurrentAssetRow = PostRow["assets"][number];
 
 /** Statuses whose content is already out in the world. */
 const PUBLISHED_STATUSES: ReadonlySet<PostStatus> = new Set(["PUBLISHING", "LIVE", "SCORED"]);
@@ -115,6 +142,25 @@ function approvalSummary(request: ApprovalRow, user: ServiceUser): ApprovalSumma
   };
 }
 
+function toAssetThumb(row: CurrentAssetRow): AssetThumbDto {
+  const params = parseStored(AssetParams, row.params, `Asset ${row.id}.params`);
+  return {
+    id: row.id,
+    kind: row.kind,
+    status: row.status,
+    version: row.version,
+    shotId: row.shotId,
+    sceneIndex: row.sceneIndex,
+    slideIndex: params.shot?.slideIndex ?? null,
+    url: row.url,
+    posterUrl: row.posterUrl,
+    mimeType: row.mimeType,
+    width: row.width,
+    height: row.height,
+    durationSec: row.durationSec,
+  };
+}
+
 export function toPostDto(row: PostRow, user: ServiceUser): PostDto {
   const placement = postPlacement(row.status, inferFailedStage(row));
   const latest = row.approvalRequests[0];
@@ -135,6 +181,7 @@ export function toPostDto(row: PostRow, user: ServiceUser): PostDto {
     angle: row.angle,
     hook: row.hook,
     copy: row.copy === null ? null : parseStored(CopywriterOutput, row.copy, `Post ${row.id}.copy`),
+    currentAssets: row.assets.map(toAssetThumb).sort(compareShotPosition),
     humanEditCount: row.humanEditCount,
     editable: whyNotEditable(row) === null,
     revision: row.revision,
@@ -227,10 +274,13 @@ function editRejection(
  * BannedWordsErrorDetails) or the copy breaks the Copywriter contract for this post (details
  * CopyRuleErrorDetails); both are reported at once when both apply. An edit after approval
  * reopens it: the approved (or pending) request is cancelled and a new round opens with a fresh
- * contentHash; any scheduled PublishJob is cancelled with it. CONFLICT unless the post is
- * PostDto.editable (whyNotEditable): while an agent is still owed the post (a change request's
- * revision included), once it is published, or when its campaign is archived. NOT_FOUND when
- * missing.
+ * contentHash; any scheduled PublishJob is cancelled with it. An edit that adds or drops a scene
+ * or slide leaves the post's takes out of step with its copy (one per scene or slide), so instead
+ * of a round opening on them the post goes back through the Visual Director and QA
+ * (routeVisualRevision, CHANGES_REQUESTED); CONFLICT for such an edit on a post outside any plan.
+ * CONFLICT unless the post is PostDto.editable (whyNotEditable): while an agent is still owed the
+ * post (a change request's revision included), once it is published, or when its campaign is
+ * archived. NOT_FOUND when missing.
  *
  * The check is made again under the locks the other writers take (locks.ts), so an edit racing a
  * decision, a revision or an archive either lands first (and the other sees it) or is refused;
@@ -254,7 +304,8 @@ export async function editCopy(
 
   const now = deps.clock.now();
   const events = new EventBatch();
-  await deps.prisma.$transaction(async (tx) => {
+  const context = { campaignId: post.campaignId, clientId: post.clientId };
+  const revisedGraphId = await deps.prisma.$transaction(async (tx) => {
     // Campaign, rounds, then the post: the order every other writer locks them in (locks.ts).
     await shareLockCampaign(tx, post.campaignId);
     await lockReopenableRounds(tx, postId);
@@ -263,14 +314,31 @@ export async function editCopy(
     if (!current) throw notFound("Post");
     const changed = whyNotEditable(current);
     if (changed) throw conflict(changed);
+    const edit = { copy: patch.copy, humanEditCount: { increment: 1 } };
+
+    if ((await shotGaps(tx, post, patch.copy)).length > 0) {
+      const graphId = await plannedGraphOf(tx, postId);
+      if (!graphId) {
+        throw conflict(
+          "This edit adds or drops a scene or slide, and the post isn't part of a plan the Visual Director can re-shoot; keep the same scenes and slides",
+        );
+      }
+      const revision = await routeVisualRevision(tx, {
+        postId,
+        graphId,
+        feedback: null,
+        enabledActions: deps.config.PIPELINE_ACTIONS,
+        now,
+      });
+      const updated = await tx.post.update({ where: { id: postId }, data: edit });
+      for (const round of revision.cancelled) approvalResolved(events, round, context);
+      postUpdated(events, updated);
+      return graphId;
+    }
 
     const cancelled = await cancelOpenRounds(tx, postId, now);
-    let updated = await tx.post.update({
-      where: { id: postId },
-      data: { copy: patch.copy, humanEditCount: { increment: 1 } },
-    });
+    let updated = await tx.post.update({ where: { id: postId }, data: edit });
     if (cancelled.length > 0) {
-      const context = { campaignId: updated.campaignId, clientId: updated.clientId };
       await tx.publishJob.updateMany({
         where: { variant: { postId }, status: { in: ["SCHEDULED", "QUEUED"] } },
         data: { status: "CANCELLED" },
@@ -285,7 +353,13 @@ export async function editCopy(
       approvalCreated(events, request, context);
     }
     postUpdated(events, updated);
+    return null;
   });
   await events.publish(deps);
+  if (revisedGraphId) {
+    await afterCommit(deps, "starting the visual revision of an edit", () =>
+      advance(deps, revisedGraphId),
+    );
+  }
   return getPost(deps, user, postId);
 }

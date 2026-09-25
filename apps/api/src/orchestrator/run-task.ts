@@ -1,9 +1,11 @@
 import {
   AgentEscalation,
   automatedCopyChecks,
+  automatedShotCheck,
   BudgetExceeded,
   COPY_BANNED_SCAN_IGNORE,
   InvalidAgentInput,
+  shotCoverageIssues,
 } from "@enmo/agents";
 import type { DbTransaction } from "@enmo/db";
 import {
@@ -14,8 +16,11 @@ import {
   type AutomatedCheck,
   type BannedWordHit,
   type CopywriterInput,
+  type Issue,
   type ManagerQaInput,
   type ManagerQaOutput,
+  type QaIssue,
+  type QaVisual,
 } from "@enmo/shared";
 import type { Deps } from "../deps";
 import type { TaskRunJob } from "../jobs/queues";
@@ -30,9 +35,16 @@ import {
   failTask,
   handOffFromEscalation,
   handOffFromInvalidInput,
+  type HandOff,
 } from "./escalation";
 import { EventBatch } from "./events";
-import { appendRevision, qaFeedbackText, qaRevisionCount, qaRevisionTarget } from "./feedback";
+import {
+  appendRevision,
+  qaFeedbackText,
+  qaRevisionCount,
+  qaRevisionTarget,
+  spliceDirectAfter,
+} from "./feedback";
 import { advance, advanceOrRecount } from "./graph";
 import { jsonOrDbNull } from "./messages";
 import { ACTION_POST_STATUS, postUpdated, requireTransition, transitionPost } from "./post-status";
@@ -44,14 +56,17 @@ import {
   taskAction,
   type TaskWithContext,
 } from "./tasks";
+import { shotGaps, visualCopyOf } from "./takes";
+import { planShots, qaVisualsOf } from "./visuals";
 
 /*
  * task.run (DESIGN §D "Graph lifecycle"): one AgentTask of an approved graph. The task goes
  * RUNNING and its post into the action's status, the agent input is built from the database
  * (brief, brand, post, upstream output, revision feedback), the agent runs, and its output is
- * stored before the graph advances. Only QUEUED and RUNNING tasks are acted on, so duplicate and
- * stale jobs are no-ops; a RUNNING task is picked up again when BullMQ retries after a transport
- * error.
+ * stored before the graph advances. The Visual Director's `direct` lives in visuals.ts: its task
+ * waits (WAITING) on the renders it queued, and the visual loop finishes it. Only QUEUED and
+ * RUNNING tasks are acted on, so duplicate and stale jobs are no-ops; a RUNNING task is picked up
+ * again when BullMQ retries after a transport error.
  */
 
 export async function runTask(deps: Deps, job: TaskRunJob, attempt: RunAttempt): Promise<void> {
@@ -77,11 +92,13 @@ export async function runTask(deps: Deps, job: TaskRunJob, attempt: RunAttempt):
       case "write":
         await runWrite(deps, task);
         break;
+      case "direct":
+        await planShots(deps, task);
+        break;
       case "qa":
         await runQa(deps, task);
         break;
       case "strategy":
-      case "direct":
       case "adapt":
         await failTask(deps, task.id, {
           reason: "UNSUPPORTED",
@@ -228,6 +245,10 @@ async function runWrite(deps: Deps, task: TaskWithContext): Promise<void> {
       data: { copy: result.output },
     });
     postUpdated(events, updated);
+    // A rewrite that adds or drops a scene or slide re-plans the shots before anything else runs.
+    if ((await shotGaps(tx, post, result.output)).length > 0) {
+      await spliceDirectAfter(tx, task, post);
+    }
     return true;
   });
   if (stored) await finish(deps, task, events);
@@ -235,17 +256,45 @@ async function runWrite(deps: Deps, task: TaskWithContext): Promise<void> {
 
 /* ─── qa (Manager) ───────────────────────────────────────────────────────────────────────────── */
 
-/** Code-run checks the Manager reviews alongside the copy; banned words also gate approval. */
+/**
+ * Code-run checks the Manager reviews alongside the copy. Two also gate approval: banned words,
+ * and the post's current takes filling exactly its scenes or slides (with visuals only).
+ */
 export function automatedChecks(
   copy: CopywriterOutput,
   context: Pick<CopywriterInput, "post" | "brand">,
-): { checks: AutomatedCheck[]; bannedWords: BannedWordHit[] } {
+  visuals: readonly QaVisual[] | null,
+): { checks: AutomatedCheck[]; bannedWords: BannedWordHit[]; shotGaps: Issue[] } {
+  const gaps =
+    visuals === null ? [] : shotCoverageIssues(context.post, visualCopyOf(copy), visuals);
   return {
-    checks: automatedCopyChecks(copy, context),
+    checks: [
+      ...automatedCopyChecks(copy, context),
+      ...(visuals === null ? [] : [automatedShotCheck(gaps)]),
+    ],
     bannedWords: scanForBannedWords(copy, context.brand.bannedWords, {
       ignoreKeys: COPY_BANNED_SCAN_IGNORE,
     }),
+    shotGaps: gaps,
   };
+}
+
+/** The gates' findings as QA issues for the specialist that fixes each. */
+function gateIssues(bannedWords: readonly BannedWordHit[], gaps: readonly Issue[]): QaIssue[] {
+  return [
+    ...bannedWords.map((hit) => ({
+      target: "COPYWRITER" as const,
+      field: hit.path || "copy",
+      problem: `Uses the banned term "${hit.term}" ("${hit.match}").`,
+      instruction: `Rewrite ${hit.path || "the copy"} without "${hit.term}".`,
+    })),
+    ...gaps.map((gap) => ({
+      target: "VISUAL_DIRECTOR" as const,
+      field: gap.path || "shots",
+      problem: gap.message,
+      instruction: "Plan exactly one shot for each scene or slide the copy has now.",
+    })),
+  ];
 }
 
 async function runQa(deps: Deps, task: TaskWithContext): Promise<void> {
@@ -259,13 +308,18 @@ async function runQa(deps: Deps, task: TaskWithContext): Promise<void> {
     });
     return;
   }
-  const { checks, bannedWords } = automatedChecks(copy, { brand, post: postContext });
+  const visuals = await qaVisualsOf(deps, post.id);
+  const {
+    checks,
+    bannedWords,
+    shotGaps: gaps,
+  } = automatedChecks(copy, { brand, post: postContext }, visuals);
   const input: ManagerQaInput = {
     brief,
     brand,
     post: postContext,
     copy,
-    visuals: null,
+    visuals,
     variants: null,
     automatedChecks: checks,
   };
@@ -280,27 +334,43 @@ async function runQa(deps: Deps, task: TaskWithContext): Promise<void> {
     await reviseAfterQa(deps, task, qa, qa.issues);
     return;
   }
-  if (bannedWords.length > 0) {
-    // The banned-words gate: no approval round opens while the copy still breaks the list.
-    const issues = bannedWords.map((hit) => ({
-      target: "COPYWRITER" as const,
-      field: hit.path || "copy",
-      problem: `Uses the banned term "${hit.term}" ("${hit.match}").`,
-      instruction: `Rewrite ${hit.path || "the copy"} without "${hit.term}".`,
-    }));
+  const issues = gateIssues(bannedWords, gaps);
+  if (issues.length > 0) {
+    // The gates: no approval round opens while the copy still breaks the banned-words list, or on
+    // takes that don't fill exactly the post's scenes or slides.
     if (canRevise) {
       await reviseAfterQa(deps, task, qa, issues);
       return;
     }
     await deps.prisma.agentTask.update({ where: { id: task.id }, data: { output: qa } });
-    await escalateTask(deps, task.id, {
-      reason: "BANNED_WORDS",
-      issues: bannedWords.map((hit) => ({ path: hit.path, message: `Banned term "${hit.term}"` })),
-      message: `can't send ${post.ref} for approval: the copy still uses banned words (${[...new Set(bannedWords.map((hit) => hit.term))].join(", ")}).`,
-    });
+    await escalateTask(deps, task.id, gateHandOff(post.ref, bannedWords, gaps));
     return;
   }
   await sendForApproval(deps, task, qa, client.id);
+}
+
+/** Why QA can't send the post for approval, out of revisions. */
+function gateHandOff(
+  ref: string,
+  bannedWords: readonly BannedWordHit[],
+  gaps: readonly Issue[],
+): HandOff {
+  const reasons: string[] = [];
+  if (bannedWords.length > 0) {
+    const terms = [...new Set(bannedWords.map((hit) => hit.term))].join(", ");
+    reasons.push(`the copy still uses banned words (${terms})`);
+  }
+  if (gaps.length > 0) {
+    reasons.push(`its takes don't match the copy's scenes or slides (${gaps[0]!.message})`);
+  }
+  return {
+    reason: bannedWords.length > 0 ? "BANNED_WORDS" : "SHOTS_OUT_OF_STEP",
+    issues: [
+      ...bannedWords.map((hit) => ({ path: hit.path, message: `Banned term "${hit.term}"` })),
+      ...gaps,
+    ],
+    message: `can't send ${ref} for approval: ${reasons.join(", and ")}.`,
+  };
 }
 
 /** QA pass (or out of revisions): the post goes to humans with the Manager's notes. */

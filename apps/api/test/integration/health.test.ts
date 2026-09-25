@@ -108,7 +108,7 @@ describe("GET /v1/capabilities", () => {
       visual: { provider: "mock" },
       publish: { mode: "dry-run" },
       storage: { driver: "local" },
-      pipelineActions: ["write", "qa"],
+      pipelineActions: ["write", "direct", "qa"],
       integrations: { anthropic: false, meta: false, tiktok: false, higgsfield: false, r2: false },
       dailyTokenCap: 2_000_000,
     });
@@ -126,7 +126,8 @@ describe("GET /v1/capabilities", () => {
         ...secrets,
         LLM_PROVIDER: "mock",
         DAILY_TOKEN_CAP: "50000",
-        PIPELINE_ACTIONS: "write,direct,qa",
+        PIPELINE_ACTIONS: "write,qa",
+        HIGGSFIELD_CREDENTIALS: "hf-key-id-value:hf-key-secret-value",
       },
     });
     try {
@@ -139,12 +140,14 @@ describe("GET /v1/capabilities", () => {
       expect(response.statusCode).toBe(200);
       expect(response.json()).toMatchObject({
         llm: { provider: "mock" },
-        pipelineActions: ["write", "direct", "qa"],
+        pipelineActions: ["write", "qa"],
         // TikTok needs both the client key and the secret.
-        integrations: { anthropic: true, meta: true, tiktok: false, higgsfield: false, r2: false },
+        integrations: { anthropic: true, meta: true, tiktok: false, higgsfield: true, r2: false },
         dailyTokenCap: 50_000,
       });
-      for (const value of Object.values(secrets)) expect(response.body).not.toContain(value);
+      for (const value of [...Object.values(secrets), "hf-key-id-value", "hf-key-secret-value"]) {
+        expect(response.body).not.toContain(value);
+      }
     } finally {
       await configured.close();
     }

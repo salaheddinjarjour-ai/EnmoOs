@@ -29,6 +29,8 @@ import {
   RequestPlanChangesRequest,
   TaskGraphDto,
   UpdatePostCopyRequest,
+  VisualDirectOutput,
+  VisualReviewOutput,
   defaultVisualStyle,
   formatSseFrame,
   isRealtimeChannel,
@@ -156,6 +158,8 @@ describe("agent output schemas are structured-output safe", () => {
     ["ManagerPlanOutput", ManagerPlanOutput],
     ["ManagerQaOutput", ManagerQaOutput],
     ["CopywriterOutput", CopywriterOutput],
+    ["VisualDirectOutput", VisualDirectOutput],
+    ["VisualReviewOutput", VisualReviewOutput],
   ] as const)("%s", (_name, schema) => {
     expect(structuredOutputProblems(schema)).toEqual([]);
   });
@@ -422,6 +426,23 @@ const post = {
   angle: "Iftar",
   hook: null,
   copy: reelCopy,
+  currentAssets: [
+    {
+      id: "a1",
+      kind: "IMAGE" as const,
+      status: "READY" as const,
+      version: 2,
+      shotId: "s1",
+      sceneIndex: 0,
+      slideIndex: null,
+      url: "http://localhost:4000/v1/files/c1/a1.png",
+      posterUrl: null,
+      mimeType: "image/png",
+      width: 1080,
+      height: 1920,
+      durationSec: null,
+    },
+  ],
   humanEditCount: 0,
   editable: true,
   revision: 0,

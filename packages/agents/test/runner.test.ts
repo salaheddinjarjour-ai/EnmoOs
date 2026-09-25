@@ -320,6 +320,27 @@ describe("runAgent: request", () => {
     expect(request!.system).toEqual([{ text: managerIntake.systemPrompt, cache: true }]);
   });
 
+  it("puts images ahead of the first turn's text and keeps them for corrections", async () => {
+    const image = { type: "image", mediaType: "image/png", data: "iVBORw0KGgo=" } as const;
+    const llm = scriptedLlm([missingCta, goodText]);
+    const hooks = recordingHooks();
+    await runAgent(copywriterWrite, input, { llm, ...hooks, images: [image] });
+
+    const first = {
+      role: "user",
+      content: [image, { type: "text", text: copywriterWrite.userMessage(input) }],
+    };
+    expect(llm.requests[0]!.messages).toEqual([first]);
+    expect(llm.requests[1]!.messages[0]).toEqual(first);
+    expect(llm.requests[1]!.messages).toHaveLength(3);
+    // The snapshot is the JSON input only; the pixels never land in AgentRun rows.
+    expect(hooks.runs[0]!.inputSnapshot).toEqual(input);
+
+    const plain = scriptedLlm([goodText]);
+    await runAgent(copywriterWrite, input, { llm: plain, ...recordingHooks(), images: [] });
+    expect(plain.requests[0]!.messages[0]!.content).toBe(copywriterWrite.userMessage(input));
+  });
+
   it("caps the stored response text", async () => {
     const huge = `{"caption": "${"x".repeat(RESPONSE_TEXT_CAP)}"}`;
     const hooks = recordingHooks();

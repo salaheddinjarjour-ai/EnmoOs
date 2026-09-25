@@ -33,9 +33,11 @@ import { sessionCookieFor } from "../helpers/auth";
 import { testDb } from "../helpers/db";
 import { createClient, createUser } from "../helpers/factories";
 import {
-  startHarness,
+  PHASE2_PIPELINE,
+  startHarness as startAnyHarness,
   type EventStream,
   type Harness,
+  type HarnessOptions,
   type ReceivedEvent,
 } from "../helpers/harness";
 
@@ -59,6 +61,10 @@ const FEEDBACK = "Mention the new cold brew tonic";
 /** Early January, so "March 1–30" is this year's March and still in the future. */
 const NOW = "2027-01-11T09:00:00.000Z";
 const BANNED = ["cheap"];
+
+/** Phase 2's copy pipeline (write → qa); the Visual Director's direct has its own suites. */
+const startHarness = (options: HarnessOptions = {}) =>
+  startAnyHarness({ pipeline: PHASE2_PIPELINE, ...options });
 
 let harness: Harness | undefined;
 

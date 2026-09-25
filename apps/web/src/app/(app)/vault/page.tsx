@@ -1,14 +1,14 @@
 import type { Metadata } from "next";
-import { ScreenPlaceholder } from "@/components/shell/ScreenPlaceholder";
+import { Suspense } from "react";
+import { VaultScreen } from "@/components/vault/VaultScreen";
 
 export const metadata: Metadata = { title: "The Vault" };
 
+/* The screen reads its filters and open take from the address, which only the browser knows. */
 export default function VaultPage() {
   return (
-    <ScreenPlaceholder
-      eyebrow="The Vault · Phase 3"
-      title="Every take, versioned."
-      description="Search every generated asset by prompt, campaign or scene, and regenerate any take with its original context."
-    />
+    <Suspense>
+      <VaultScreen />
+    </Suspense>
   );
 }

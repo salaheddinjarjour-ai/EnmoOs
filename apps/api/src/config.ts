@@ -5,6 +5,7 @@ import {
   Email,
   LlmProviderName,
   MAX_QA_REVISIONS as DEFAULT_MAX_QA_REVISIONS,
+  MAX_VISUAL_REGENERATIONS as DEFAULT_MAX_VISUAL_REGENERATIONS,
   NewPassword,
   orderPipelineActions,
   PipelineAction,
@@ -30,6 +31,18 @@ export class ConfigError extends Error {
 
 /** Every plan drafts copy and ends in Manager QA, which opens the approval round. */
 export const REQUIRED_PIPELINE_ACTIONS: readonly PipelineAction[] = ["write", "qa"];
+
+/** The per-post actions whose agents exist so far (Phase 3: the Visual Director's direct). */
+export const DEFAULT_PIPELINE_ACTIONS: readonly PipelineAction[] = ["write", "direct", "qa"];
+
+/**
+ * Where the API serves STORAGE_DRIVER=local files: unversioned, because the URL is stored on every
+ * Asset row (and handed to Meta/TikTok), so it must not change when the API's version does.
+ */
+export const LOCAL_FILES_PATH = "/files";
+
+/** Public base of the R2 bucket's custom domain (DESIGN §F). */
+export const DEFAULT_R2_PUBLIC_BASE_URL = "https://assets.enmo.marketing";
 
 const bool = (fallback: boolean) => z.stringbool().default(fallback);
 const int = (min: number, max: number) => z.coerce.number().int().min(min).max(max);
@@ -140,7 +153,7 @@ const EnvSchema = z.object({
    * Per-post actions the Manager may plan, in any order; widened phase by phase as their agents
    * arrive (Phase 3 adds direct, Phase 5 adapt, Phase 6 strategy).
    */
-  PIPELINE_ACTIONS: commaList(PipelineAction).default(["write", "qa"]),
+  PIPELINE_ACTIONS: commaList(PipelineAction).default([...DEFAULT_PIPELINE_ACTIONS]),
   /** Automatic QA → revision loops per post before it goes to humans with qaNotes anyway. */
   MAX_QA_REVISIONS: int(0, 3).default(DEFAULT_MAX_QA_REVISIONS),
   /** MockLlm fault injection, e.g. "COPYWRITER.write:invalid*2,VISUAL_DIRECTOR.review:weak*3". */
@@ -158,6 +171,10 @@ const EnvSchema = z.object({
 
   // ── Visuals ──
   VISUAL_PROVIDER: VisualProviderName.default("mock"),
+  /** The pair as Higgsfield hands it out, "<key id>:<key secret>"; or set the two keys below. */
+  HIGGSFIELD_CREDENTIALS: secret
+    .regex(/^[^:\s]+:[^:\s]+$/, 'Expected "<key id>:<key secret>"')
+    .optional(),
   HIGGSFIELD_KEY_ID: secret.optional(),
   HIGGSFIELD_KEY_SECRET: secret.optional(),
   HIGGSFIELD_BASE_URL: HttpUrl.default("https://api.higgsfield.ai"),
@@ -165,11 +182,29 @@ const EnvSchema = z.object({
   HIGGSFIELD_VIDEO_MODEL: z.string().trim().min(1).optional(),
   /** Multi-scene video assembly; without it the NoopAssembler keeps the first clip. */
   FFMPEG_PATH: z.string().trim().min(1).optional(),
+  /**
+   * Weak takes of one shot the Visual Director may regenerate before it escalates. The spec's cost
+   * guard is at most 2 (MASTER_PLAN §02), so this may only lower it; the review is told the value.
+   */
+  MAX_VISUAL_REGENERATIONS: int(0, DEFAULT_MAX_VISUAL_REGENERATIONS).default(
+    DEFAULT_MAX_VISUAL_REGENERATIONS,
+  ),
+  /**
+   * Delay before the first render.poll of a job; later polls back off to at most 10 seconds
+   * (DESIGN §D: 3-10s). Tests shorten it so MockProvider's two polls take milliseconds.
+   */
+  RENDER_POLL_DELAY_MS: int(10, 10_000).default(3_000),
 
   // ── Storage ──
   STORAGE_DRIVER: StorageDriver.default("local"),
-  STORAGE_LOCAL_DIR: z.string().trim().min(1).default(".data/storage"),
-  /** Defaults to API_PUBLIC_URL/v1/files (local) or https://assets.enmo.marketing (r2). */
+  /** The local driver's directory, relative to the process's working directory. */
+  STORAGE_LOCAL_DIR: z.string().trim().min(1).default(".data/assets"),
+  /**
+   * Render's disk is ephemeral (every deploy and restart wipes it) and Meta/TikTok fetch media by
+   * public URL, so production refuses the local driver unless this says the disk is durable.
+   */
+  ALLOW_LOCAL_STORAGE_IN_PRODUCTION: bool(false),
+  /** The local driver's public base; defaults to API_PUBLIC_URL + /files (served by this API). */
   PUBLIC_ASSET_BASE_URL: HttpUrl.optional(),
   R2_ACCOUNT_ID: secret.optional(),
   R2_ACCESS_KEY_ID: secret.optional(),
@@ -177,6 +212,8 @@ const EnvSchema = z.object({
   R2_BUCKET: z.string().trim().min(1).optional(),
   /** Overrides https://<R2_ACCOUNT_ID>.r2.cloudflarestorage.com (tests, S3-compatible stores). */
   R2_ENDPOINT: HttpUrl.optional(),
+  /** The bucket's public domain, which every R2 asset URL starts with. */
+  R2_PUBLIC_BASE_URL: HttpUrl.default(DEFAULT_R2_PUBLIC_BASE_URL),
 
   // ── Publishing ──
   PUBLISH_MODE: PublishMode.default("dry-run"),
@@ -226,6 +263,29 @@ function resolvePipelineActions(listed: readonly PipelineAction[]) {
   return { actions, problems };
 }
 
+/**
+ * HIGGSFIELD_CREDENTIALS ("<id>:<secret>") or the HIGGSFIELD_KEY_ID + HIGGSFIELD_KEY_SECRET pair;
+ * setting both forms would leave it unclear which key is live.
+ */
+function resolveHiggsfieldKeys(env: Env) {
+  const problems: string[] = [];
+  const pairSet = Boolean(env.HIGGSFIELD_KEY_ID ?? env.HIGGSFIELD_KEY_SECRET);
+  if (env.HIGGSFIELD_CREDENTIALS && pairSet) {
+    problems.push(
+      "Set HIGGSFIELD_CREDENTIALS or HIGGSFIELD_KEY_ID + HIGGSFIELD_KEY_SECRET, not both",
+    );
+  }
+  if (env.HIGGSFIELD_CREDENTIALS) {
+    const [keyId, keySecret] = env.HIGGSFIELD_CREDENTIALS.split(":") as [string, string];
+    return { keyId, keySecret, problems };
+  }
+  return {
+    keyId: env.HIGGSFIELD_KEY_ID,
+    keySecret: env.HIGGSFIELD_KEY_SECRET,
+    problems,
+  };
+}
+
 /** The AGENT_EFFORT_<AGENT> values that are set. */
 function agentEffortOverrides(env: Env): Readonly<Partial<Record<AgentName, Effort>>> {
   const overrides: Partial<Record<AgentName, Effort>> = {};
@@ -255,12 +315,19 @@ function resolveConfig(env: Env) {
       problems.push(error instanceof Error ? error.message : String(error));
     }
   }
-  if (
-    env.VISUAL_PROVIDER === "higgsfield" &&
-    !(env.HIGGSFIELD_KEY_ID && env.HIGGSFIELD_KEY_SECRET)
-  ) {
+  const higgsfield = resolveHiggsfieldKeys(env);
+  problems.push(...higgsfield.problems);
+  if (env.VISUAL_PROVIDER === "higgsfield" && !(higgsfield.keyId && higgsfield.keySecret)) {
     problems.push(
-      "VISUAL_PROVIDER=higgsfield requires HIGGSFIELD_KEY_ID and HIGGSFIELD_KEY_SECRET",
+      "VISUAL_PROVIDER=higgsfield requires HIGGSFIELD_CREDENTIALS (or HIGGSFIELD_KEY_ID and HIGGSFIELD_KEY_SECRET)",
+    );
+  }
+  // Without an image model the provider renders no stills, and STATIC, STORY and CAROUSEL posts
+  // are nothing but stills: every one of them would escalate. Video is optional (REEL and TIKTOK
+  // shots fall back to stills).
+  if (env.VISUAL_PROVIDER === "higgsfield" && !env.HIGGSFIELD_IMAGE_MODEL) {
+    problems.push(
+      "VISUAL_PROVIDER=higgsfield requires HIGGSFIELD_IMAGE_MODEL: every post type needs still images (HIGGSFIELD_VIDEO_MODEL is optional)",
     );
   }
   if (
@@ -269,6 +336,20 @@ function resolveConfig(env: Env) {
   ) {
     problems.push(
       "STORAGE_DRIVER=r2 requires R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY and R2_BUCKET",
+    );
+  }
+  if (env.STORAGE_DRIVER === "r2" && env.PUBLIC_ASSET_BASE_URL) {
+    problems.push(
+      "PUBLIC_ASSET_BASE_URL only applies to STORAGE_DRIVER=local; R2 assets are served from R2_PUBLIC_BASE_URL",
+    );
+  }
+  if (
+    env.NODE_ENV === "production" &&
+    env.STORAGE_DRIVER === "local" &&
+    !env.ALLOW_LOCAL_STORAGE_IN_PRODUCTION
+  ) {
+    problems.push(
+      "STORAGE_DRIVER=local in production loses every asset on the next deploy (Render's disk is ephemeral) and Meta/TikTok can't fetch it; use r2, or set ALLOW_LOCAL_STORAGE_IN_PRODUCTION=true on a durable disk",
     );
   }
   if (env.NODE_ENV === "production" && env.TRUST_PROXY === true) {
@@ -304,9 +385,9 @@ function resolveConfig(env: Env) {
     /** AGENT_EFFORT_<AGENT> overrides by agent; unset agents keep their definition's effort. */
     AGENT_EFFORT: agentEffortOverrides(env),
     API_PUBLIC_URL: apiPublicUrl,
-    PUBLIC_ASSET_BASE_URL:
-      env.PUBLIC_ASSET_BASE_URL ??
-      (env.STORAGE_DRIVER === "r2" ? "https://assets.enmo.marketing" : `${apiPublicUrl}/v1/files`),
+    HIGGSFIELD_KEY_ID: higgsfield.keyId,
+    HIGGSFIELD_KEY_SECRET: higgsfield.keySecret,
+    PUBLIC_ASSET_BASE_URL: env.PUBLIC_ASSET_BASE_URL ?? `${apiPublicUrl}${LOCAL_FILES_PATH}`,
     /** Decoded 32-byte AES-256-GCM key. */
     TOKEN_ENC_KEY: tokenEncKey,
   });

@@ -5,16 +5,27 @@ import {
   ManagerIntakeInput,
   ManagerPlanInput,
   ManagerQaInput,
+  VisualDirectInput,
+  VisualReviewInput,
   type Brief,
   type PostContext,
 } from "@enmo/shared";
 import type { LlmClient, LlmRefusal, LlmRequest, LlmResponse, LlmStopReason } from "../types";
+import { mockCallOf, type MockCall } from "./call";
 import { mockCopy, mockCopyWithBannedWord } from "./copywriter";
 import { faultAt, parseMockFaults, type MockFault, type MockFaultKind } from "./faults";
 import { mockIntake } from "./intake";
 import { mockPlan } from "./plan";
 import { mockQa, mockWeakQa } from "./qa";
 import { hashOf } from "./seed";
+import {
+  mockVisualDirect,
+  mockVisualDirectWithBannedWord,
+  mockVisualReview,
+  mockWeakVisualReview,
+  visualDirectSubject,
+  visualReviewSubject,
+} from "./visual-director";
 
 export {
   MOCK_FAULT_KINDS,
@@ -24,6 +35,7 @@ export {
   type MockFaultKind,
 } from "./faults";
 export { REVISION_PREFIX } from "./copywriter";
+export type { MockCall } from "./call";
 
 /** Synthetic usage: one token per four characters. */
 export const MOCK_CHARS_PER_TOKEN = 4;
@@ -56,18 +68,18 @@ function fixture<I>(
   schema: z.ZodType<I>,
   spec: {
     subject(input: I): unknown;
-    build(input: I): object;
-    banned?(input: I): object | null;
-    weak?(input: I): object | null;
+    build(input: I, call: MockCall): object;
+    banned?(input: I, call: MockCall): object | null;
+    weak?(input: I, call: MockCall): object | null;
   },
-): (rawInput: unknown) => BoundFixture {
-  return (rawInput) => {
+): (rawInput: unknown, call: MockCall) => BoundFixture {
+  return (rawInput, call) => {
     const input = schema.parse(rawInput);
     return {
       subject: String(hashOf(spec.subject(input))),
-      build: () => spec.build(input),
-      withBannedWord: () => spec.banned?.(input) ?? null,
-      weak: () => spec.weak?.(input) ?? null,
+      build: () => spec.build(input, call),
+      withBannedWord: () => spec.banned?.(input, call) ?? null,
+      weak: () => spec.weak?.(input, call) ?? null,
     };
   };
 }
@@ -83,7 +95,7 @@ function postSubject(input: { brief: Brief; post: PostContext }): unknown {
   };
 }
 
-const FIXTURES: Readonly<Record<string, (rawInput: unknown) => BoundFixture>> = {
+const FIXTURES: Readonly<Record<string, (rawInput: unknown, call: MockCall) => BoundFixture>> = {
   "MANAGER.intake": fixture(ManagerIntakeInput, { subject: (input) => input, build: mockIntake }),
   "MANAGER.plan": fixture(ManagerPlanInput, { subject: (input) => input, build: mockPlan }),
   "MANAGER.qa": fixture(ManagerQaInput, { subject: postSubject, build: mockQa, weak: mockWeakQa }),
@@ -91,6 +103,16 @@ const FIXTURES: Readonly<Record<string, (rawInput: unknown) => BoundFixture>> = 
     subject: postSubject,
     build: mockCopy,
     banned: mockCopyWithBannedWord,
+  }),
+  "VISUAL_DIRECTOR.direct": fixture(VisualDirectInput, {
+    subject: visualDirectSubject,
+    build: mockVisualDirect,
+    banned: mockVisualDirectWithBannedWord,
+  }),
+  "VISUAL_DIRECTOR.review": fixture(VisualReviewInput, {
+    subject: visualReviewSubject,
+    build: mockVisualReview,
+    weak: mockWeakVisualReview,
   }),
 };
 
@@ -197,7 +219,7 @@ export class MockLlm implements LlmClient {
     const key = `${request.meta.agent}.${request.meta.action}`;
     const bind = FIXTURES[key];
     if (!bind) throw new Error(`MockLlm has no fixture for ${key}`);
-    const bound = bind(request.meta.input);
+    const bound = bind(request.meta.input, mockCallOf(request));
     const counterKey = `${key}#${bound.subject}`;
     const callIndex = this.calls.get(counterKey) ?? 0;
     this.calls.set(counterKey, callIndex + 1);

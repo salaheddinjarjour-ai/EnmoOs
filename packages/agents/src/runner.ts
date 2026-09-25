@@ -10,6 +10,8 @@ import {
 import type {
   Effort,
   LlmClient,
+  LlmContentBlock,
+  LlmImageBlock,
   LlmMessage,
   LlmRequest,
   LlmResponse,
@@ -72,6 +74,14 @@ export interface RunAgentOptions extends RunnerHooks {
   model?: string;
   /** AGENT_EFFORT_<AGENT> override; defaults to the definition's effort. */
   effort?: Effort;
+  /**
+   * Images for the first user turn, placed ahead of its text; they stay in the conversation for
+   * every correction attempt. VISUAL_DIRECTOR.review sends the render this way (base64 PNG,
+   * downscaled to a 1568px long edge by @enmo/providers toReviewImage). Images ride beside the
+   * input rather than inside it, so AgentRun.inputSnapshot stays the small JSON input; MockLlm
+   * fixtures see them through MockCall.images.
+   */
+  images?: readonly LlmImageBlock[];
 }
 
 export interface AgentResult<O> {
@@ -114,7 +124,9 @@ export async function runAgent<I, O>(
   const effort = options.effort ?? def.effort;
   const maxAttempts = 1 + Math.max(0, Math.floor(options.maxRetries ?? DEFAULT_MAX_RETRIES));
   const system = systemBlocks(def.systemPrompt, def.brandBlock(input));
-  const messages: LlmMessage[] = [{ role: "user", content: def.userMessage(input) }];
+  const messages: LlmMessage[] = [
+    { role: "user", content: firstUserTurn(def.userMessage(input), options.images ?? []) },
+  ];
 
   let maxTokens = Math.min(def.maxTokens, MAX_TOKENS_CAP);
   let usage: LlmUsage = { ...ZERO_USAGE };
@@ -225,6 +237,17 @@ export async function runAgent<I, O>(
     reason: last.reason,
     issues: last.issues,
   });
+}
+
+/** Images first: the Messages API documents image-then-text as the order models read best. */
+function firstUserTurn(
+  content: string | LlmContentBlock[],
+  images: readonly LlmImageBlock[],
+): string | LlmContentBlock[] {
+  if (images.length === 0) return content;
+  const text: LlmContentBlock[] =
+    typeof content === "string" ? [{ type: "text", text: content }] : content;
+  return [...images, ...text];
 }
 
 /** The frozen prompt, then the brand block; the cache breakpoint sits on the last block. */

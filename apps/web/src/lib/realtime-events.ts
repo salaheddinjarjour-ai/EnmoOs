@@ -70,6 +70,8 @@ export function effectsOf(event: RealtimeEvent): CacheEffect[] {
     case "post.updated":
       return [{ kind: "patchPost", post: event.payload }, invalidate(queryKeys.posts.all)];
     case "asset.updated":
+      // Cards read PostDto.currentAssets; the Vault lists and lineages read the assets.
+      return [invalidate(queryKeys.posts.all), invalidate(queryKeys.assets.all)];
     case "publish.updated":
       return [invalidate(queryKeys.posts.all)];
     case "approval.created":

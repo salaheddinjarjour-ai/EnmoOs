@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  COPY_LIMITS,
+  VISUAL_LIMITS,
   canonicalGraph,
   type CopywriterInput,
   type CopywriterOutput,
@@ -121,6 +123,31 @@ describe("validateCopy", () => {
       ]),
     });
     expect(paths(validateCopy(long, reel))).toEqual(["script.totalDurationSec"]);
+  });
+
+  it(`caps the script at ${COPY_LIMITS.scenesMax} scenes, the most shots a post can plan`, () => {
+    expect(COPY_LIMITS.scenesMax).toBeLessThanOrEqual(VISUAL_LIMITS.shotsMax);
+    const spans = (count: number) =>
+      scenes(Array.from({ length: count }, (_, i): [number, number] => [i * 2.5, 2.5]));
+    const most = withScript({
+      totalDurationSec: COPY_LIMITS.scenesMax * 2.5,
+      hookTimestampSec: 1,
+      scenes: spans(COPY_LIMITS.scenesMax),
+    });
+    expect(validateCopy(most, reel)).toEqual([]);
+
+    const thirteen = withScript({
+      totalDurationSec: 13 * 2.5,
+      hookTimestampSec: 1,
+      scenes: spans(13),
+    });
+    const issues = validateCopy(thirteen, reel);
+    expect(paths(issues)).toEqual(["script.scenes"]);
+    expect(issues[0]!.message).toMatch(/13 scenes; use at most 12/);
+    // A human edit is held to it too, and QA sees it as a failed script check.
+    expect(paths(editedCopyIssues(thirteen, reel.post))).toEqual(["script.scenes"]);
+    const timing = automatedCopyChecks(thirteen, reel).find((c) => c.name === "script_timing")!;
+    expect(timing.passed).toBe(false);
   });
 
   it("checks the shape for each post type", () => {

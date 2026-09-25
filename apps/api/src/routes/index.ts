@@ -1,12 +1,15 @@
+import { LOCAL_FILES_PATH } from "../config";
 import type { ApiApp, RouteModule } from "../types";
 import { agentTasksRoutes } from "./agent-tasks";
 import { approvalsRoutes } from "./approvals";
+import { assetsRoutes } from "./assets";
 import { authRoutes } from "./auth";
 import { budgetRoutes } from "./budget";
 import { campaignsRoutes } from "./campaigns";
 import { capabilitiesRoutes } from "./capabilities";
 import { clientsRoutes } from "./clients";
 import { eventsRoutes } from "./events";
+import { filesRoutes } from "./files";
 import { healthRoutes } from "./health";
 import { invitesRoutes } from "./invites";
 import { postsRoutes } from "./posts";
@@ -33,6 +36,8 @@ export const V1_ROUTES: readonly RouteModule[] = [
   approvalsRoutes,
   budgetRoutes,
   eventsRoutes,
+  // Phase 3
+  assetsRoutes,
 ];
 
 export async function registerRoutes(app: ApiApp): Promise<void> {
@@ -40,6 +45,16 @@ export async function registerRoutes(app: ApiApp): Promise<void> {
   await app.register(async (scope) => {
     await healthRoutes(scope);
   });
+
+  // Local asset files, unversioned: their URLs are stored on Asset rows. R2 serves its own.
+  if (app.deps.config.STORAGE_DRIVER === "local") {
+    await app.register(
+      async (scope) => {
+        await filesRoutes(scope);
+      },
+      { prefix: LOCAL_FILES_PATH },
+    );
+  }
 
   await app.register(
     async (v1) => {

@@ -7,6 +7,7 @@ import { EventBatch } from "../orchestrator/events";
 import { postUpdated } from "../orchestrator/post-status";
 import { requeueTask } from "../orchestrator/sweeper";
 import { taskAction } from "../orchestrator/tasks";
+import { acceptBestTake } from "../orchestrator/visuals";
 import type { ServiceUser } from "./actor";
 
 /*
@@ -89,9 +90,10 @@ async function getAgentTask(deps: Deps, taskId: string): Promise<AgentTaskDto> {
 
 /**
  * POST /agent-tasks/:id/resolve for an ESCALATED or FAILED task. `retry` re-queues it with fresh
- * contract attempts and clears the post's needsAttention; `accept_best` (Phase 3 visual review
- * escalations) keeps the best take so far. CONFLICT for a task in any other status, or for
- * `accept_best` on a task that has no takes; NOT_FOUND when missing.
+ * contract attempts and clears the post's needsAttention; `accept_best` (visual review
+ * escalations) keeps each shot's best take so far (orchestrator/visuals.ts). CONFLICT for a task
+ * in any other status, or for `accept_best` on a task that renders nothing; NOT_FOUND when
+ * missing.
  */
 export async function resolveTask(
   deps: Deps,
@@ -103,6 +105,8 @@ export async function resolveTask(
     where: { id: taskId },
     select: {
       status: true,
+      agent: true,
+      action: true,
       postId: true,
       graph: { select: { status: true, campaign: { select: { status: true } } } },
     },
@@ -115,8 +119,12 @@ export async function resolveTask(
 
   switch (action) {
     case "accept_best":
-      // Takes are Visual Director renders (Phase 3); no task in the pipeline has any before then.
-      throw conflict("This task has no takes to accept; retry it instead");
+      // Takes are the Visual Director's renders; no other task has any.
+      if (task.agent !== "VISUAL_DIRECTOR" || task.action !== "direct") {
+        throw conflict("This task has no takes to accept; retry it instead");
+      }
+      await acceptBestTake(deps, taskId);
+      return getAgentTask(deps, taskId);
     case "retry":
       await retryTask(deps, taskId, task.postId);
       return getAgentTask(deps, taskId);

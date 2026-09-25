@@ -46,7 +46,8 @@ import { testDb } from "../helpers/db";
 import { createClient, createUser } from "../helpers/factories";
 import {
   seedProposedPlan,
-  startHarness,
+  PHASE2_PIPELINE,
+  startHarness as startAnyHarness,
   type Harness,
   type HarnessOptions,
 } from "../helpers/harness";
@@ -62,6 +63,10 @@ import {
  * tick.prune, and the campaign-level Manager jobs (intake, plan) failing for good or parked for
  * the budget.
  */
+
+/** Phase 2's copy pipeline (write → qa); the Visual Director's direct has its own suites. */
+const startHarness = (options: HarnessOptions = {}) =>
+  startAnyHarness({ pipeline: PHASE2_PIPELINE, ...options });
 
 let harness: Harness | undefined;
 

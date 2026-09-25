@@ -6,6 +6,7 @@ import {
   type AgentKey,
   type AgentResult,
   type AgentRunRecord,
+  type LlmImageBlock,
 } from "@enmo/agents";
 import type { Deps } from "../deps";
 import { budgetHooks } from "../services/budget";
@@ -29,11 +30,17 @@ export interface RunContext {
   clientId: string | null;
 }
 
+export interface RunAgentForOptions {
+  /** Images ahead of the input (VISUAL_DIRECTOR.review's render, via toReviewImage). */
+  images?: readonly LlmImageBlock[];
+}
+
 export function runAgentFor<K extends AgentKey>(
   deps: Deps,
   key: K,
   input: AgentInput<K>,
   context: RunContext,
+  options: RunAgentForOptions = {},
 ): Promise<AgentResult<AgentOutput<K>>> {
   const definition = getAgentDefinition(key) as unknown as AgentDefinition<
     AgentInput<K>,
@@ -44,6 +51,7 @@ export function runAgentFor<K extends AgentKey>(
     budget: budgetHooks(deps),
     recorder: { recordRun: (run) => recordAgentRun(deps, run, context) },
     effort: deps.config.AGENT_EFFORT[definition.agent],
+    ...(options.images ? { images: options.images } : {}),
   });
 }
 

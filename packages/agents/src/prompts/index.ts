@@ -18,4 +18,14 @@ export {
   MANAGER_QA_SYSTEM_PROMPT,
   renderQaUserMessage,
 } from "./manager-qa";
+export {
+  VISUAL_DIRECTOR_DIRECT_PROMPT_VERSION,
+  VISUAL_DIRECTOR_DIRECT_SYSTEM_PROMPT,
+  renderVisualDirectUserMessage,
+} from "./visual-director-direct";
+export {
+  VISUAL_DIRECTOR_REVIEW_PROMPT_VERSION,
+  VISUAL_DIRECTOR_REVIEW_SYSTEM_PROMPT,
+  renderVisualReviewUserMessage,
+} from "./visual-director-review";
 export { renderBrandBlock } from "./shared";

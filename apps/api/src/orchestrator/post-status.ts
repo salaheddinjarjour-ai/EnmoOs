@@ -45,6 +45,14 @@ export const POST_TRANSITIONS: Readonly<Record<PostStatus, readonly PostStatus[]
   ],
 };
 
+/** Posts whose visuals are out in the world (or failed there) and can't change any more. */
+export const FROZEN_POST_STATUSES: ReadonlySet<PostStatus> = new Set([
+  "PUBLISHING",
+  "LIVE",
+  "SCORED",
+  "FAILED",
+]);
+
 export function canTransition(from: PostStatus, to: PostStatus): boolean {
   return POST_TRANSITIONS[to].includes(from);
 }

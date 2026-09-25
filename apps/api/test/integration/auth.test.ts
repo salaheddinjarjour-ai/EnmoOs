@@ -655,7 +655,9 @@ describe("request hygiene", () => {
   });
 
   it("adds HSTS in production", async () => {
-    const production = await buildTestApp({ env: { NODE_ENV: "production" } });
+    const production = await buildTestApp({
+      env: { NODE_ENV: "production", ALLOW_LOCAL_STORAGE_IN_PRODUCTION: "true" },
+    });
     try {
       const response = await production.app.inject({ method: "GET", url: "/healthz" });
       expect(response.headers["strict-transport-security"]).toBe(

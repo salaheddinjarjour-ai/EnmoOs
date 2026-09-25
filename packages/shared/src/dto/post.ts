@@ -10,6 +10,7 @@ import {
   Slide,
 } from "../contracts/copywriter";
 import { Issue } from "../contracts/issues";
+import { AssetThumbDto } from "./asset";
 import { Id, IsoDate, IsoDateTime, listResponse } from "./common";
 
 /** The post's open (or latest) approval round, enough for a card's buttons. */
@@ -45,6 +46,11 @@ export const PostDto = z.object({
   angle: z.string().nullable(),
   hook: z.string().nullable(),
   copy: CopywriterOutput.nullable(),
+  /**
+   * The current take of each of the post's shots (role SHOT, isCurrent), in shot order: scene or
+   * slide order, else shot id. Empty until the Visual Director has planned its shots.
+   */
+  currentAssets: z.array(AssetThumbDto),
   humanEditCount: z.int().nonnegative(),
   /**
    * Whether PATCH /posts/:id/copy would take an edit now: the post has copy in a
@@ -87,8 +93,8 @@ export const EDITED_COPY_BOUNDS = {
   textMaxChars: COPY_LIMITS.captionMaxChars,
   hashtagMaxChars: 100,
   platformCaptionsMax: 10,
-  /** 90s of script at 1.5s a scene. */
-  scenesMax: 60,
+  /** The Copywriter contract's own: every scene gets a shot, and a post plans at most so many. */
+  scenesMax: COPY_LIMITS.scenesMax,
   /** PATCH /posts/:id/copy body limit, in bytes. */
   bodyMaxBytes: 128 * 1024,
 } as const;

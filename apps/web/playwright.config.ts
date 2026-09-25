@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { defineConfig, devices } from "@playwright/test";
-import { API_PORT, API_URL, E2E_ADMIN, WEB_PORT, WEB_URL } from "./e2e/env";
+import { API_PORT, API_URL, E2E_ADMIN, PIPELINE_ACTIONS, WEB_PORT, WEB_URL } from "./e2e/env";
 
 /*
  * Browser e2e (DESIGN §H): `pnpm --filter @enmo/web test:e2e [-- phase1]`.
@@ -78,7 +78,11 @@ export default defineConfig({
         MOCK_LLM_FAULTS: "",
         // A little latency per mock call, so drafting progress streams in over SSE as it would live.
         MOCK_LLM_DELAY_MS: "150",
+        PIPELINE_ACTIONS,
         VISUAL_PROVIDER: "mock",
+        // MockProvider settles on its second poll: about 2.5s of rendering per take, quick enough
+        // for the cards and long enough for phase3.spec to see a card shimmer while it renders.
+        RENDER_POLL_DELAY_MS: "1000",
         PUBLISH_MODE: "dry-run",
         STORAGE_DRIVER: "local",
         STORAGE_LOCAL_DIR: ".data/e2e-storage",

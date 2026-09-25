@@ -44,7 +44,7 @@ mock or dry-run mode.
 | ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------ | -------- |
 | 1 · Foundation     | Monorepo, full Prisma schema, auth + RBAC, invites, client CRUD (brand voice, visual style, banned words, approval chain), Command Center shell, Render + Cloudflare deploy config, CI | Log in, create a client, see the dashboard             | **Done** |
 | 2 · First words    | Brief chat, Manager intake/plan, task graph, BullMQ, Copywriter, approvals (text only)                                                                                                 | Brief → caption drafts → approve in the UI             | **Done** |
-| 3 · Eyes           | Visual provider abstraction + MockProvider, Visual Director, Vault, asset versioning                                                                                                   | Brief → approvable post card with a placeholder visual | Planned  |
+| 3 · Eyes           | Visual provider abstraction + MockProvider, Visual Director, Vault, asset versioning                                                                                                   | Brief → approvable post card with a placeholder visual | **Done** |
 | 4 · Go live (Meta) | Meta Graph publishing, Publisher agent, Calendar + slot optimizer, Approvals Queue                                                                                                     | An approved post publishes itself to IG/FB             | Planned  |
 | 5 · Everywhere     | TikTok publishing, Adapter agent, Higgsfield provider                                                                                                                                  | One brief → three platforms, in native formats         | Planned  |
 | 6 · The loop       | Metrics pull, Analyst, LearningLog, Strategist, growth dashboard                                                                                                                       | Content visibly improves week over week                | Planned  |
@@ -158,6 +158,90 @@ A chat brief becomes approved caption drafts, text only, end to end.
   `enmo-api` instance in `render.yaml`. If the API is ever scaled out, give `@fastify/rate-limit`
   the Redis client (`apps/api/src/plugins/security.ts`).
 
+### Phase 3: what works today
+
+A brief now ends in approvable post cards that carry a visual. The Visual Director directs and
+reviews each one; for now the renders are branded placeholders.
+
+- **The pipeline.** `PIPELINE_ACTIONS=write,direct,qa` is the new default: write, then direct,
+  then QA for each post. The Visual Director turns the post's script scenes, carousel slides or
+  on-screen text into a shot list: one shot per scene or slide, each a 9:16 master (1080×1920)
+  that Phase 5's Adapter crops to 4:5 and 1:1 for the feeds. Each shot gets a provider prompt, a
+  negative prompt, a camera note and a seed. Clip lengths stay within what the provider can
+  render. Its output is checked like every agent's: one shot per place, the right aspect ratios,
+  no banned words anywhere, and two corrective retries before it escalates.
+- **Renders.** Each shot becomes an `Asset` and a `render.submit` job on the `media` queue.
+  `render.poll` asks the provider how the job is doing. The first poll waits
+  `RENDER_POLL_DELAY_MS`, later ones back off to 10 s, and it gives up after 90 polls. The
+  finished file is downloaded into Storage (`clients/<clientId>/assets/<assetId>.png`), measured
+  and marked READY. The direct task waits (`WAITING`) until every shot has an accepted take.
+- **Review and regeneration.** The Visual Director reviews every take by looking at the render
+  itself, sent as an image scaled to a 1568 px long edge. A weak take is rendered again from the
+  revised prompt as the next version of the same lineage (`parentAssetId`, `rootAssetId`,
+  `version`, and `isCurrent` moves to it). That happens at most `MAX_VISUAL_REGENERATIONS` (2)
+  times. After that the task escalates: the Visual Director signs the escalation in the thread,
+  the post is flagged, and a MANAGER or ADMIN chooses **Accept best take** (each shot keeps its
+  highest-scored take) or **Retry**. If the provider refuses a render, the task escalates; if the
+  render fails or times out, the task fails with an alert (the take's status and the task's
+  hand-off commit together). The sweeper re-drives renders and reviews whose jobs were lost, for
+  the takes someone still waits on, and hands on a task whose failed take never reached it. A
+  review stopped by the token budget resumes after UTC midnight.
+- **Approval.** QA sees each post's current takes with their review scores and can send the
+  visuals back (`direct → qa`). An approval round's content hash covers the copy and the ids of
+  the current assets, so a new take means a new round. Request Changes can target Copy, Visual or
+  Both. Visual re-runs `direct.rN → qa.rN`, and Both re-runs write → direct → QA. Each agent
+  receives the reviewer's words verbatim. The takes follow the copy, one per scene or slide: a
+  Copy revision whose rewrite adds or drops a slide or scene gets `direct.rN` spliced in after
+  its write, a hand edit that does the same goes back through the Visual Director and QA, and
+  QA's `shots` check never lets a round open on takes that don't fit the copy.
+- **The Vault.** `GET /v1/assets` lists every take, newest first and keyset-paginated. It shows
+  current versions unless you ask for all of them. `q` searches the prompt, the campaign name and
+  the shot id; filters cover client, campaign, post, scene and kind. `GET /v1/assets/:id` returns
+  the take with its whole lineage. `POST /v1/assets/:id/regenerate {instruction?}` creates the next
+  version and gives the Visual Director the take's original context back: the shot, the post's
+  copy and the brand, plus the instruction verbatim. The new take is on trial: it goes through
+  the same review loop (a weak one is regenerated at most twice, then escalated) and becomes
+  current only once the Visual Director accepts it, so the post keeps its take meanwhile. On a
+  planned post the regenerate runs as a revision: open or approved rounds are cancelled, and QA
+  opens a new round once the new take is accepted. Outside any plan, a take that stays weak is
+  set aside with an alert.
+- **Files.** With `STORAGE_DRIVER=local` the API serves Storage at `GET /files/*`. The route is
+  public, caches immutably and supports byte ranges. It answers only canonical storage keys and
+  gives a 404 for anything else, including every traversal attempt. `STORAGE_DRIVER=r2` is
+  implemented for production.
+- **Providers.** `createVisualProvider` (`packages/providers/src/visual/index.ts`) switches on
+  `VISUAL_PROVIDER`. Adding a provider means one file and one `case`. Provider calls and render
+  downloads go through the injected `deps.fetch`.
+- **Web.** Post cards show the first shot's take at the post type's shape (a carousel shows its
+  first slide and the slide count). The card shimmers while the take renders. The post drawer
+  lists each shot's current take and links to it in the Vault. **The Vault** shows a grid of
+  current takes with search, filters, infinite scroll and an all-versions toggle. Its drawer has a
+  large preview, the version timeline, the prompt and camera note, the provider, and the review's
+  verdict and score. It also has **Regenerate** with an optional instruction: the new version
+  shimmers at once and swaps in live when it is ready. The Visual Director's escalations offer
+  Accept best take next to Retry.
+
+**Mocked, dry-run or not there yet (as of Phase 3).**
+
+- `VISUAL_PROVIDER=mock` is the default. MockProvider renders a branded placeholder PNG with
+  sharp: a gradient in the client's palette, the headline in the brand's display font, the start
+  of the prompt, and a `MOCK · s2 · v1` footer. Outputs are 1080×1920, 1080×1350 or 1080×1080. It
+  reports success on its second poll. A VIDEO shot comes back as a poster PNG only
+  (`params.mockVideo=true`), so there is no real clip.
+- The HiggsfieldProvider is written against Higgsfield's REST API (submit, status and cancel,
+  with `Authorization: Key id:secret`). `phase3.provider-swap` runs the whole pipeline with
+  `VISUAL_PROVIDER=higgsfield` against an in-memory Higgsfield behind the injected fetch. It has
+  never called the real service, because there are no credentials. Its request fields are checked
+  again against the fake Higgsfield server in Phase 5, which also brings multi-scene video
+  assembly (ffmpeg).
+- R2 storage has only been tested against a local S3-compatible server. There are no R2
+  credentials yet.
+- The Visual Director runs on MockLlm. Its shot lists come from templates, and its review reads
+  the PNG's dimensions and accepts takes in the right aspect ratio. `MOCK_LLM_FAULTS` can make it
+  misbehave, for example `VISUAL_DIRECTOR.review:weak*3`.
+- Approved posts are still not published (Phase 4). The Adapter's per-platform variants arrive in
+  Phase 5, so for now each post has one master visual per shot.
+
 ## Architecture
 
 ```
@@ -217,7 +301,7 @@ packages/
   shared/       @enmo/shared  zod enums + DTOs, RBAC matrix, approval-chain walk, status maps (no Node deps)
   db/           @enmo/db      Prisma 7 schema + migrations, createPrisma(), seed, test helpers
   agents/       @enmo/agents  agent runner, Anthropic + MockLlm clients, prompts, definitions, validators
-  providers/    (Phase 3+)    visual providers, storage (local / R2), imaging, publishers, OAuth, metrics
+  providers/    @enmo/providers  visual providers (mock, Higgsfield), storage (local / R2), imaging; publishers, OAuth, metrics later
 scripts/
   services.sh   local Postgres :54329 + Redis :63799 (up | down | status | env | createdb <name>)
   smoke-api.mjs boots the built API and checks /healthz, /readyz and a clean shutdown
@@ -315,7 +399,10 @@ pnpm format:check
   `startHarness()`: the app listening on a free port, in-process BullMQ workers on a unique queue
   prefix, the MockLlm and a FakeClock. The SSE stream is read over the real port, scheduler ticks
   are called directly, and `waitFor` polls the database. `phase2.brief-to-approval` is the Phase 2
-  exit test; `phase2.faults` covers `MOCK_LLM_FAULTS` and `DAILY_TOKEN_CAP`.
+  exit test; `phase2.faults` covers `MOCK_LLM_FAULTS` and `DAILY_TOKEN_CAP`. The harness also uses
+  MockProvider and a temporary LocalStorage. `phase3.brief-to-visual` is the Phase 3 exit test.
+  `phase3.visual-loop` covers feedback routing, provider failures, the sweeper and the budget.
+  `phase3.provider-swap` runs the pipeline on Higgsfield against a fake behind the injected fetch.
 - **Playwright.** The config starts the API from source on port 4100 (tsx, embedded worker, mock
   LLM, dry-run publishing) against a fresh `enmo_e2e` database. It starts the web app on port 3100
   with `next build && next start`. Every run starts its own servers: if port 4100 or 3100 is
@@ -386,7 +473,7 @@ combination stops the process at boot with a list of the problems, for example
 | `DAILY_TOKEN_CAP`         | `2000000`                                              | Input + output token budget per UTC day. Once it is reached, tasks wait as `BLOCKED_BUDGET`.                                         |
 | `AGENT_CONCURRENCY`       | `4`                                                    | Concurrency of the `agents` queue (LLM work).                                                                                        |
 | `MEDIA_CONCURRENCY`       | `4`                                                    | Concurrency of the `media` queue (renders, adapting).                                                                                |
-| `PIPELINE_ACTIONS`        | `write,qa`                                             | Comma list of per-post actions the Manager may plan, from `strategy`, `write`, `direct`, `adapt` and `qa`. It widens phase by phase. |
+| `PIPELINE_ACTIONS`        | `write,direct,qa`                                      | Comma list of per-post actions the Manager may plan, from `strategy`, `write`, `direct`, `adapt` and `qa`. It widens phase by phase. |
 | `MAX_QA_REVISIONS`        | `1`                                                    | Automatic Manager QA revisions per post (0–3). After that the post goes to humans with the QA notes.                                 |
 | `MOCK_LLM_FAULTS`         | none                                                   | MockLlm fault injection for tests, e.g. `COPYWRITER.write:invalid*2,VISUAL_DIRECTOR.review:weak*3`.                                  |
 | `MOCK_LLM_DELAY_MS`       | `0`                                                    | MockLlm latency per call (0–60000 ms), so a local demo shows progress arriving live instead of all at once.                          |
@@ -394,28 +481,33 @@ combination stops the process at boot with a list of the problems, for example
 
 **Visuals**
 
-| Variable                 | Default                     | Purpose                                                                                      |
-| ------------------------ | --------------------------- | -------------------------------------------------------------------------------------------- |
-| `VISUAL_PROVIDER`        | `mock`                      | `mock` (sharp-rendered branded placeholders) or `higgsfield`.                                |
-| `HIGGSFIELD_KEY_ID`      | none                        | Higgsfield credentials. Both this and `HIGGSFIELD_KEY_SECRET` are required for `higgsfield`. |
-| `HIGGSFIELD_KEY_SECRET`  | none                        | See above.                                                                                   |
-| `HIGGSFIELD_BASE_URL`    | `https://api.higgsfield.ai` | API base URL. Tests override it with a fake server.                                          |
-| `HIGGSFIELD_IMAGE_MODEL` | none                        | Higgsfield model id for stills.                                                              |
-| `HIGGSFIELD_VIDEO_MODEL` | none                        | Higgsfield model id for video.                                                               |
-| `FFMPEG_PATH`            | none                        | Enables multi-scene video assembly. Without it, the first clip is used.                      |
+| Variable                   | Default                     | Purpose                                                                                                                                                   |
+| -------------------------- | --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `VISUAL_PROVIDER`          | `mock`                      | `mock` (sharp-rendered branded placeholders) or `higgsfield`.                                                                                             |
+| `HIGGSFIELD_CREDENTIALS`   | none                        | The Higgsfield key as `<key id>:<key secret>`. `higgsfield` needs either this or both halves below, never both forms.                                     |
+| `HIGGSFIELD_KEY_ID`        | none                        | The key id, if you set the halves separately.                                                                                                             |
+| `HIGGSFIELD_KEY_SECRET`    | none                        | The key secret, if you set the halves separately.                                                                                                         |
+| `HIGGSFIELD_BASE_URL`      | `https://api.higgsfield.ai` | API base URL. Tests override it with a fake server.                                                                                                       |
+| `HIGGSFIELD_IMAGE_MODEL`   | none                        | Higgsfield model id for stills. `higgsfield` needs it: every post type has stills.                                                                        |
+| `HIGGSFIELD_VIDEO_MODEL`   | none                        | Higgsfield model id for video. Optional: without it, reel and TikTok shots are stills too.                                                                |
+| `FFMPEG_PATH`              | none                        | Enables multi-scene video assembly. Without it, the first clip is used.                                                                                   |
+| `MAX_VISUAL_REGENERATIONS` | `2`                         | How many times (0–2) the Visual Director may regenerate a weak take of one shot, each as a new asset version, before it escalates. Lower it to save cost. |
+| `RENDER_POLL_DELAY_MS`     | `3000`                      | Wait before the first `render.poll` after a submit (10–10000 ms). Later polls back off to 10 s. Tests shorten it.                                         |
 
 **Storage**
 
-| Variable                | Default                                                                    | Purpose                                                                                                                                            |
-| ----------------------- | -------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `STORAGE_DRIVER`        | `local`                                                                    | `local` (disk, served at `/v1/files/*`) or `r2`. Production needs `r2`: Render's disk is ephemeral, and Meta and TikTok fetch media by public URL. |
-| `STORAGE_LOCAL_DIR`     | `.data/storage`                                                            | Directory for the local driver, relative to the API's working directory.                                                                           |
-| `PUBLIC_ASSET_BASE_URL` | `$API_PUBLIC_URL/v1/files` (local) or `https://assets.enmo.marketing` (r2) | Public base URL of stored assets.                                                                                                                  |
-| `R2_ACCOUNT_ID`         | none                                                                       | Cloudflare account id. All four `R2_*` credentials are required for `r2`.                                                                          |
-| `R2_ACCESS_KEY_ID`      | none                                                                       | R2 API token access key.                                                                                                                           |
-| `R2_SECRET_ACCESS_KEY`  | none                                                                       | R2 API token secret.                                                                                                                               |
-| `R2_BUCKET`             | none                                                                       | Bucket name. Production: `enmo-assets`.                                                                                                            |
-| `R2_ENDPOINT`           | `https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com`                          | Override for tests or another S3-compatible store.                                                                                                 |
+| Variable                            | Default                                           | Purpose                                                                                                                                                    |
+| ----------------------------------- | ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `STORAGE_DRIVER`                    | `local`                                           | `local` (disk, served by the API at `/files/*`) or `r2`. Production needs `r2`: Render's disk is ephemeral, and Meta and TikTok fetch media by public URL. |
+| `STORAGE_LOCAL_DIR`                 | `.data/assets`                                    | Directory for the local driver, relative to the API's working directory.                                                                                   |
+| `ALLOW_LOCAL_STORAGE_IN_PRODUCTION` | `false`                                           | With `NODE_ENV=production` the services refuse `local` unless this is `true`: only for a disk that survives deploys (the smoke test sets it).              |
+| `PUBLIC_ASSET_BASE_URL`             | `$API_PUBLIC_URL/files`                           | Local driver only: the public base URL of `/files/*`. With `r2`, setting it is an error.                                                                   |
+| `R2_ACCOUNT_ID`                     | none                                              | Cloudflare account id. All four `R2_*` credentials are required for `r2`.                                                                                  |
+| `R2_ACCESS_KEY_ID`                  | none                                              | R2 API token access key.                                                                                                                                   |
+| `R2_SECRET_ACCESS_KEY`              | none                                              | R2 API token secret.                                                                                                                                       |
+| `R2_BUCKET`                         | none                                              | Bucket name. Production: `enmo-assets`.                                                                                                                    |
+| `R2_ENDPOINT`                       | `https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com` | Override for tests or another S3-compatible store.                                                                                                         |
+| `R2_PUBLIC_BASE_URL`                | `https://assets.enmo.marketing`                   | The bucket's public domain, which every R2 asset URL starts with.                                                                                          |
 
 **Publishing**
 
@@ -549,10 +641,11 @@ or `CF-Connecting-IP` is not reaching the API.
    ```
 
    Later phases add `META_APP_ID`, `META_APP_SECRET`, `TIKTOK_CLIENT_KEY`, `TIKTOK_CLIENT_SECRET`,
-   `HIGGSFIELD_KEY_ID`, `HIGGSFIELD_KEY_SECRET`, `HIGGSFIELD_IMAGE_MODEL` and
-   `HIGGSFIELD_VIDEO_MODEL` to this group. The services refuse to boot without `TOKEN_ENC_KEY`,
-   without the Anthropic key (because `LLM_PROVIDER=anthropic`), and without the R2 credentials
-   (because `STORAGE_DRIVER=r2`).
+   `HIGGSFIELD_CREDENTIALS` (or `HIGGSFIELD_KEY_ID` and `HIGGSFIELD_KEY_SECRET`),
+   `HIGGSFIELD_IMAGE_MODEL` and `HIGGSFIELD_VIDEO_MODEL` to this group. The services refuse to
+   boot without `TOKEN_ENC_KEY`, without the Anthropic key (because `LLM_PROVIDER=anthropic`), and
+   without the R2 credentials (because `STORAGE_DRIVER=r2`; production refuses the local driver,
+   whose files a deploy would wipe).
 
 2. **Apply the Blueprint.** Go to Blueprints → New Blueprint Instance and pick this repository.
    Render reads `render.yaml` and creates:

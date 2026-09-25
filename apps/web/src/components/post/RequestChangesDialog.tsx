@@ -15,8 +15,10 @@ import { useRuntimeCapabilities } from "@/lib/capabilities";
 /*
  * Request Changes (DESIGN "Request Changes"): the note reaches the agent byte-for-byte, so the
  * textarea's value is sent exactly as typed (never trimmed), and the reviewer says what needs the
- * work. Visual and Both need the Visual Director in the pipeline (PIPELINE_ACTIONS has "direct",
- * from Phase 3), so until then they are shown but disabled.
+ * work: Copy (the Copywriter), Visual (the Visual Director reshoots) or Both. Visual and Both need
+ * the Visual Director in the pipeline (PIPELINE_ACTIONS has "direct", the default since Phase 3);
+ * a deployment that leaves it out shows them disabled, since the API would route the note to the
+ * Copywriter anyway.
  */
 
 const FEEDBACK_MAX = 4000;
@@ -26,6 +28,13 @@ const TARGETS: ReadonlyArray<{ value: FeedbackTarget; label: string; description
   { value: "VISUAL", label: "Visual", description: "The Visual Director reshoots." },
   { value: "BOTH", label: "Both", description: "Copy first, then new visuals." },
 ];
+
+/** Who the toast says has the note. */
+const RECIPIENT: Readonly<Record<FeedbackTarget, string>> = {
+  COPY: "The Copywriter has your note, word for word.",
+  VISUAL: "The Visual Director has your note, word for word.",
+  BOTH: "The Copywriter and the Visual Director have your note, word for word.",
+};
 
 export function RequestChangesDialog({
   post,
@@ -73,12 +82,7 @@ function RequestChangesForm({ post, onDone }: { post: PostDto; onDone: () => voi
       { requestId, postId: post.id, decision: "REQUEST_CHANGES", feedback, target },
       {
         onSuccess: () => {
-          toast.success(
-            `Changes requested on ${post.ref}`,
-            target === "COPY"
-              ? "The Copywriter has your note, word for word."
-              : "The Arsenal has your note, word for word.",
-          );
+          toast.success(`Changes requested on ${post.ref}`, RECIPIENT[target]);
           onDone();
         },
       },
@@ -143,8 +147,9 @@ function RequestChangesForm({ post, onDone }: { post: PostDto; onDone: () => voi
         </div>
         {visualsEnabled ? null : (
           <p id={`${groupId}-hint`} className="text-xs leading-relaxed text-steel/80">
-            Visual and Both open once the Visual Director joins the pipeline (Phase 3). Posts are
-            text only for now, so the Copywriter takes the note.
+            {runtime.data
+              ? "This pipeline runs without the Visual Director, so the Copywriter takes the note."
+              : "Visual and Both open once the pipeline's agents are known."}
           </p>
         )}
       </fieldset>

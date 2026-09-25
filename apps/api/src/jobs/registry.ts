@@ -1,8 +1,12 @@
 import { managerIntakeProcessor } from "./processors/manager-intake";
 import { managerPlanProcessor } from "./processors/manager-plan";
+import { renderPollProcessor } from "./processors/render-poll";
+import { renderSubmitProcessor } from "./processors/render-submit";
 import { taskRunProcessor } from "./processors/task-run";
 import { tickPruneProcessor } from "./processors/tick-prune";
 import { tickSweeperProcessor } from "./processors/tick-sweeper";
+import { visualRegenerateProcessor } from "./processors/visual-regenerate";
+import { visualReviewProcessor } from "./processors/visual-review";
 import { JOB, QUEUE_NAMES, type QueueName } from "./queues";
 import type { JobProcessor } from "./types";
 
@@ -24,8 +28,13 @@ export const processors: ProcessorRegistry = {
     [JOB.managerIntake]: managerIntakeProcessor,
     [JOB.managerPlan]: managerPlanProcessor,
     [JOB.taskRun]: taskRunProcessor,
+    [JOB.visualReview]: visualReviewProcessor,
+    [JOB.visualRegenerate]: visualRegenerateProcessor,
   },
-  media: {},
+  media: {
+    [JOB.renderSubmit]: renderSubmitProcessor,
+    [JOB.renderPoll]: renderPollProcessor,
+  },
   ops: {
     [JOB.tickSweeper]: tickSweeperProcessor,
     [JOB.tickPrune]: tickPruneProcessor,

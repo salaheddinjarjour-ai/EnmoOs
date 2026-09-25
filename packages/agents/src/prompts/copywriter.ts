@@ -7,7 +7,7 @@ import {
 import { BANNED_WORDS_RULE, ENMO_PREAMBLE, OUTPUT_RULES, json } from "./shared";
 
 /** Bump whenever the system prompt or the user-turn template changes. */
-export const COPYWRITER_PROMPT_VERSION = "copywriter.write.v1";
+export const COPYWRITER_PROMPT_VERSION = "copywriter.write.v2";
 
 export const COPYWRITER_SYSTEM_PROMPT = `${ENMO_PREAMBLE}
 
@@ -28,6 +28,7 @@ Write the complete copy for the post described in the request, in the brand's vo
   - scenes are indexed from 0 and contiguous: scene 0 starts at 0s, each next scene starts exactly where the previous one ends, and the durations add up to totalDurationSec (±${COPY_LIMITS.durationToleranceSec}s).
   - hookTimestampSec is when the hook lands: within ${COPY_LIMITS.hookMaxSec}s (or by post.targetHookSec when it's set, whichever is earlier) and inside scene 0. hookText is that line.
   - totalDurationSec ≤ ${COPY_LIMITS.scriptMaxSec}s; 15 to 45 seconds usually works best.
+  - at most ${COPY_LIMITS.scenesMax} scenes: the Visual Director gives every scene its own shot, so a beat that shares a visual with the one before belongs in the same scene.
   - voiceover is what's spoken; overlayText is the short on-screen text (a few words); visualNote directs the Visual Director and is never shown to the audience.
 - CAROUSEL: ${COPY_LIMITS.slidesMin} to ${COPY_LIMITS.slidesMax} "slides" indexed from 0; slide 0 is the cover that stops the scroll and the last slide carries the call to action. "script" and "onScreenText" are null.
 - STATIC and STORY: "onScreenText" holds the few words set on the image (a dozen words at most); "script" and "slides" are null.
@@ -51,7 +52,7 @@ export function renderCopywriterUserMessage(input: CopywriterInput): string {
   const hookBy = Math.min(COPY_LIMITS.hookMaxSec, post.targetHookSec ?? COPY_LIMITS.hookMaxSec);
   const body =
     shape === "script"
-      ? `a script (hook by ${hookBy}s, inside scene 0); slides and onScreenText are null`
+      ? `a script (hook by ${hookBy}s, inside scene 0; at most ${COPY_LIMITS.scenesMax} scenes); slides and onScreenText are null`
       : shape === "slides"
         ? `${COPY_LIMITS.slidesMin}–${COPY_LIMITS.slidesMax} slides; script and onScreenText are null`
         : "onScreenText; script and slides are null";

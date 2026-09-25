@@ -13,6 +13,8 @@ import {
   MOCK_CHARS_PER_TOKEN,
   MockLlm,
   REVISION_PREFIX,
+  SHOTS_CHECK,
+  automatedShotCheck,
   copywriterWrite,
   createLlm,
   faultAt,
@@ -21,11 +23,13 @@ import {
   managerQa,
   parseMockFaults,
   runAgent,
+  shotCoverageIssues,
   validateCopy,
   validateIntake,
   validateQa,
   type LlmRequest,
 } from "../src";
+import { mockCallOf } from "../src/llm/mock/call";
 import {
   QAHWA,
   RAMADAN_ANSWER,
@@ -135,6 +139,21 @@ describe("MockLlm", () => {
         meta: { ...req.meta, agent: "ANALYST", action: "analyze" },
       }),
     ).rejects.toThrow(/no fixture for ANALYST\.analyze/);
+  });
+
+  it("shows fixtures the images a call carried, from every user turn", () => {
+    const image = { type: "image", mediaType: "image/png", data: "iVBORw0KGgo=" } as const;
+    const req = request(copyInput("REEL"));
+    expect(mockCallOf(req).images).toEqual([]);
+    const withImage: LlmRequest = {
+      ...req,
+      messages: [
+        { role: "user", content: [image, { type: "text", text: "Review this take." }] },
+        { role: "assistant", content: "{}" },
+        { role: "user", content: "Fix it." },
+      ],
+    };
+    expect(mockCallOf(withImage).images).toEqual([image]);
   });
 });
 
@@ -381,6 +400,37 @@ describe("MockLlm QA", () => {
       expect.objectContaining({ target: "COPYWRITER", field: "hashtags" }),
     ]);
     expect(validateQa(revise.output, failing)).toEqual([]);
+  });
+
+  it("sends takes that no longer fit the copy back to the Visual Director", async () => {
+    const copy = await mockCopyFor(copyInput("CAROUSEL"));
+    const slides = copy.slides!;
+    const visuals = slides.slice(0, -1).map((slide, i) => ({
+      assetId: `a${i}`,
+      shotId: `s${i + 1}`,
+      sceneIndex: null,
+      slideIndex: slide.index,
+      prompt: "A shot",
+      url: null,
+      reviewScore: 8,
+    }));
+    const gaps = shotCoverageIssues({ type: "CAROUSEL" }, copy, visuals);
+    expect(gaps).toEqual([
+      { path: "shots", message: `Slide ${slides.at(-1)!.index} has no shot.` },
+    ]);
+    const input = qaInput({ copy, visuals, automatedChecks: [automatedShotCheck(gaps)] });
+    expect(input.automatedChecks).toEqual([
+      { name: SHOTS_CHECK, passed: false, detail: gaps[0]!.message },
+    ]);
+    const { output } = await runAgent(managerQa, input, {
+      llm: new MockLlm(),
+      ...recordingHooks(),
+    });
+    expect(output.verdict).toBe("revise");
+    expect(output.issues).toEqual([
+      expect.objectContaining({ target: "VISUAL_DIRECTOR", field: "shots" }),
+    ]);
+    expect(validateQa(output, input)).toEqual([]);
   });
 });
 

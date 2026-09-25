@@ -12,8 +12,8 @@ import { closeRedis, createProducerConnection } from "./connection";
  * the producer side (DESIGN §D). Processors live in processors/*.ts and are wired by registry.ts;
  * runtime.ts consumes.
  *
- *   agents  LLM work                         concurrency AGENT_CONCURRENCY
- *   media   rendering and adapting (Phase 3)  concurrency MEDIA_CONCURRENCY
+ *   agents  LLM work (visual.review too)     concurrency AGENT_CONCURRENCY
+ *   media   rendering and adapting            concurrency MEDIA_CONCURRENCY
  *   ops     publishing, metrics, ticks        concurrency 2
  */
 
@@ -42,6 +42,14 @@ export const JOB = {
   managerPlan: "manager.plan",
   /** Run one AgentTask of an approved graph. */
   taskRun: "task.run",
+  /** Hand one QUEUED shot Asset to the visual provider (Asset.providerJobId, RENDERING). */
+  renderSubmit: "render.submit",
+  /** Ask the provider how an Asset's job is doing; re-enqueued with a 3-10s delay until it settles. */
+  renderPoll: "render.poll",
+  /** The Visual Director looks at one READY take: accept, regenerate or escalate. */
+  visualReview: "visual.review",
+  /** A Vault regenerate: the Visual Director re-plans one shot in its original context. */
+  visualRegenerate: "visual.regenerate",
   /** Every 5 min: stuck RUNNING tasks, BLOCKED_BUDGET after the UTC day rolls, stale WAITING. */
   tickSweeper: "tick.sweeper",
   /** Daily: RealtimeEvent rows older than 7 days and expired Session rows. */
@@ -57,12 +65,17 @@ export const JOB_QUEUE: Readonly<Record<JobName, QueueName>> = {
   "manager.intake": "agents",
   "manager.plan": "agents",
   "task.run": "agents",
+  "render.submit": "media",
+  "render.poll": "media",
+  "visual.review": "agents",
+  "visual.regenerate": "agents",
   "tick.sweeper": "ops",
   "tick.prune": "ops",
 };
 
 /** A short token that makes a deliberate re-queue a new job, e.g. "stall1" or "budget-2026-09-25". */
 export const RequeueToken = z.string().regex(/^[A-Za-z0-9._-]{1,48}$/);
+export type RequeueToken = z.infer<typeof RequeueToken>;
 
 export const ManagerIntakeJob = z.object({
   campaignId: Id,
@@ -91,6 +104,29 @@ export const TaskRunJob = z.object({
 });
 export type TaskRunJob = z.infer<typeof TaskRunJob>;
 
+/** render.submit: the Asset row carries the shot (prompt, params); the job only names it. */
+export const RenderSubmitJob = z.object({ assetId: Id });
+export type RenderSubmitJob = z.infer<typeof RenderSubmitJob>;
+
+export const RenderPollJob = z.object({
+  assetId: Id,
+  /** 1 for the first poll after submit; each re-enqueue adds one (and backs off, see below). */
+  attempt: z.int().positive(),
+});
+export type RenderPollJob = z.infer<typeof RenderPollJob>;
+
+/** visual.review: one review per Asset row; a regeneration is a new row with its own review. */
+export const VisualReviewJob = z.object({ assetId: Id });
+export type VisualReviewJob = z.infer<typeof VisualReviewJob>;
+
+/**
+ * visual.regenerate: the new QUEUED version POST /assets/:id/regenerate created. The Visual
+ * Director re-plans its shot from Asset.params (the shot, the Vault instruction verbatim) before
+ * it is submitted.
+ */
+export const VisualRegenerateJob = z.object({ assetId: Id });
+export type VisualRegenerateJob = z.infer<typeof VisualRegenerateJob>;
+
 /** Scheduler ticks carry no data; everything they act on is read from the database. */
 export const TickJob = z.object({});
 export type TickJob = z.infer<typeof TickJob>;
@@ -99,6 +135,10 @@ export const JOB_PAYLOADS = {
   "manager.intake": ManagerIntakeJob,
   "manager.plan": ManagerPlanJob,
   "task.run": TaskRunJob,
+  "render.submit": RenderSubmitJob,
+  "render.poll": RenderPollJob,
+  "visual.review": VisualReviewJob,
+  "visual.regenerate": VisualRegenerateJob,
   "tick.sweeper": TickJob,
   "tick.prune": TickJob,
 } as const satisfies Record<JobName, z.ZodType>;
@@ -132,7 +172,39 @@ export const jobIds = {
     `plan-${campaignId}-v${version}`,
   taskRun: ({ taskId, revision, requeue }: TaskRunJob) =>
     `task-${taskId}-r${revision}${requeue ? `-${requeue}` : ""}`,
+  /** DESIGN's render:<assetId>:submit; a requeue token lets the sweeper submit a lost job again. */
+  renderSubmit: ({ assetId }: RenderSubmitJob, requeue?: RequeueToken | null) =>
+    `render-${assetId}-submit${requeueSuffix(requeue)}`,
+  renderPoll: ({ assetId, attempt }: RenderPollJob) => `render-${assetId}-poll${attempt}`,
+  /** DESIGN's review:<assetId>. */
+  visualReview: ({ assetId }: VisualReviewJob, requeue?: RequeueToken | null) =>
+    `review-${assetId}${requeueSuffix(requeue)}`,
+  visualRegenerate: ({ assetId }: VisualRegenerateJob, requeue?: RequeueToken | null) =>
+    `regenerate-${assetId}${requeueSuffix(requeue)}`,
 } as const;
+
+function requeueSuffix(requeue: RequeueToken | null | undefined): string {
+  return requeue ? `-${RequeueToken.parse(requeue)}` : "";
+}
+
+/* ─── render polling ─────────────────────────────────────────────────────────────────────────── */
+
+/** The longest wait between two polls of one render (DESIGN §D: 3-10s). */
+export const RENDER_POLL_MAX_DELAY_MS = 10_000;
+
+/**
+ * How long to wait before poll `attempt`: RENDER_POLL_DELAY_MS for the first, then ×1.5 per poll
+ * up to RENDER_POLL_MAX_DELAY_MS, so quick mock renders settle fast and slow video renders cost
+ * few queue commands.
+ */
+export function renderPollDelayMs(
+  config: Pick<Config, "RENDER_POLL_DELAY_MS">,
+  attempt: number,
+): number {
+  const base = config.RENDER_POLL_DELAY_MS;
+  const delay = Math.round(base * 1.5 ** Math.max(0, attempt - 1));
+  return Math.min(Math.max(base, RENDER_POLL_MAX_DELAY_MS), delay);
+}
 
 /* ─── options ────────────────────────────────────────────────────────────────────────────────── */
 
@@ -291,4 +363,56 @@ export function enqueueTaskRun(
   options: { delayMs?: number } = {},
 ): Promise<string> {
   return queues.add(JOB.taskRun, data, { jobId: jobIds.taskRun(data), ...options });
+}
+
+/** Options of the asset jobs' enqueue helpers. */
+export interface AssetJobOptions {
+  /** Makes the job id new, for a deliberate re-queue (e.g. the sweeper re-driving a lost job). */
+  requeue?: RequeueToken | null;
+  delayMs?: number;
+}
+
+export function enqueueRenderSubmit(
+  queues: JobQueues,
+  data: RenderSubmitJob,
+  { requeue, delayMs }: AssetJobOptions = {},
+): Promise<string> {
+  return queues.add(JOB.renderSubmit, data, {
+    jobId: jobIds.renderSubmit(data, requeue),
+    ...(delayMs ? { delayMs } : {}),
+  });
+}
+
+/** Pass `delayMs: renderPollDelayMs(deps.config, data.attempt)`. */
+export function enqueueRenderPoll(
+  queues: JobQueues,
+  data: RenderPollJob,
+  options: { delayMs: number },
+): Promise<string> {
+  return queues.add(JOB.renderPoll, data, {
+    jobId: jobIds.renderPoll(data),
+    delayMs: options.delayMs,
+  });
+}
+
+export function enqueueVisualReview(
+  queues: JobQueues,
+  data: VisualReviewJob,
+  { requeue, delayMs }: AssetJobOptions = {},
+): Promise<string> {
+  return queues.add(JOB.visualReview, data, {
+    jobId: jobIds.visualReview(data, requeue),
+    ...(delayMs ? { delayMs } : {}),
+  });
+}
+
+export function enqueueVisualRegenerate(
+  queues: JobQueues,
+  data: VisualRegenerateJob,
+  { requeue, delayMs }: AssetJobOptions = {},
+): Promise<string> {
+  return queues.add(JOB.visualRegenerate, data, {
+    jobId: jobIds.visualRegenerate(data, requeue),
+    ...(delayMs ? { delayMs } : {}),
+  });
 }
