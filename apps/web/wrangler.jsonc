@@ -1,8 +1,11 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  // Must match the Worker's name in the Cloudflare dashboard (Workers Builds overrides it otherwise).
-  "name": "enmoos",
-  // Custom entry: the OpenNext handler plus a cron that keeps the Render API awake.
+  // Workers Builds deploys under the dashboard Worker's name whatever this says, so nothing else in
+  // this file may depend on the name. That is why there is no WORKER_SELF_REFERENCE service
+  // binding: OpenNext only needs it for ISR revalidation queues and Pages Router res.revalidate,
+  // which this app doesn't use, and a binding naming the wrong Worker fails the deploy.
+  "name": "enmo-web",
+  // Custom entry: the API proxy, the OpenNext handler and a cron that keeps the Render API awake.
   "main": "worker.ts",
   "compatibility_date": "2026-09-20",
   "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
@@ -10,13 +13,6 @@
     "directory": ".open-next/assets",
     "binding": "ASSETS",
   },
-  "services": [
-    {
-      // OpenNext self-reference binding; must match "name".
-      "binding": "WORKER_SELF_REFERENCE",
-      "service": "enmoos",
-    },
-  ],
   // Serves on the Worker's workers.dev address. For app.enmo.marketing (needs the enmo.marketing
   // zone in this Cloudflare account), add:
   //   "routes": [{ "pattern": "app.enmo.marketing", "custom_domain": true }],

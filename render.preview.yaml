@@ -38,11 +38,11 @@ services:
         value: "0"
       - key: LOG_LEVEL
         value: info
-      # The web app's address, e.g. https://enmoos.<your-subdomain>.workers.dev (no trailing slash).
+      # The web app's address, e.g. https://enmo-web.<your-subdomain>.workers.dev (no trailing slash).
       # It is the CORS/CSRF origin and, behind the Worker's proxy, this API's public address too.
       - key: APP_ORIGINS
         sync: false
-      # Copy this value into the Worker's EDGE_PROXY_SECRET (Cloudflare → Workers → enmoos →
+      # Copy this value into the Worker's EDGE_PROXY_SECRET (Cloudflare → Workers → enmo-web →
       # Settings → Variables and Secrets), so the API can see each visitor's real address.
       - key: EDGE_PROXY_SECRET
         generateValue: true

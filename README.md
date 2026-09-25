@@ -666,11 +666,11 @@ Render redeploys each commit after CI passes (`autoDeployTrigger: checksPass`).
 
 **DNS and cookies.** Keep the `enmo.marketing` zone on Cloudflare DNS.
 
-| Host                    | Points to                               | Created by                                                                                 |
-| ----------------------- | --------------------------------------- | ------------------------------------------------------------------------------------------ |
-| `app.enmo.marketing`    | Worker `enmoos` (custom domain)         | Workers → `enmoos` → Settings → Domains & Routes, or `routes` in `apps/web/wrangler.jsonc` |
-| `api.enmo.marketing`    | `CNAME enmo-api.onrender.com`           | You, after Render lists the domain (`domains` in `render.yaml`)                            |
-| `assets.enmo.marketing` | R2 bucket `enmo-assets` (custom domain) | R2 → bucket → Settings → Custom Domains                                                    |
+| Host                    | Points to                               | Created by                                                                                   |
+| ----------------------- | --------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `app.enmo.marketing`    | Worker `enmo-web` (custom domain)       | Workers → `enmo-web` → Settings → Domains & Routes, or `routes` in `apps/web/wrangler.jsonc` |
+| `api.enmo.marketing`    | `CNAME enmo-api.onrender.com`           | You, after Render lists the domain (`domains` in `render.yaml`)                              |
+| `assets.enmo.marketing` | R2 bucket `enmo-assets` (custom domain) | R2 → bucket → Settings → Custom Domains                                                      |
 
 The browser only ever talks to the web app. Its Worker forwards `/v1/*` (the API, the SSE stream
 included) and `/files/*` to `API_ORIGIN` (`apps/web/src/edge/api-proxy.ts`), so the `enmo_session`
@@ -705,13 +705,13 @@ visuals and dry-run publishing, so it needs no API keys. See the file's header f
 limits (sleeping, a disk wiped on every deploy, databases deleted after 30 days).
 
 1. Deploy the web app first (section 4 below), so you know its address:
-   `https://enmoos.<your-subdomain>.workers.dev`.
+   `https://<worker-name>.<your-subdomain>.workers.dev`.
 2. Render → **New → Blueprint** → this repository and branch → Blueprint path
    `render.preview.yaml`. Fill in `APP_ORIGINS` (the workers.dev address, no trailing slash),
    `SEED_ADMIN_EMAIL` and `SEED_ADMIN_PASSWORD` (12+ characters), then apply.
 3. When `enmo-api-preview` is live, copy its URL (`https://enmo-api-preview.onrender.com`, or with a
    suffix Render added) and its generated `EDGE_PROXY_SECRET` (service → Environment).
-4. Cloudflare → Workers → `enmoos` → Settings → Variables and Secrets: add `API_ORIGIN` (text) = the
+4. Cloudflare → Workers → your Worker (`enmo-web`) → Settings → Variables and Secrets: add `API_ORIGIN` (text) = the
    Render URL and `EDGE_PROXY_SECRET` (secret) = the copied value. `keep_vars` keeps them on later
    deploys.
 5. Open the workers.dev address and sign in with the seed admin.
@@ -807,7 +807,7 @@ minutes to keep it awake.
 
 ### 4. Cloudflare Workers (web)
 
-`apps/web/wrangler.jsonc` sets up the Worker `enmoos`:
+`apps/web/wrangler.jsonc` sets up the Worker `enmo-web`:
 
 - entry `worker.ts`: `/v1/*` and `/files/*` go to `API_ORIGIN`, everything else to OpenNext, plus a
   keep-alive cron
@@ -846,8 +846,10 @@ Worker's _Settings → Build_, set:
 | Build command  | `pnpm --filter @enmo/web run build:cf`                    |
 | Deploy command | `pnpm --filter @enmo/web exec wrangler deploy`            |
 
-- The Worker's name in the dashboard must match `"name"` in `apps/web/wrangler.jsonc` (`enmoos`,
-  also used by the `WORKER_SELF_REFERENCE` service binding). If you rename the Worker, change both.
+- Workers Builds deploys under the dashboard Worker's name, whatever `"name"` says in
+  `apps/web/wrangler.jsonc` (`enmo-web`); a mismatch only prints a warning. Nothing in the config
+  depends on the name (there is deliberately no `WORKER_SELF_REFERENCE` binding; see the comment in
+  `wrangler.jsonc`).
 - The `app.enmo.marketing` custom domain needs the `enmo.marketing` zone in the same Cloudflare
   account and no existing DNS record for `app`.
 - Under _Settings → Variables and Secrets_, set `API_ORIGIN` and `EDGE_PROXY_SECRET` (see the
