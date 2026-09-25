@@ -370,6 +370,46 @@ describe("banned words before approval", () => {
   });
 });
 
+describe("publishing limits before approval", () => {
+  it("never opens a round on copy Instagram won't publish once its hashtags are appended", async () => {
+    const h = (harness = await startHarness({ env: { MAX_QA_REVISIONS: "0" }, workers: false }));
+    const seeded = await seedProposedPlan(h, { postCount: 1 });
+    await approvePlan(h.deps, toServiceUser(seeded.admin, null), seeded.graphId);
+    await runQueued(h, "n1");
+    const drafted = await db().post.findFirstOrThrow({ where: { campaignId: seeded.campaignId } });
+    const copy = CopywriterOutputSchema.parse(drafted.copy);
+    // Within 2200 on its own, over it with the hashtags the Publisher appends on Instagram.
+    const caption = "Iced. ".repeat(366);
+    expect(caption.length).toBeLessThanOrEqual(2200);
+    await db().post.update({
+      where: { id: drafted.id },
+      data: {
+        copy: {
+          ...copy,
+          hashtags: ["#IcedLine", "#ColdBrew"],
+          platformCaptions: [{ platform: "INSTAGRAM", caption }],
+        },
+      },
+    });
+
+    const qa = await runQueued(h, "n2");
+    expect(qa.status).toBe("ESCALATED");
+    expect(qa.error).toMatch(/can't send p1 for approval: a platform won't publish its caption/);
+    const input = qa.input as { automatedChecks: { name: string; passed: boolean }[] };
+    expect(input.automatedChecks).toContainEqual(
+      expect.objectContaining({ name: "publish_limits", passed: false }),
+    );
+    expect(await db().approvalRequest.count({ where: { postId: drafted.id } })).toBe(0);
+    const message = await db().chatMessage.findFirstOrThrow({
+      where: { threadId: seeded.threadId, kind: "ESCALATION" },
+    });
+    expect(message.payload).toMatchObject({ taskId: qa.id, reason: "PUBLISH_LIMITS" });
+    expect((await db().post.findUniqueOrThrow({ where: { id: drafted.id } })).needsAttention).toBe(
+      true,
+    );
+  });
+});
+
 describe("intake", () => {
   it("lets the answer name another client than the one the question guessed", async () => {
     const llm = new GuessingClientLlm();

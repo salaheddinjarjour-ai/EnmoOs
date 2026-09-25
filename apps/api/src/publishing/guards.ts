@@ -12,6 +12,7 @@ import {
 } from "@enmo/shared";
 import { currentContentHash } from "../orchestrator/approval-round";
 import { TokenCryptoError, type TokenCipher } from "../lib/crypto";
+import { publishingAccountUnchosen } from "../services/social-accounts";
 
 /*
  * The publish guard (DESIGN §F "Publishing safety"): when a job's slot comes, nothing goes out
@@ -35,9 +36,13 @@ export interface GuardFailure {
   bannedHits?: readonly BannedWordHit[];
 }
 
-/** The account side of a live job, as read for the guard. */
+/**
+ * The account side of a live job, as read for the guard: none at all, several connected and none
+ * chosen to publish through, or the job's account.
+ */
 export type TokenState =
   | { kind: "missing" }
+  | { kind: "unchosen" }
   | {
       kind: "account";
       platform: Platform;
@@ -66,6 +71,13 @@ function tokenFailure(snapshot: GuardSnapshot, token: TokenState): GuardFailure 
     return {
       guard: "token",
       message: `No ${label} account is connected to publish through`,
+      accountStatus: null,
+    };
+  }
+  if (token.kind === "unchosen") {
+    return {
+      guard: "token",
+      message: `None of the client's ${label} accounts is chosen to publish through; choose one in the client's accounts`,
       accountStatus: null,
     };
   }
@@ -115,7 +127,9 @@ export function evaluateGuards(snapshot: GuardSnapshot): GuardFailure | null {
     return {
       guard: "archived",
       message:
-        snapshot.archived === "campaign" ? "The post's campaign is archived" : "The client is archived",
+        snapshot.archived === "campaign"
+          ? "The post's campaign is archived"
+          : "The client is archived",
       accountStatus: null,
     };
   }
@@ -150,6 +164,7 @@ export function evaluateGuards(snapshot: GuardSnapshot): GuardFailure | null {
 
 export interface GuardInput {
   postId: string;
+  clientId: string;
   archived: "campaign" | "client" | null;
   /** Post.copy as stored. */
   copy: unknown;
@@ -222,7 +237,8 @@ export async function checkPublishGuards(
       ? await tx.socialAccount.findUnique({ where: { id: input.job.socialAccountId } })
       : null;
     if (!row) {
-      token = { kind: "missing" };
+      const unchosen = await publishingAccountUnchosen(tx, input.clientId, input.variant.platform);
+      token = { kind: unchosen ? "unchosen" : "missing" };
     } else {
       account = decryptAccount(row, cipher);
       token = {

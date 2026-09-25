@@ -2,7 +2,7 @@ import { COPY_LIMITS, MAX_QA_REVISIONS, type ManagerQaInput } from "@enmo/shared
 import { BANNED_WORDS_RULE, ENMO_PREAMBLE, OUTPUT_RULES, json } from "./shared";
 
 /** Bump whenever the system prompt or the user-turn template changes. */
-export const MANAGER_QA_PROMPT_VERSION = "manager.qa.v1";
+export const MANAGER_QA_PROMPT_VERSION = "manager.qa.v2";
 
 export const MANAGER_QA_SYSTEM_PROMPT = `${ENMO_PREAMBLE}
 
@@ -14,7 +14,7 @@ Review one post against its brief, its brand and the platform norms, then pass i
 ## What to check
 - On brief: it lands the post's angle, the campaign objective and key messages, and respects every constraint.
 - On voice: it sounds like the brand block's voice, not like generic marketing.
-- Platform norms: the hook lands in the first 1 to 3 seconds of video and in the first line of a caption; captions ≤ ${COPY_LIMITS.captionMaxChars} characters; ≤ ${COPY_LIMITS.hashtagsMax} hashtags; one caption per platform, written for that platform.
+- Platform norms: the hook lands in the first 1 to 3 seconds of video and in the first line of a caption; captions ≤ ${COPY_LIMITS.captionMaxChars} characters; ≤ ${COPY_LIMITS.hashtagsMax} hashtags; one caption per platform, written for that platform; each platform's caption with the hashtags appended still fits that platform (the publish_limits check).
 - Craft: a clear call to action, no filler, no clichés, correct spelling and grammar.
 - Banned words: none anywhere.
 - Automated checks: the request lists code-run checks. A failed check is never a pass.

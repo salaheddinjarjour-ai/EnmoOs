@@ -156,7 +156,7 @@ describe("the fake's tokens", () => {
     const response = await graphFetch(`/v26.0/${IG_USER}/media`, {
       method: "POST",
       token: "no-publish",
-      json: { image_url: "https://assets.enmo.marketing/a.png" },
+      json: { image_url: "https://assets.enmo.marketing/a.jpg" },
     });
     expect(response.status).toBe(403);
     expect(await response.json()).toMatchObject({ error: { code: 200 } });
@@ -169,7 +169,7 @@ describe("the fake's scripts", () => {
     graph.state.containerOutcome = "ERROR";
     const created = await graphFetch(`/v26.0/${IG_USER}/media`, {
       method: "POST",
-      json: { image_url: "https://assets.enmo.marketing/a.png" },
+      json: { image_url: "https://assets.enmo.marketing/a.jpg" },
     });
     const { id } = (await created.json()) as { id: string };
 
@@ -187,11 +187,29 @@ describe("the fake's scripts", () => {
     ]);
   });
 
+  it("ends an image container in ERROR unless the image is a JPEG, as Instagram does", async () => {
+    graph.state.containerPolls = 0;
+    const statusOf = async (imageUrl: string) => {
+      const created = await graphFetch(`/v26.0/${IG_USER}/media`, {
+        method: "POST",
+        json: { image_url: imageUrl },
+      });
+      const { id } = (await created.json()) as { id: string };
+      const read = await graphFetch(`/v26.0/${id}?fields=status_code`);
+      return ((await read.json()) as { status_code: string }).status_code;
+    };
+    expect(await statusOf("https://assets.enmo.marketing/a.png")).toBe("ERROR");
+    expect(await statusOf("https://assets.enmo.marketing/a-instagram-1080x1350.jpg")).toBe(
+      "FINISHED",
+    );
+    expect(await statusOf("https://assets.enmo.marketing/a.JPEG?v=2")).toBe("FINISHED");
+  });
+
   it("refuses media_publish once the quota is used up", async () => {
     graph.state.quotaUsage = 100;
     const created = await graphFetch(`/v26.0/${IG_USER}/media`, {
       method: "POST",
-      json: { image_url: "https://assets.enmo.marketing/a.png" },
+      json: { image_url: "https://assets.enmo.marketing/a.jpg" },
     });
     const { id } = (await created.json()) as { id: string };
     const limit = await graphFetch(`/v26.0/${IG_USER}/content_publishing_limit`);

@@ -20,6 +20,8 @@ export const queryKeys = {
     socialAccounts: (clientId: string) =>
       ["clients", "detail", clientId, "social-accounts"] as const,
   },
+  /** A Meta sign-in's pick list (GET /oauth/meta/selections/:id). */
+  oauthSelection: (selectionId: string) => ["oauth-selection", selectionId] as const,
   users: ["users"] as const,
   teamDirectory: ["users", "directory"] as const,
   invites: ["invites"] as const,

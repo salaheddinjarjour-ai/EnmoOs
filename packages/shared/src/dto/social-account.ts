@@ -34,6 +34,12 @@ export const SocialAccountDto = z.object({
   handle: z.string(),
   displayName: z.string().nullable(),
   status: AccountStatus,
+  /**
+   * The account the client's posts on this platform publish through: one per client and platform.
+   * A client's only account on a platform is it; with several, an admin chooses
+   * (POST /social-accounts/:id/primary), and until they do nothing publishes live there.
+   */
+  isPrimary: z.boolean(),
   scopes: z.array(z.string()),
   meta: SocialAccountMeta,
   tokenExpiresAt: IsoDateTime.nullable(),
@@ -69,6 +75,14 @@ export const CreateSocialAccountRequest = z.object({
 });
 export type CreateSocialAccountRequest = z.infer<typeof CreateSocialAccountRequest>;
 export type CreateSocialAccountInput = z.input<typeof CreateSocialAccountRequest>;
+
+/**
+ * POST /v1/social-accounts/:id/primary → the account, now the one its client publishes through on
+ * its platform (the others there stop being it, and posts waiting to go out move to it). 409
+ * unless the account is ACTIVE.
+ */
+export const MakePrimarySocialAccountResponse = SocialAccountDto;
+export type MakePrimarySocialAccountResponse = SocialAccountDto;
 
 /** POST /v1/social-accounts/:id/check → SocialAccountDto with refreshed status/lastCheckedAt. */
 export const CheckSocialAccountResponse = SocialAccountDto;

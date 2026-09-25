@@ -81,11 +81,30 @@ export function publishUpdated(
 }
 
 /**
+ * A job that holds platform progress (PublishJob.containerId: a container, uploaded media, a
+ * publishing call sent) has reached the platform, and the post may be out there already. A QUEUED
+ * one is a retry resuming that progress, so it counts as PUBLISHING: nothing calls it off, and
+ * its post stays frozen, since scheduling it anew would start from scratch and could post twice.
+ */
+export function countedPublishStatus(job: {
+  status: PublishStatus;
+  containerId: string | null;
+}): PublishStatus {
+  return job.status === "QUEUED" && job.containerId !== null ? "PUBLISHING" : job.status;
+}
+
+/** Jobs still waiting to go out with nothing at the platform yet: what may be called off. */
+export const NOT_YET_OUT = {
+  status: { in: [...WAITING_PUBLISH_STATUSES] },
+  containerId: null,
+} as const satisfies Prisma.PublishJobWhereInput;
+
+/**
  * Inside the transaction that reopens a post's approval (or sends it back to an agent): every
- * PublishJob of the post that hasn't started publishing is CANCELLED with the reason, and a
- * `publish.updated` is queued for each. Jobs already PUBLISHING or done are left alone: the
- * publish guard re-checks the approval and content hash before anything goes out. Returns how many
- * jobs were cancelled.
+ * PublishJob of the post that is NOT_YET_OUT is CANCELLED with the reason, and a `publish.updated`
+ * is queued for each. Jobs PUBLISHING, resuming what reached the platform, or done are left alone:
+ * the publish guard re-checks the approval and content hash before anything goes out. Returns how
+ * many jobs were cancelled.
  */
 export async function cancelScheduledForPost(
   tx: DbTransaction,
@@ -94,7 +113,7 @@ export async function cancelScheduledForPost(
   reason: PublishCancelReason,
 ): Promise<number> {
   const cancelled = await tx.publishJob.updateManyAndReturn({
-    where: { variant: { postId }, status: { in: [...WAITING_PUBLISH_STATUSES] } },
+    where: { variant: { postId }, ...NOT_YET_OUT },
     data: { status: "CANCELLED", lastError: PUBLISH_CANCEL_REASONS[reason] },
   });
   for (const job of cancelled) publishUpdated(events, job, postId);
@@ -103,9 +122,10 @@ export async function cancelScheduledForPost(
 
 /**
  * Inside an archive's transaction, after the archived row was written: each post `where` selects
- * that still has a job waiting to go out is locked, its waiting jobs CANCELLED with the reason
+ * that still has a job waiting to go out is locked, its NOT_YET_OUT jobs CANCELLED with the reason
  * and its status brought in line (a SCHEDULED post is APPROVED again). The publish guard refuses
- * whatever this misses (a job it raced). Returns how many jobs were cancelled.
+ * whatever this leaves or misses (a retry resuming its container, a job it raced). Returns how
+ * many jobs were cancelled.
  */
 export async function cancelScheduledWhere(
   tx: DbTransaction,
@@ -114,10 +134,7 @@ export async function cancelScheduledWhere(
   reason: Extract<PublishCancelReason, "campaignArchived" | "clientArchived">,
 ): Promise<number> {
   const posts = await tx.post.findMany({
-    where: {
-      ...where,
-      variants: { some: { publishJob: { status: { in: [...WAITING_PUBLISH_STATUSES] } } } },
-    },
+    where: { ...where, variants: { some: { publishJob: NOT_YET_OUT } } },
     select: { id: true },
     // A stable order, so two archives touching the same posts can't deadlock.
     orderBy: { id: "asc" },
@@ -146,12 +163,15 @@ export type PublishDrivenStatus = Extract<
 >;
 
 /**
- * Where a post's publish jobs put it (cancelled jobs don't count):
+ * Where a post's publish jobs put it, from each job's countedPublishStatus (cancelled jobs don't
+ * count):
  * - none left → APPROVED (approved, nothing scheduled);
  * - all PUBLISHED → LIVE;
  * - any FAILED → FAILED (people retry it);
- * - any PUBLISHING or PUBLISHED → PUBLISHING (part of it is going or gone out);
- * - otherwise every job waits for its slot (SCHEDULED, or QUEUED for publish.run) → SCHEDULED.
+ * - any PUBLISHING or PUBLISHED → PUBLISHING (part of it is going or gone out, or a platform put
+ *   on a day after the rest went out still waits);
+ * - otherwise every job waits for its slot (SCHEDULED, or QUEUED for publish.run with nothing at
+ *   the platform yet) → SCHEDULED.
  */
 export function postStatusForJobs(statuses: readonly PublishStatus[]): PublishDrivenStatus {
   const active = statuses.filter((status) => status !== "CANCELLED");
@@ -186,9 +206,9 @@ export async function syncPostPublishStatus(
   if (!post || !PUBLISH_DRIVEN_STATUSES.has(post.status)) return null;
   const jobs = await tx.publishJob.findMany({
     where: { variant: { postId } },
-    select: { status: true, publishedAt: true },
+    select: { status: true, containerId: true, publishedAt: true },
   });
-  const target = postStatusForJobs(jobs.map((job) => job.status));
+  const target = postStatusForJobs(jobs.map(countedPublishStatus));
   if (target === post.status) return null;
 
   const data: PostTransitionData = {};

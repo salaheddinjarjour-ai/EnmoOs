@@ -1,19 +1,38 @@
-import { OAuthCallbackQuery, OAuthStartQuery, OAuthStartResponse } from "@enmo/shared";
+import {
+  ConnectOAuthSelectionBody,
+  ConnectOAuthSelectionResponse,
+  OAuthCallbackQuery,
+  OAuthSelectionDto,
+  OAuthSelectionParams,
+  OAuthStartQuery,
+  OAuthStartResponse,
+} from "@enmo/shared";
 import type { FastifyRequest } from "fastify";
 import { currentUser, resolveSessionUser, type AuthUser } from "../plugins/auth";
 import { requireCap } from "../plugins/rbac";
 import { toServiceUser } from "../services/actor";
-import { completeMetaOAuth, startMetaOAuth, type OAuthSessionUser } from "../services/oauth";
+import {
+  completeMetaOAuth,
+  connectMetaSelection,
+  getMetaSelection,
+  startMetaOAuth,
+  type OAuthSessionUser,
+} from "../services/oauth";
 import type { RouteModule } from "../types";
 
 /*
  * Connecting Facebook Pages and their Instagram accounts (DESIGN §E "OAuth"):
- *   GET /oauth/meta/start?clientId   socialAccounts.manage   {authorizeUrl}: the web app sends the
- *                                                            admin to Meta's consent screen
- *   GET /oauth/meta/callback         public                  Meta redirects the browser here; the
- *                                                            state (bound to the admin's session)
- *                                                            is checked, then a redirect back to the
- *                                                            client's accounts tab
+ *   GET  /oauth/meta/start?clientId    socialAccounts.manage  {authorizeUrl}: the web app sends
+ *                                                             the admin to Meta's consent screen
+ *   GET  /oauth/meta/callback          public                 Meta redirects the browser here; the
+ *                                                             state (bound to the admin's session)
+ *                                                             is checked, the Pages Meta lists are
+ *                                                             kept as a selection, then a redirect
+ *                                                             back to the client's accounts tab
+ *   GET  /oauth/meta/selections/:id    socialAccounts.manage  that selection (same session only):
+ *                                                             each account, and whether it's free
+ *   POST /oauth/meta/selections/:id    socialAccounts.manage  {keys}: the picked accounts connected
+ *                                                             to the client
  */
 
 function oauthUserOf(request: FastifyRequest, user: AuthUser): OAuthSessionUser {
@@ -31,6 +50,35 @@ export const oauthMetaRoutes: RouteModule = (app) => {
     },
     (request) =>
       startMetaOAuth(deps, oauthUserOf(request, currentUser(request)), request.query.clientId),
+  );
+
+  app.get(
+    "/oauth/meta/selections/:id",
+    {
+      onRequest: requireCap("socialAccounts.manage"),
+      schema: { params: OAuthSelectionParams, response: { 200: OAuthSelectionDto } },
+    },
+    (request) =>
+      getMetaSelection(deps, oauthUserOf(request, currentUser(request)), request.params.id),
+  );
+
+  app.post(
+    "/oauth/meta/selections/:id",
+    {
+      onRequest: requireCap("socialAccounts.manage"),
+      schema: {
+        params: OAuthSelectionParams,
+        body: ConnectOAuthSelectionBody,
+        response: { 200: ConnectOAuthSelectionResponse },
+      },
+    },
+    (request) =>
+      connectMetaSelection(
+        deps,
+        oauthUserOf(request, currentUser(request)),
+        request.params.id,
+        request.body,
+      ),
   );
 
   app.get(

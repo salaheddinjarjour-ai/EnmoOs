@@ -6,8 +6,8 @@ import { bestSlotOn } from "../../src/publishing/slot-optimizer";
 import { buildTestApp, type TestApp } from "../helpers/app";
 import { sessionCookieFor, type CookieHeader } from "../helpers/auth";
 import { testDb } from "../helpers/db";
-import { createClient, createUser, type TestUser } from "../helpers/factories";
-import { RIYADH, seedPublishPost } from "../helpers/publish-fixtures";
+import { createAsset, createClient, createUser, type TestUser } from "../helpers/factories";
+import { RIYADH, seedPublishPost, type SeedPublishedPostInput } from "../helpers/publish-fixtures";
 import { obliterateQueues, queuedJobs, sender } from "../helpers/route-fixtures";
 
 /*
@@ -70,6 +70,194 @@ async function publishEvents(jobId: string) {
 async function auditOf(action: string) {
   return testDb().auditLog.findMany({ where: { action } });
 }
+
+describe("POST /v1/publish-jobs (schedule)", () => {
+  /** An approved post the Publisher left unscheduled (no free slot in its window), with a take. */
+  async function unscheduledPost(overrides: Partial<SeedPublishedPostInput> = {}) {
+    const seeded = await seedPublishPost({
+      createdBy: admin,
+      client,
+      status: "APPROVED",
+      ...overrides,
+    });
+    await testDb().post.update({
+      where: { id: seeded.post.id },
+      data: {
+        needsAttention: true,
+        attentionReason:
+          "Not scheduled on Instagram: no free slot is left in the campaign window (2027-03-01 to 2027-03-02); put it on a day on the calendar; Facebook: the same",
+      },
+    });
+    await createAsset({ client, campaignId: seeded.campaignId, postId: seeded.post.id });
+    return seeded;
+  }
+
+  it("puts each platform the Publisher couldn't place on the teammate's day, answering its flag", async () => {
+    const { post } = await unscheduledPost();
+    const day = "2027-04-06";
+    const expected = await bestSlotOn(
+      testDb(),
+      { clientId: client.id, platform: "INSTAGRAM", timezone: RIYADH, now: t.clock.now() },
+      day,
+    );
+    // Instagram's first weekday peak, 11:00 in Riyadh, weeks after the campaign window.
+    expect(expected?.slotStart).toBe("2027-04-06T08:00:00.000Z");
+
+    const response = await send("POST", "/v1/publish-jobs", cookies.manager, {
+      postId: post.id,
+      platform: "INSTAGRAM",
+      date: day,
+    });
+    expect(response.statusCode, response.body).toBe(201);
+    const job = response.json<PublishJobDto>();
+    expect(job).toMatchObject({
+      postId: post.id,
+      platform: "INSTAGRAM",
+      status: "SCHEDULED",
+      scheduledFor: expected?.slotStart,
+      date: day,
+      slotSource: "manual",
+      dryRun: true,
+      attempts: 0,
+    });
+    expect(job.slotReason).toContain(`Scheduled on ${day} by Maha, at the day's best free hour.`);
+    // Facebook still has nothing scheduled: the post stays flagged.
+    const partly = await testDb().post.findUniqueOrThrow({ where: { id: post.id } });
+    expect(partly).toMatchObject({ status: "SCHEDULED", needsAttention: true });
+
+    const facebook = await send("POST", "/v1/publish-jobs", cookies.admin, {
+      postId: post.id,
+      platform: "FACEBOOK",
+      date: day,
+    });
+    expect(facebook.statusCode, facebook.body).toBe(201);
+    const answered = await testDb().post.findUniqueOrThrow({ where: { id: post.id } });
+    expect(answered).toMatchObject({
+      status: "SCHEDULED",
+      needsAttention: false,
+      attentionReason: null,
+    });
+
+    const audits = await auditOf(AUDIT_ACTIONS.publishSchedule);
+    expect(audits.map((audit) => audit.data)).toEqual([
+      expect.objectContaining({ postId: post.id, platform: "INSTAGRAM", date: day }),
+      expect.objectContaining({ postId: post.id, platform: "FACEBOOK", date: day }),
+    ]);
+    expect(await publishEvents(job.id)).toEqual([
+      expect.objectContaining({ status: "SCHEDULED", scheduledFor: expected?.slotStart }),
+    ]);
+  });
+
+  it("puts a platform on a day after the rest of the post went out: LIVE is PUBLISHING again", async () => {
+    const { post } = await unscheduledPost({
+      status: "LIVE",
+      jobs: [
+        {
+          platform: "INSTAGRAM",
+          status: "PUBLISHED",
+          scheduledFor: "2027-03-01T05:00:00.000Z",
+          attempts: 1,
+          publishedAt: new Date("2027-03-01T05:00:05.000Z"),
+          liveUrl: "https://dryrun.enmo.marketing/instagram/variant",
+        },
+      ],
+    });
+    await testDb().post.update({
+      where: { id: post.id },
+      data: {
+        attentionReason:
+          "Not scheduled on Facebook: no free slot is left in the campaign window (2027-03-01 to 2027-03-02); put it on a day on the calendar",
+      },
+    });
+    const response = await send("POST", "/v1/publish-jobs", cookies.manager, {
+      postId: post.id,
+      platform: "FACEBOOK",
+      date: WEDNESDAY,
+    });
+    expect(response.statusCode, response.body).toBe(201);
+    expect(response.json<PublishJobDto>()).toMatchObject({
+      platform: "FACEBOOK",
+      status: "SCHEDULED",
+      date: WEDNESDAY,
+      slotSource: "manual",
+    });
+    expect(await testDb().post.findUniqueOrThrow({ where: { id: post.id } })).toMatchObject({
+      status: "PUBLISHING",
+      needsAttention: false,
+      attentionReason: null,
+    });
+    const postEvents = await testDb().realtimeEvent.findMany({ where: { type: "post.updated" } });
+    expect(postEvents.map((row) => row.payload)).toContainEqual(
+      expect.objectContaining({ postId: post.id, status: "PUBLISHING" }),
+    );
+  });
+
+  it("puts a platform whose job was cancelled back on that row, its attempts moving on", async () => {
+    const { jobs, post } = await unscheduledPost({
+      jobs: [
+        {
+          platform: "INSTAGRAM",
+          status: "CANCELLED",
+          scheduledFor: TUESDAY_1100,
+          attempts: 2,
+          lastError: "Cancelled by Maha",
+        },
+      ],
+    });
+    const response = await send("POST", "/v1/publish-jobs", cookies.admin, {
+      postId: post.id,
+      platform: "INSTAGRAM",
+      date: WEDNESDAY,
+    });
+    expect(response.statusCode, response.body).toBe(201);
+    expect(response.json<PublishJobDto>()).toMatchObject({
+      id: jobs.INSTAGRAM!.id,
+      status: "SCHEDULED",
+      attempts: 3,
+      lastError: null,
+      date: WEDNESDAY,
+    });
+  });
+
+  it("refuses what can't be scheduled, and a day with no free slot", async () => {
+    const schedule = (postId: string, platform = "INSTAGRAM", date = WEDNESDAY) =>
+      send("POST", "/v1/publish-jobs", cookies.admin, { postId, platform, date });
+
+    const scheduled = await unscheduledPost({
+      jobs: [{ platform: "INSTAGRAM", scheduledFor: TUESDAY_1100 }],
+    });
+    const taken = await schedule(scheduled.post.id);
+    expect(taken.statusCode, taken.body).toBe(409);
+    expect(taken.json()).toMatchObject({
+      error: { message: "This post is already scheduled on Instagram; move that job instead" },
+    });
+    expect((await schedule(scheduled.post.id, "TIKTOK")).statusCode).toBe(409);
+    expect((await schedule(scheduled.post.id, "FACEBOOK", "2027-02-27")).statusCode).toBe(409);
+
+    const pending = await unscheduledPost({ status: "PENDING_APPROVAL", ref: "p2" });
+    const notApproved = await schedule(pending.post.id);
+    expect(notApproved.statusCode).toBe(409);
+    expect(notApproved.json()).toMatchObject({
+      error: { message: "Only an approved post can be scheduled; this one is pending approval" },
+    });
+    // A scored post is done with.
+    const scored = await unscheduledPost({ status: "SCORED", ref: "p4" });
+    expect((await schedule(scored.post.id)).statusCode).toBe(409);
+
+    // Checked as the Publisher checks it: no visuals, nothing to publish.
+    const bare = await seedPublishPost({ createdBy: admin, client, status: "APPROVED", ref: "p3" });
+    const empty = await schedule(bare.post.id);
+    expect(empty.statusCode, empty.body).toBe(422);
+    expect(empty.json()).toMatchObject({
+      error: {
+        message:
+          "It can't go out on Instagram: the post breaks its publishing rules: The post has no visuals to publish",
+      },
+    });
+    expect((await schedule("nope")).statusCode).toBe(404);
+    expect(await testDb().publishJob.count()).toBe(1);
+  });
+});
 
 describe("PATCH /v1/publish-jobs/:id (reschedule)", () => {
   it("moves a scheduled job to the best free hour of the dropped day", async () => {
@@ -327,7 +515,31 @@ describe("POST /v1/publish-jobs/:id/retry", () => {
     ]);
   });
 
-  it("puts a live job whose account was disconnected on the client's current account", async () => {
+  it("lets a Facebook post whose answer never came back go out again: the teammate checked the Page", async () => {
+    const { jobs } = await seedPublishPost({
+      createdBy: admin,
+      client,
+      status: "FAILED",
+      jobs: [
+        {
+          platform: "FACEBOOK",
+          status: "FAILED",
+          scheduledFor: "2027-02-28T08:00:00.000Z",
+          attempts: 1,
+          lastError: "Facebook may already have the post: …",
+          containerId: "FB_MULTI_PHOTO;items=301,302;posting",
+        },
+      ],
+    });
+    const job = jobs.FACEBOOK!;
+    const response = await send("POST", `/v1/publish-jobs/${job.id}/retry`, cookies.manager);
+    expect(response.statusCode, response.body).toBe(200);
+    // The staged photos are kept; only the mark that stops a second post is gone.
+    const stored = await testDb().publishJob.findUniqueOrThrow({ where: { id: job.id } });
+    expect(stored).toMatchObject({ status: "QUEUED", containerId: "FB_MULTI_PHOTO;items=301,302" });
+  });
+
+  it("puts a live job whose account was disconnected on the account the client publishes through", async () => {
     const account = await testDb().socialAccount.create({
       data: {
         clientId: client.id,
@@ -335,6 +547,18 @@ describe("POST /v1/publish-jobs/:id/retry", () => {
         externalId: "17841400000000009",
         handle: "qahwa.co",
         accessTokenEnc: t.deps.tokenCipher.encrypt("page-token"),
+        status: "ACTIVE",
+        isPrimary: true,
+      },
+    });
+    // Connected later, but not chosen to publish: never picked for being the newest.
+    await testDb().socialAccount.create({
+      data: {
+        clientId: client.id,
+        platform: "INSTAGRAM",
+        externalId: "17841400000000010",
+        handle: "other.brand",
+        accessTokenEnc: t.deps.tokenCipher.encrypt("other-token"),
         status: "ACTIVE",
       },
     });
@@ -578,6 +802,49 @@ describe("POST /v1/publish-jobs/:id/cancel", () => {
     });
     const dto = await send("GET", `/v1/posts/${post.id}`, cookies.admin);
     expect(dto.json<{ editable: boolean }>().editable).toBe(true);
+  });
+
+  it("refuses to cancel a retry resuming a container that already reached the platform", async () => {
+    const { jobs, post } = await seedPublishPost({
+      createdBy: admin,
+      client,
+      status: "PUBLISHING",
+      platforms: ["INSTAGRAM"],
+      jobs: [
+        {
+          platform: "INSTAGRAM",
+          status: "QUEUED",
+          scheduledFor: "2027-03-01T05:00:00.000Z",
+          attempts: 1,
+          dryRun: false,
+          lastError: "Instagram is unavailable: Meta did not answer POST /v26.0/1789/media_publish",
+          containerId: "IG_IMAGE;items=17890000000000001",
+        },
+      ],
+    });
+    const response = await send(
+      "POST",
+      `/v1/publish-jobs/${jobs.INSTAGRAM!.id}/cancel`,
+      cookies.admin,
+    );
+    expect(response.statusCode, response.body).toBe(409);
+    expect(response.json()).toMatchObject({
+      error: {
+        message:
+          "This Instagram job is retrying a publish that already reached Instagram, so it can't be cancelled until that settles",
+        details: { status: "QUEUED" },
+      },
+    });
+    expect(
+      await testDb().publishJob.findUniqueOrThrow({ where: { id: jobs.INSTAGRAM!.id } }),
+    ).toMatchObject({
+      status: "QUEUED",
+      containerId: "IG_IMAGE;items=17890000000000001",
+    });
+    expect((await testDb().post.findUniqueOrThrow({ where: { id: post.id } })).status).toBe(
+      "PUBLISHING",
+    );
+    expect(await auditOf(AUDIT_ACTIONS.publishCancel)).toEqual([]);
   });
 
   it.each(["PUBLISHING", "PUBLISHED", "CANCELLED"] as const)(

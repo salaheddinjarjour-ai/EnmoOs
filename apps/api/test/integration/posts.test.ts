@@ -344,6 +344,37 @@ describe("PATCH /v1/posts/:id/copy", () => {
     expect(details.issues).toHaveLength(4);
   });
 
+  it("answers 422 for a caption Instagram won't publish once the hashtags are appended", async () => {
+    const client = await createClient();
+    const { posts } = await seedPipeline({ createdBy: team.manager, client, postCount: 1 });
+    const postId = posts[0]?.id ?? "";
+    const good = testCopy("Slow evenings, cold coffee.");
+    // 2195 characters on its own; with "\n\n#Ramadan #IcedLatte" appended, over Instagram's 2200.
+    const long = "Cold. ".repeat(366).slice(0, 2195);
+    const edit: CopywriterOutput = {
+      ...good,
+      platformCaptions: good.platformCaptions.map((entry) =>
+        entry.platform === "INSTAGRAM" ? { ...entry, caption: long } : entry,
+      ),
+    };
+    const response = await send("PATCH", `/v1/posts/${postId}/copy`, team.cookies.editor, {
+      copy: edit,
+    });
+    expect(response.statusCode, response.body).toBe(422);
+    const { error } = response.json<{
+      error: { message: string; details: CopyRuleErrorDetails };
+    }>();
+    expect(error.details.issues).toEqual([
+      {
+        path: "platformCaptions[0].caption",
+        message: expect.stringContaining("Instagram takes 2200") as string,
+      },
+    ]);
+    expect((await testDb().post.findUniqueOrThrow({ where: { id: postId } })).humanEditCount).toBe(
+      0,
+    );
+  });
+
   it("bounds the edit: contract limits, field sizes and the body", async () => {
     const client = await createClient({ bannedWords: ["cheap"] });
     const { posts } = await seedPipeline({ createdBy: team.manager, client, postCount: 1 });

@@ -1,4 +1,4 @@
-import { PublishJobDto, type CalendarResponse } from "@enmo/shared";
+import { PublishJobDto, type CalendarResponse, type Platform } from "@enmo/shared";
 import {
   useMutation,
   useMutationState,
@@ -10,9 +10,10 @@ import { api, apiPath } from "@/lib/api";
 import { queryKeys } from "./query-keys";
 
 /*
- * The publish-job controls behind the calendar (DESIGN §E "calendar"): reschedule (a drag, or
- * "Move to date"), retry and cancel. Every one is keyed under queryKeys.publishJobs.all, so a view
- * can tell a publish-job change is in flight.
+ * The publish-job controls behind the calendar (DESIGN §E "calendar"): schedule (a platform the
+ * Publisher couldn't place, "Schedule on date"), reschedule (a drag, or "Move to date"), retry and
+ * cancel. Every one is keyed under queryKeys.publishJobs.all, so a view can tell a publish-job
+ * change is in flight.
  *
  * A reschedule is optimistic without touching the cache: the calendar draws each pending move from
  * the mutation itself (usePendingMoves), so a refetch that lands mid-flight (another job's
@@ -26,7 +27,15 @@ export interface RescheduleInput {
   date: string;
 }
 
+export interface ScheduleInput {
+  postId: string;
+  platform: Platform;
+  /** The client-local day to put it on; the optimizer picks the hour. */
+  date: string;
+}
+
 const MUTATION_KEYS = {
+  schedule: [...queryKeys.publishJobs.all, "schedule"],
   reschedule: [...queryKeys.publishJobs.all, "reschedule"],
   retry: [...queryKeys.publishJobs.all, "retry"],
   cancel: [...queryKeys.publishJobs.all, "cancel"],
@@ -43,6 +52,22 @@ function storeJob(queryClient: QueryClient, job: PublishJobDto): void {
 function refresh(queryClient: QueryClient): void {
   void queryClient.invalidateQueries({ queryKey: queryKeys.calendar.all });
   void queryClient.invalidateQueries({ queryKey: queryKeys.posts.all });
+}
+
+/**
+ * POST /publish-jobs {postId, platform, date}: a platform of an approved post with nothing
+ * scheduled there, put on that day's best free hour (409 when it has none, 422 when the post
+ * can't go out there).
+ */
+export function useSchedulePublishJob() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationKey: MUTATION_KEYS.schedule,
+    mutationFn: (input: ScheduleInput) =>
+      api(apiPath("publish-jobs"), { method: "POST", body: input, schema: PublishJobDto }),
+    onSuccess: (job) => storeJob(queryClient, job),
+    onSettled: () => refresh(queryClient),
+  });
 }
 
 /** PATCH /publish-jobs/:id {date}: the best free hour of that day (409 when it has none). */

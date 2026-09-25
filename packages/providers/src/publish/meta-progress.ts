@@ -6,11 +6,12 @@ import type { PublishFlow } from "./flow";
  * persisted through resume.onContainer the moment Meta hands it out, so a crash, retry or poll
  * picks up where the last call left off and never creates a container, photo or video twice.
  *
- * Written as `<flow>;items=<id>,<id>;parent=<id>;finished;result=<id>` (parts left out when
- * empty), e.g.
+ * Written as `<flow>;items=<id>,<id>;parent=<id>;finished;posting;result=<id>` (parts left out
+ * when empty), e.g.
  *   IG_IMAGE;items=17890000000000001
  *   IG_CAROUSEL;items=17890000000000001,17890000000000002;parent=17890000000000003
  *   FB_REEL;items=1200000000001;finished
+ *   FB_MULTI_PHOTO;items=301,302;posting
  *   FB_MULTI_PHOTO;items=301,302;result=100000000000001_400
  */
 
@@ -42,12 +43,18 @@ export interface MetaProgress {
   parent: string | null;
   /** Facebook video flows: the upload was finished (the video is processing or live). */
   finished: boolean;
+  /**
+   * Facebook photo, feed and story flows: the call that makes the post public was sent and its
+   * answer (the result) never recorded. Meta may have created the post, so nothing sends that
+   * call again until a person has checked the Page and retried (withoutPostingMarker).
+   */
+  posting: boolean;
   /** The post the flow produced (Instagram media id, Facebook post id), once Meta created it. */
   result: string | null;
 }
 
 export function startProgress(flow: MetaFlow): MetaProgress {
-  return { flow, items: [], parent: null, finished: false, result: null };
+  return { flow, items: [], parent: null, finished: false, posting: false, result: null };
 }
 
 const ID = /^[A-Za-z0-9_.-]+$/;
@@ -57,6 +64,7 @@ export function formatProgress(progress: MetaProgress): string {
   if (progress.items.length > 0) parts.push(`items=${progress.items.join(",")}`);
   if (progress.parent !== null) parts.push(`parent=${progress.parent}`);
   if (progress.finished) parts.push("finished");
+  if (progress.posting) parts.push("posting");
   if (progress.result !== null) parts.push(`result=${progress.result}`);
   return parts.join(";");
 }
@@ -71,9 +79,9 @@ export function parseProgress(containerId: string): MetaProgress | null {
     const [key, value, ...rest] = part.split("=");
     if (!key || seen.has(key) || rest.length > 0) return null;
     seen.add(key);
-    if (key === "finished") {
+    if (key === "finished" || key === "posting") {
       if (value !== undefined) return null;
-      progress.finished = true;
+      progress[key] = true;
       continue;
     }
     if (value === undefined) return null;
@@ -88,4 +96,22 @@ export function parseProgress(containerId: string): MetaProgress | null {
     }
   }
   return progress;
+}
+
+/**
+ * Whether a job's containerId says a publishing call went out unanswered (MetaProgress.posting):
+ * the post may be live already, so people must check the platform before it is sent again.
+ */
+export function hasUnconfirmedPost(containerId: string | null): boolean {
+  const progress = containerId === null ? null : parseProgress(containerId);
+  return progress !== null && progress.posting && progress.result === null;
+}
+
+/**
+ * The containerId without its posting marker: a person checked the platform and retried, so the
+ * publishing call may be sent again. Anything that isn't Meta progress is returned as it is.
+ */
+export function withoutPostingMarker(containerId: string): string {
+  const progress = parseProgress(containerId);
+  return progress?.posting ? formatProgress({ ...progress, posting: false }) : containerId;
 }

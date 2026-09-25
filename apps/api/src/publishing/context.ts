@@ -58,7 +58,10 @@ export function copyOf(post: { copy: unknown }): CopywriterOutput | null {
 }
 
 /** The job's payload from the variant and the post's current takes. */
-export function payloadOf(deps: Pick<Deps, "config">, job: PublishJobWithContext): PreparedPayload {
+export function payloadOf(
+  deps: Pick<Deps, "config" | "storage">,
+  job: PublishJobWithContext,
+): PreparedPayload {
   const { variant } = job;
   return preparePayload({
     platform: variant.platform,
@@ -69,18 +72,37 @@ export function payloadOf(deps: Pick<Deps, "config">, job: PublishJobWithContext
     copy: copyOf(variant.post),
     takes: job.takes,
     publicBaseUrl: deps.config.PUBLIC_ASSET_BASE_URL,
+    storageUrl: (key) => deps.storage.publicUrl(key),
   });
 }
 
-/** The client's newest ACTIVE account on the platform, which its jobs publish through. */
+/**
+ * The account the client chose to publish through on the platform (SocialAccount.isPrimary), when
+ * it is ACTIVE. Never another of its accounts: with several Pages connected (or another brand's
+ * among them) a post only ever goes where the client's publishing account is.
+ */
 export function activeAccountOf(
   db: Db,
   clientId: string,
   platform: Platform,
 ): Promise<{ id: string } | null> {
   return db.socialAccount.findFirst({
-    where: { clientId, platform, status: "ACTIVE" },
-    orderBy: { createdAt: "desc" },
+    where: { clientId, platform, isPrimary: true, status: "ACTIVE" },
+    select: { id: true },
+  });
+}
+
+/**
+ * The client's publishing account on the platform whatever its status (an expired one included),
+ * or null when it has none chosen.
+ */
+export function publishingAccountOf(
+  db: Db,
+  clientId: string,
+  platform: Platform,
+): Promise<{ id: string } | null> {
+  return db.socialAccount.findFirst({
+    where: { clientId, platform, isPrimary: true },
     select: { id: true },
   });
 }

@@ -32,6 +32,8 @@ import {
   platformSupportsPostType,
   platformVariantFormat,
   publishedCaption,
+  publishedTextFit,
+  variantTextOf,
   slotHourBucket,
   variantNeedsCrop,
 } from "../src";
@@ -104,6 +106,30 @@ describe("publishing limits", () => {
       "#قهوة_باردة",
       "#iced",
     ]);
+  });
+
+  it("measures a variant's text as it goes out, and takes JPEG only for Instagram images", () => {
+    const copy = {
+      caption: "Main caption.",
+      hashtags: ["#Iced", "#Ramadan"],
+      platformCaptions: [{ platform: "INSTAGRAM" as const, caption: "Iced after iftar #Iced" }],
+    };
+    expect(variantTextOf(copy, "INSTAGRAM")).toEqual({
+      caption: "Iced after iftar #Iced",
+      hashtags: ["#Iced", "#Ramadan"],
+    });
+    expect(variantTextOf(copy, "FACEBOOK").caption).toBe("Main caption.");
+    const text = variantTextOf(copy, "INSTAGRAM");
+    // "Iced after iftar #Iced\n\n#Ramadan": the inline tag counts, and isn't appended twice.
+    expect(publishedTextFit("INSTAGRAM", text.caption, text.hashtags)).toEqual({
+      length: 32,
+      maxChars: 2200,
+      hashtags: 2,
+      maxHashtags: 30,
+    });
+    expect(publishedTextFit("FACEBOOK", text.caption, text.hashtags).maxHashtags).toBeNull();
+    expect(PLATFORM_LIMITS.INSTAGRAM.imageMimeTypes).toEqual(["image/jpeg"]);
+    expect(PLATFORM_LIMITS.FACEBOOK.imageMimeTypes).toBeNull();
   });
 
   it("lists missing publish scopes", () => {
@@ -326,6 +352,18 @@ describe("OAuth DTOs", () => {
     expect(
       oauthReturnPath("c1", { oauth: "meta", outcome: "error", message: "You declined & left" }),
     ).toContain("message=You%20declined%20%26%20left");
+    // A Meta sign-in comes back with the list to pick from.
+    const pick = "Ab_9-".repeat(9);
+    const choose = oauthReturnPath("c1", { oauth: "meta", outcome: "choose", pick });
+    expect(choose).toBe(`/clients/c1?tab=accounts&oauth=meta&outcome=choose&pick=${pick}`);
+    expect(OAuthResultQuery.parse(queryOf(choose))).toEqual({
+      oauth: "meta",
+      outcome: "choose",
+      pick,
+    });
+    expect(
+      OAuthResultQuery.safeParse({ oauth: "meta", outcome: "choose", pick: "a/b" }).success,
+    ).toBe(false);
   });
 
   it("keeps Meta's page and Instagram ids in account meta", () => {

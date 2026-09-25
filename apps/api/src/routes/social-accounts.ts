@@ -2,6 +2,7 @@ import {
   CheckSocialAccountResponse,
   CreateSocialAccountRequest,
   IdParams,
+  MakePrimarySocialAccountResponse,
   SocialAccountDto,
   SocialAccountListResponse,
 } from "@enmo/shared";
@@ -11,6 +12,7 @@ import {
   connectSocialAccount,
   disconnectSocialAccount,
   listSocialAccounts,
+  makePrimarySocialAccount,
   verifyWithPlatform,
 } from "../services/social-accounts";
 import type { RouteModule } from "../types";
@@ -20,6 +22,7 @@ import { actorOf } from "./clients";
  * Social accounts (DESIGN §E); tokens go in encrypted and never come back out:
  *   GET /clients/:id/social-accounts · POST /clients/:id/social-accounts (manual token)
  *   DELETE /social-accounts/:id · POST /social-accounts/:id/check
+ *   POST /social-accounts/:id/primary (the account its client publishes through on its platform)
  */
 export const socialAccountsRoutes: RouteModule = (app) => {
   const { prisma, clock, tokenCipher: cipher, oauth } = app.deps;
@@ -61,6 +64,15 @@ export const socialAccountsRoutes: RouteModule = (app) => {
       await disconnectSocialAccount(prisma, request.params.id, actorOf(request));
       return reply.status(204).send();
     },
+  );
+
+  app.post(
+    "/social-accounts/:id/primary",
+    {
+      onRequest: requireCap("socialAccounts.manage"),
+      schema: { params: IdParams, response: { 200: MakePrimarySocialAccountResponse } },
+    },
+    (request) => makePrimarySocialAccount(prisma, request.params.id, actorOf(request)),
   );
 
   app.post(

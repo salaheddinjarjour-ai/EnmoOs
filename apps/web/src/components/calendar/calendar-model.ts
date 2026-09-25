@@ -8,6 +8,7 @@ import {
   type CalendarJobItem,
   type CalendarQuery,
   type CalendarResponse,
+  type PostStatus,
   type PublishJobDto,
   type SlotSource,
 } from "@enmo/shared";
@@ -184,23 +185,49 @@ export function isRetryable(item: CalendarItemDto): item is CalendarJobItem {
 }
 
 /**
+ * Post statuses whose unscheduled platforms a teammate can put on a day (POST /publish-jobs): an
+ * approved post, even with its other platforms out or failed, until it is scored.
+ */
+const SCHEDULABLE_GHOST_POST_STATUSES: readonly PostStatus[] = [
+  "APPROVED",
+  "SCHEDULED",
+  "PUBLISHING",
+  "LIVE",
+  "FAILED",
+];
+
+/** A ghost of an approved post: "Schedule on date" can place it. */
+export function isGhostSchedulable(item: CalendarItemDto): item is CalendarGhostItem {
+  return item.kind === "ghost" && SCHEDULABLE_GHOST_POST_STATUSES.includes(item.postStatus);
+}
+
+const PUT_IT_ON_A_DAY = "Put it on a day: the optimizer picks that day's best free hour.";
+
+/**
  * What a ghost means for its post: a planned slot waiting on approval or, once the post is past
- * approval, a platform with nothing scheduled (its publish cancelled, or no free slot found) and
- * whether it can still be scheduled.
+ * approval, a platform with nothing scheduled (its publish cancelled, or no free slot left in the
+ * campaign window) and whether it can still be scheduled.
  */
 export function ghostNote(item: CalendarGhostItem): string {
   const platform = PLATFORM_LABEL[item.platform];
   switch (item.postStatus) {
     case "APPROVED":
     case "SCHEDULED":
-      return `The post is approved, but nothing is scheduled on ${platform}: its publish there was cancelled, or the Publisher found no free slot for it. Edit the post and approve it again to schedule it anew.`;
+      return `The post is approved, but nothing is scheduled on ${platform}: the Publisher found no free slot for it inside the campaign window (or the window had passed), or its publish there was cancelled. ${PUT_IT_ON_A_DAY}`;
     case "FAILED":
-      return `Nothing is scheduled on ${platform}, and another platform's publish failed. Retry or cancel that one first; if none of the post is out then, editing it and approving it again schedules it anew.`;
+      return `Nothing is scheduled on ${platform}, and another platform's publish failed: retry or cancel that one from its own chip. ${PUT_IT_ON_A_DAY}`;
     case "PUBLISHING":
     case "LIVE":
+      return `The post is going out without ${platform}: nothing is scheduled there (the Publisher found no free slot for it inside the campaign window, or its publish there was cancelled). ${PUT_IT_ON_A_DAY}`;
     case "SCORED":
-      return `The post went out without ${platform}: nothing is scheduled there, and a post that is out can't be scheduled again.`;
-    default:
+      return `The post went out without ${platform}, and it has been scored: nothing is scheduled there any more.`;
+    case "IDEA":
+    case "DRAFTING":
+    case "VISUALIZING":
+    case "ADAPTING":
+    case "QA":
+    case "CHANGES_REQUESTED":
+    case "PENDING_APPROVAL":
       return `The campaign plan puts this post here; nothing is scheduled yet. Once the post is approved, the Publisher picks its slot on ${platform}.`;
   }
 }

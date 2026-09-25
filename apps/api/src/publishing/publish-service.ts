@@ -1,12 +1,13 @@
 import type { DbTransaction } from "@enmo/db";
 import {
+  hasUnconfirmedPost,
   PublishError,
   type DecryptedAccount,
   type PublishErrorCode,
   type PublishOutcome,
   type PublishPayload,
 } from "@enmo/providers";
-import { PLATFORM_LABEL, type Platform } from "@enmo/shared";
+import { PLATFORM_LABEL, type Platform, type PublishStatus } from "@enmo/shared";
 import type { Deps } from "../deps";
 import {
   enqueuePublishPoll,
@@ -18,6 +19,8 @@ import {
   publishPollMaxPolls,
   type PublishPollJob,
   type PublishRunJob,
+  type QueueName,
+  type RequeueToken,
 } from "../jobs/queues";
 import type { RunAttempt } from "../jobs/types";
 import { MINUTE_MS } from "../lib/clock";
@@ -26,18 +29,19 @@ import { lockReopenableRounds } from "../orchestrator/approval-round";
 import { EventBatch } from "../orchestrator/events";
 import { advance } from "../orchestrator/graph";
 import { lockPost } from "../orchestrator/locks";
+import { postUpdated } from "../orchestrator/post-status";
 import {
   LIFECYCLE_CANCEL_MESSAGES,
   publishUpdated,
   syncPostPublishStatus,
 } from "../orchestrator/publishing";
 import {
-  activeAccountOf,
   archivedOf,
   loadPublishJob,
   payloadOf,
   publisherFor,
   publishesLive,
+  publishingAccountOf,
   type PublishJobWithContext,
 } from "./context";
 import { checkPublishGuards, decryptAccount } from "./guards";
@@ -50,6 +54,8 @@ import {
   type AttemptRef,
 } from "./outcomes";
 import { describeIssues } from "./payload";
+import { ensureRenditions, type Rendition } from "./renditions";
+import { UNSCHEDULED_ATTENTION_PREFIXES } from "./schedule";
 
 /*
  * Publishing one job (DESIGN §F "Publishing safety", "Meta", "Dry-run"):
@@ -83,6 +89,7 @@ const ERROR_VERB: Readonly<Record<PublishErrorCode, string>> = {
   UNAVAILABLE: "is unavailable",
   REJECTED: "rejected the post",
   NOT_CONFIGURED: "isn't set up for publishing",
+  UNCONFIRMED: "may already have the post",
 };
 
 function describeError(error: PublishError, platform: Platform): string {
@@ -163,6 +170,7 @@ type Claim =
       kind: "claimed";
       job: PublishJobWithContext;
       payload: PublishPayload;
+      renditions: Rendition[];
       account: DecryptedAccount | null;
     };
 
@@ -177,10 +185,13 @@ interface PublishMode {
  * PUBLISH_MODE is live, the platform has credentials and there is an account). Scheduling only
  * forecast it, so a kill switch (PUBLISH_MODE=dry-run, credentials removed) never passes a
  * simulated post off as live, and a post scheduled before its account was connected goes out for
- * real. The account is the job's own, or else the client's current one. A job scheduled live
- * whose account is gone stays live: the token guard fails it, so people reconnect rather than
- * find a simulated post. A job already PUBLISHING (a BullMQ retry after a crash) keeps what its
- * first claim settled: that attempt may have media at the platform already.
+ * real. The account is the job's own, or else the client's publishing account. While the client
+ * has any account on the platform the job is live, even without one it can use: scheduled live
+ * with its account gone since, a publishing account that expired, several connected and none
+ * chosen. The token guard fails it then, so people reconnect or choose rather than find a
+ * simulated post while real accounts are connected. A job already PUBLISHING (a BullMQ retry
+ * after a crash) keeps what its first claim settled: that attempt may have media at the platform
+ * already.
  */
 async function publishModeOf(
   tx: DbTransaction,
@@ -191,8 +202,11 @@ async function publishModeOf(
   if (job.status === "PUBLISHING") return stored;
   if (!publishesLive(deps, job.platform)) return { ...stored, dryRun: true };
   if (job.socialAccountId) return { ...stored, dryRun: false };
-  const account = await activeAccountOf(tx, job.variant.post.clientId, job.platform);
-  return account ? { dryRun: false, socialAccountId: account.id } : stored;
+  const { clientId } = job.variant.post;
+  const account = await publishingAccountOf(tx, clientId, job.platform);
+  if (account) return { dryRun: false, socialAccountId: account.id };
+  const connected = await tx.socialAccount.count({ where: { clientId, platform: job.platform } });
+  return connected > 0 ? { dryRun: false, socialAccountId: null } : stored;
 }
 
 /** QUEUED for this attempt, or already PUBLISHING on it (a BullMQ retry after a crash). */
@@ -204,9 +218,9 @@ function onThisAttempt(job: { status: string; attempts: number }, attempt: numbe
 }
 
 /**
- * One transaction under the locks an edit takes (rounds, then the post): the guard, the payload,
- * then QUEUED → PUBLISHING. From then on the post is PUBLISHING, which no edit touches, so what
- * the guard passed is what goes out.
+ * One transaction under the locks an edit takes (rounds, then the post): the publish mode, the
+ * guard, the payload, then QUEUED → PUBLISHING with the mode stored. From then on the post is
+ * PUBLISHING, which no edit touches, so what the guard passed is what goes out.
  */
 async function claim(deps: Deps, data: PublishRunJob): Promise<Claim> {
   const events = new EventBatch();
@@ -226,6 +240,7 @@ async function claim(deps: Deps, data: PublishRunJob): Promise<Claim> {
 
     const guard = await checkPublishGuards(tx, deps.tokenCipher, {
       postId: post.id,
+      clientId: post.clientId,
       archived: archivedOf(job),
       copy: post.copy,
       bannedWords: post.client.bannedWords,
@@ -238,7 +253,11 @@ async function claim(deps: Deps, data: PublishRunJob): Promise<Claim> {
       now: deps.clock.now(),
     });
     if (!guard.ok) {
-      const refusal = await refuseIn(tx, deps, events, job, ref, guard.failure);
+      // The refused job keeps the mode it was to go out in: a live one failed, nothing simulated.
+      if (mode.dryRun !== job.dryRun || mode.socialAccountId !== job.socialAccountId) {
+        await tx.publishJob.update({ where: { id: job.id }, data: mode });
+      }
+      const refusal = await refuseIn(tx, deps, events, { ...job, ...mode }, ref, guard.failure);
       return { kind: "settled", revisedGraph: refusal.revisedGraph };
     }
     const prepared = payloadOf(deps, job);
@@ -260,6 +279,7 @@ async function claim(deps: Deps, data: PublishRunJob): Promise<Claim> {
       kind: "claimed",
       job: { ...job, ...mode },
       payload: prepared.payload,
+      renditions: prepared.renditions,
       account: guard.account,
     };
   });
@@ -273,13 +293,57 @@ function switchedOff(platform: Platform): string {
   return `${label} publishing was switched to dry run (PUBLISH_MODE or its credentials) while this live publish was under way; check the ${label} account, then retry it`;
 }
 
+/**
+ * The claim, or on BullMQ's last attempt the job FAILED with an alert when it keeps throwing (the
+ * database down for longer than the backoff, a transaction timeout): nothing else would move a
+ * QUEUED job whose run gave up, so it would sit there without anyone knowing.
+ */
+async function claimOrFail(deps: Deps, data: PublishRunJob, run: RunAttempt): Promise<Claim> {
+  try {
+    return await claim(deps, data);
+  } catch (error) {
+    if (run.isLast) {
+      const reason = error instanceof Error ? error.message : String(error);
+      try {
+        await failQueuedRun(deps, data, reason);
+      } catch (failure) {
+        // tick.publish finds the job without a run and deals with it (driveOrphans).
+        deps.logger.error(
+          { err: failure, publishJobId: data.publishJobId },
+          "could not fail a publish job whose run gave up",
+        );
+      }
+    }
+    throw error;
+  }
+}
+
+/** A QUEUED job whose run for `data.attempt` gave up before it could start publishing: FAILED. */
+async function failQueuedRun(deps: Deps, data: PublishRunJob, reason: string): Promise<boolean> {
+  const head = await deps.prisma.publishJob.findUnique({
+    where: { id: data.publishJobId },
+    select: { variant: { select: { postId: true } } },
+  });
+  if (!head) return false;
+  return failJob(
+    deps,
+    { jobId: data.publishJobId, postId: head.variant.postId, attempt: data.attempt },
+    `publishing couldn't start (${clip(reason)}); retry it`,
+    { alert: "stuck" },
+  );
+}
+
+function clip(text: string, max = 300): string {
+  return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
+}
+
 /** publish.run: one attempt at publishing a job. */
 export async function runPublish(
   deps: Deps,
   data: PublishRunJob,
   run: RunAttempt,
 ): Promise<PublishStepResult> {
-  const claimed = await claim(deps, data);
+  const claimed = await claimOrFail(deps, data, run);
   if (claimed.kind === "stale") return "stale";
   if (claimed.kind === "settled") {
     const graphId = claimed.revisedGraph;
@@ -289,7 +353,7 @@ export async function runPublish(
     }
     return "refused";
   }
-  const { job, payload, account } = claimed;
+  const { job, payload, renditions, account } = claimed;
   const ref = refOf(job, data.attempt);
   const publisher = publisherFor(deps, job);
   if (!publisher) {
@@ -298,6 +362,8 @@ export async function runPublish(
   }
   let outcome: PublishOutcome;
   try {
+    // A dry run writes them too: the files a live publish would hand the platform exist.
+    await ensureRenditions(deps.storage, renditions);
     outcome = await publisher.publish(payload, account, {
       containerId: job.containerId,
       onContainer: (containerId) => saveContainer(deps, ref, containerId),
@@ -386,6 +452,8 @@ export async function pollPublish(
 export const SCHEDULE_REDRIVE_AFTER_MS = 5 * MINUTE_MS;
 /** The requeue token of a re-driven publisher.schedule (one per round, however many ticks). */
 export const SCHEDULE_REDRIVE_TOKEN = "sweep";
+/** The requeue token of a re-driven publish.run (one per attempt, however many ticks). */
+export const RUN_REDRIVE_TOKEN = "sweep";
 
 /** BullMQ states in which a job will still run (or is running). */
 const LIVE_JOB_STATES = [
@@ -399,11 +467,14 @@ const LIVE_JOB_STATES = [
 export interface PublishTickReport {
   /** Due jobs handed to publish.run. */
   queued: number;
-  /** QUEUED jobs whose publish.run was lost, queued again. */
+  /** QUEUED jobs whose publish.run was lost (or gave up once), queued again. */
   redriven: number;
-  /** PUBLISHING jobs nothing was working on any more, FAILED. */
+  /**
+   * Jobs nothing will work on any more, FAILED with an alert: PUBLISHING ones no run or poll is
+   * on, and QUEUED ones whose re-driven run gave up too.
+   */
   stalled: number;
-  /** APPROVED posts whose publisher.schedule was lost, queued again. */
+  /** APPROVED posts whose publisher.schedule was lost (or gave up once), queued again. */
   rescheduled: number;
 }
 
@@ -425,15 +496,37 @@ async function jobsInFlight(deps: Deps): Promise<Set<string>> {
   return ids;
 }
 
-async function enqueueRun(deps: Deps, job: { id: string; attempts: number }): Promise<boolean> {
+async function enqueueRun(
+  deps: Deps,
+  job: { id: string; attempts: number },
+  requeue: RequeueToken | null = null,
+): Promise<boolean> {
   try {
-    await enqueuePublishRun(deps.queues, { publishJobId: job.id, attempt: job.attempts + 1 });
+    await enqueuePublishRun(
+      deps.queues,
+      { publishJobId: job.id, attempt: job.attempts + 1 },
+      { requeue },
+    );
     return true;
   } catch (error) {
     // Left QUEUED without a run: the next tick queues it again.
     deps.logger.warn({ err: error, publishJobId: job.id }, "could not queue publish.run");
     return false;
   }
+}
+
+/** A BullMQ job's state by id, or null when there is none (never added, or removed). */
+async function runState(deps: Deps, queue: QueueName, id: string): Promise<string | null> {
+  const job = await deps.queues.queue(queue).getJob(id);
+  if (!job) return null;
+  const state = await job.getState();
+  return state === "unknown" ? null : state;
+}
+
+/** Why the run with this id gave up, as BullMQ kept it. */
+async function failedReasonOf(deps: Deps, queue: QueueName, id: string): Promise<string> {
+  const job = await deps.queues.queue(queue).getJob(id);
+  return job?.failedReason?.trim() || "an unexpected error";
 }
 
 async function queueDue(deps: Deps): Promise<number> {
@@ -449,42 +542,135 @@ async function queueDue(deps: Deps): Promise<number> {
   return due.length;
 }
 
+interface OrphanRow {
+  id: string;
+  status: PublishStatus;
+  attempts: number;
+  platform: Platform;
+  containerId: string | null;
+  variant: { postId: string };
+}
+
+/**
+ * A QUEUED job with no run in flight. Its run's id is deterministic, and BullMQ ignores an add
+ * whose id it still keeps (a failed run for a week), so what to do depends on that run:
+ * - none (the enqueue was lost, or the run was removed): queue it;
+ * - it gave up (or finished) without starting the job: queue it once more under
+ *   RUN_REDRIVE_TOKEN, since what broke it (a database outage, say) may be over;
+ * - that one gave up too: FAILED with an alert, for a person to look at and retry, rather than
+ *   a job sitting QUEUED for good.
+ */
+async function redriveQueued(deps: Deps, row: OrphanRow, report: PublishTickReport) {
+  const data = { publishJobId: row.id, attempt: row.attempts + 1 };
+  const first = await runState(deps, "ops", jobIds.publishRun(data));
+  if (first === null) {
+    if (await enqueueRun(deps, row)) report.redriven += 1;
+    return;
+  }
+  // Queued after all (a retry racing this tick): a second run of one attempt must never start.
+  if (first !== "failed" && first !== "completed") return;
+  const sweepId = jobIds.publishRun(data, RUN_REDRIVE_TOKEN);
+  const sweep = await runState(deps, "ops", sweepId);
+  if (sweep === null) {
+    if (await enqueueRun(deps, row, RUN_REDRIVE_TOKEN)) report.redriven += 1;
+    return;
+  }
+  if (sweep !== "failed" && sweep !== "completed") return;
+  const reason = sweep === "failed" ? await failedReasonOf(deps, "ops", sweepId) : "it ended early";
+  const failed = await failJob(
+    deps,
+    { jobId: row.id, postId: row.variant.postId, attempt: data.attempt },
+    `publishing couldn't start (${clip(reason)}); retry it`,
+    { alert: "stuck" },
+  );
+  if (failed) report.stalled += 1;
+}
+
+/** Why a PUBLISHING job nothing works on any more is FAILED, and what a person does about it. */
+function stalledMessage(row: OrphanRow): string {
+  if (hasUnconfirmedPost(row.containerId)) {
+    const label = PLATFORM_LABEL[row.platform];
+    return `publishing stalled right after ${label} was sent the post, so it may be live already: check ${label}, then retry to post it again, or cancel the job`;
+  }
+  return "publishing stalled with nothing left working on it; retry it to resume";
+}
+
 /** QUEUED jobs without a run, and PUBLISHING ones nothing is running or polling any more. */
 async function driveOrphans(deps: Deps, report: PublishTickReport): Promise<void> {
   // Rows first, queue second: a run that finishes in between has moved its row on.
   const rows = await deps.prisma.publishJob.findMany({
     where: { status: { in: ["QUEUED", "PUBLISHING"] } },
-    select: { id: true, status: true, attempts: true, variant: { select: { postId: true } } },
+    select: {
+      id: true,
+      status: true,
+      attempts: true,
+      platform: true,
+      containerId: true,
+      variant: { select: { postId: true } },
+    },
   });
   if (rows.length === 0) return;
   const inFlight = await jobsInFlight(deps);
   for (const row of rows) {
     if (inFlight.has(row.id)) continue;
     if (row.status === "QUEUED") {
-      if (await enqueueRun(deps, row)) report.redriven += 1;
+      await redriveQueued(deps, row, report);
       continue;
     }
     const stalled = await failJob(
       deps,
       { jobId: row.id, postId: row.variant.postId, attempt: row.attempts },
-      "publishing stalled with nothing left working on it; retry it to resume",
+      stalledMessage(row),
       { alert: "stuck" },
     );
     if (stalled) report.stalled += 1;
   }
 }
 
-/** Whether publisher.schedule for this round is queued, running or done (not lost or failed). */
-async function scheduleHandled(deps: Deps, postId: string, round: number): Promise<boolean> {
-  const queue = deps.queues.queue("agents");
-  for (const id of [
-    jobIds.publisherSchedule({ postId, round }),
-    jobIds.publisherSchedule({ postId, round }, SCHEDULE_REDRIVE_TOKEN),
-  ]) {
-    const job = await queue.getJob(id);
-    if (job && (await job.getState()) !== "failed") return true;
-  }
-  return false;
+/**
+ * What became of publisher.schedule for this round: "handled" (queued, running or done), "lost"
+ * (never queued, or it failed: queue it once more under SCHEDULE_REDRIVE_TOKEN), or "gave up"
+ * (that re-driven job failed too) with BullMQ's reason.
+ */
+type ScheduleFate = { kind: "handled" } | { kind: "lost" } | { kind: "gaveUp"; reason: string };
+
+async function scheduleFate(deps: Deps, postId: string, round: number): Promise<ScheduleFate> {
+  const first = await runState(deps, "agents", jobIds.publisherSchedule({ postId, round }));
+  if (first !== null && first !== "failed") return { kind: "handled" };
+  const sweepId = jobIds.publisherSchedule({ postId, round }, SCHEDULE_REDRIVE_TOKEN);
+  const sweep = await runState(deps, "agents", sweepId);
+  if (sweep === null) return { kind: "lost" };
+  if (sweep !== "failed") return { kind: "handled" };
+  return { kind: "gaveUp", reason: await failedReasonOf(deps, "agents", sweepId) };
+}
+
+/**
+ * The post's schedule gave up twice: flagged with an alert, so people see it and pick its days on
+ * the calendar, and tick.publish stops looking at it (it only re-drives posts not flagged).
+ */
+async function flagUnscheduled(deps: Deps, postId: string, reason: string): Promise<void> {
+  const events = new EventBatch();
+  await deps.prisma.$transaction(async (tx) => {
+    await lockPost(tx, postId);
+    const [post] = await tx.post.updateManyAndReturn({
+      where: { id: postId, status: "APPROVED", needsAttention: false },
+      data: {
+        needsAttention: true,
+        attentionReason: clip(`${UNSCHEDULED_ATTENTION_PREFIXES[1]}${reason}`, 500),
+      },
+    });
+    if (!post) return;
+    postUpdated(events, post);
+    events.alert({
+      kind: "failed",
+      entityType: "Post",
+      entityId: post.id,
+      message: `The Publisher couldn't schedule ${post.ref}: ${clip(reason)}. Pick its days on the calendar.`,
+      clientId: post.clientId,
+      campaignId: post.campaignId,
+    });
+  });
+  await events.publish(deps);
 }
 
 /**
@@ -522,7 +708,13 @@ async function redriveLostSchedules(deps: Deps): Promise<number> {
     const scheduledThisRound = jobs.some(
       (job) => job.status !== "CANCELLED" || !LIFECYCLE_CANCEL_MESSAGES.has(job.lastError ?? ""),
     );
-    if (scheduledThisRound || (await scheduleHandled(deps, post.id, round.round))) continue;
+    if (scheduledThisRound) continue;
+    const fate = await scheduleFate(deps, post.id, round.round);
+    if (fate.kind === "handled") continue;
+    if (fate.kind === "gaveUp") {
+      await flagUnscheduled(deps, post.id, fate.reason);
+      continue;
+    }
     try {
       await enqueuePublisherSchedule(
         deps.queues,

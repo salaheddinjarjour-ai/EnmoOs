@@ -20,7 +20,8 @@ import {
  *   POST /{v}/{ig}/media                            a container (image, REELS, STORIES, carousel
  *                                                   item, CAROUSEL), IN_PROGRESS for
  *                                                   state.containerPolls status reads, then
- *                                                   state.containerOutcome
+ *                                                   state.containerOutcome (ERROR for an image
+ *                                                   that isn't a JPEG)
  *   POST /{v}/{ig}/media_publish {creation_id}      publishes a FINISHED container, counting it
  *                                                   against state.quotaUsage/quotaTotal
  *   GET  /{v}/{ig}/content_publishing_limit
@@ -30,6 +31,20 @@ import {
 const PUBLISH_SCOPE = "instagram_content_publish";
 const CAROUSEL_MIN = 2;
 const CAROUSEL_MAX = 10;
+
+/**
+ * Instagram fetches images as JPEG only; anything else ends its container in ERROR once Meta has
+ * tried to download it. The fake goes by the URL's extension.
+ */
+export function isJpegUrl(url: string): boolean {
+  let path = url;
+  try {
+    path = new URL(url).pathname;
+  } catch {
+    // Not a URL: judged as written.
+  }
+  return /\.jpe?g$/i.test(path);
+}
 
 /** A status read: answers IN_PROGRESS while polls are left, then the container's outcome. */
 export function readContainer(container: FakeContainer): ContainerStatusCode {
@@ -171,7 +186,7 @@ function createContainer(state: FakeGraphState, request: FastifyRequest, reply: 
         : {},
     status: "IN_PROGRESS",
     pollsLeft: state.containerPolls,
-    outcome: state.containerOutcome,
+    outcome: imageUrl && !isJpegUrl(imageUrl) ? "ERROR" : state.containerOutcome,
     mediaId: null,
   };
   state.containers.set(container.id, container);

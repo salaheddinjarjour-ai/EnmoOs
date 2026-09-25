@@ -20,8 +20,11 @@ export const AUDIT_ACTIONS = {
   socialAccountConnect: "social_account.connect",
   socialAccountDisconnect: "social_account.disconnect",
   socialAccountCheck: "social_account.check",
+  /** The account a client's posts on its platform publish through (SocialAccount.isPrimary). */
+  socialAccountPrimary: "social_account.primary",
   planApprove: "plan.approve",
   approvalApproveAll: "approval.approve_all",
+  publishSchedule: "publish.schedule",
   publishReschedule: "publish.reschedule",
   publishCancel: "publish.cancel",
   publishRetry: "publish.retry",

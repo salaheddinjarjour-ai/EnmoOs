@@ -4,6 +4,7 @@ export {
   automatedCopyChecks,
   copyIssuesByRule,
   editedCopyIssues,
+  publishLimitIssues,
   validateCopy,
   type CopyRule,
 } from "./copy";

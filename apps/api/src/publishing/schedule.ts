@@ -8,6 +8,7 @@ import {
   topSlotCandidate,
   type Brief,
   type BriefWindow,
+  type CopywriterOutput,
   type Platform,
   type PostType,
   type PublisherInput,
@@ -25,8 +26,9 @@ import { EventBatch } from "../orchestrator/events";
 import { lockPost } from "../orchestrator/locks";
 import { postUpdated } from "../orchestrator/post-status";
 import { publishUpdated, syncPostPublishStatus } from "../orchestrator/publishing";
+import { publishingAccountUnchosen } from "../services/social-accounts";
 import { activeAccountOf, copyOf, currentTakesOf, publisherNote } from "./context";
-import { describeIssues, preparePayload, variantCopyOf } from "./payload";
+import { describeIssues, preparePayload, variantCopyOf, type PayloadTake } from "./payload";
 import { addDays, candidates, slotIsFree, type CandidateRequest } from "./slot-optimizer";
 
 /*
@@ -39,10 +41,36 @@ import { addDays, candidates, slotIsFree, type CandidateRequest } from "./slot-o
  * Two short transactions around the LLM call, each re-checking that the post is still APPROVED on
  * the round being scheduled (an edit racing it wins, and this becomes a no-op). The second one
  * re-checks each slot under the client's slot lock and re-picks when another post took it.
+ *
+ * Slots stay inside the campaign window (DESIGN §F "Slot optimizer"): a variant with no free slot
+ * left there, or whose window has passed, is not scheduled; the post is flagged and a teammate puts
+ * that platform on a day of their choosing from the calendar (services/publishing.ts schedule).
  */
 
-/** How far past a full (or finished) campaign window the optimizer looks for a free slot. */
-export const OVERFLOW_DAYS = 14;
+/** How far ahead the optimizer looks for a post whose campaign has no window. */
+export const NO_WINDOW_DAYS = 14;
+
+/**
+ * Post.attentionReason of a post the Publisher left with a platform unscheduled (a problem here,
+ * or its job giving up twice): scheduling the last such platform by hand answers it.
+ */
+export const UNSCHEDULED_ATTENTION_PREFIXES = [
+  "Not scheduled on ",
+  "The Publisher couldn't schedule it: ",
+] as const;
+
+export function isUnscheduledAttention(reason: string | null): boolean {
+  return (
+    reason !== null && UNSCHEDULED_ATTENTION_PREFIXES.some((prefix) => reason.startsWith(prefix))
+  );
+}
+
+/** Why a variant has no candidate slot: its window is full, or over. */
+function noSlotIn(window: BriefWindow, today: string): string {
+  return window.end < today
+    ? `the campaign window ended on ${window.end}; put it on a day on the calendar`
+    : `no free slot is left in the campaign window (${window.start} to ${window.end}); put it on a day on the calendar`;
+}
 
 interface PreparedVariant {
   id: string;
@@ -242,7 +270,7 @@ async function prepareVariants(
     // What would fail at publish time is caught now, before a slot is spent on it.
     for (const variant of prepared.variants) {
       if (variant.keeps) continue;
-      const payload = preparePayload({
+      const problem = variantProblem(deps, {
         platform: variant.platform,
         postType: post.type,
         variantId: variant.id,
@@ -250,26 +278,10 @@ async function prepareVariants(
         hashtags: variant.hashtags,
         copy,
         takes,
-        publicBaseUrl: deps.config.PUBLIC_ASSET_BASE_URL,
+        bannedWords: post.client.bannedWords,
       });
-      const banned = scanForBannedWords(
-        { copy, variant: { caption: variant.caption, hashtags: variant.hashtags } },
-        post.client.bannedWords,
-        { ignoreKeys: COPY_BANNED_SCAN_IGNORE, limit: 20 },
-      );
-      if (!payload.ok) {
-        prepared.problems.push({
-          platform: variant.platform,
-          message: `the post breaks its publishing rules: ${describeIssues(payload.issues)}`,
-          actionable: true,
-        });
-      } else if (banned.length > 0) {
-        const terms = [...new Set(banned.map((hit) => `"${hit.term}"`))].join(", ");
-        prepared.problems.push({
-          platform: variant.platform,
-          message: `it uses the client's banned words ${terms}`,
-          actionable: true,
-        });
+      if (problem) {
+        prepared.problems.push({ platform: variant.platform, message: problem, actionable: true });
       }
     }
     const blocked = new Set(prepared.problems.map((problem) => problem.platform));
@@ -280,44 +292,70 @@ async function prepareVariants(
   });
 }
 
-/** The campaign window, or the next OVERFLOW_DAYS for a post whose campaign has none. */
-function windowOf(prepared: PreparedPost, today: string): BriefWindow {
-  return prepared.brief?.window ?? { start: today, end: addDays(today, OVERFLOW_DAYS - 1) };
+export interface VariantCheck {
+  platform: Platform;
+  postType: PostType;
+  variantId: string;
+  caption: string;
+  hashtags: readonly string[];
+  copy: CopywriterOutput;
+  takes: readonly PayloadTake[];
+  bannedWords: readonly string[];
 }
 
-/** Candidates inside the window, or else (flagged as such) in the days right after it. */
+/**
+ * What would stop the variant at publish time (its publishing rules, the client's banned words),
+ * as a clause for people, or null when it can go out.
+ */
+export function variantProblem(
+  deps: { config: Deps["config"]; storage: Deps["storage"] },
+  check: VariantCheck,
+): string | null {
+  const payload = preparePayload({
+    platform: check.platform,
+    postType: check.postType,
+    variantId: check.variantId,
+    caption: check.caption,
+    hashtags: check.hashtags,
+    copy: check.copy,
+    takes: check.takes,
+    publicBaseUrl: deps.config.PUBLIC_ASSET_BASE_URL,
+    storageUrl: (key) => deps.storage.publicUrl(key),
+  });
+  if (!payload.ok) return `the post breaks its publishing rules: ${describeIssues(payload.issues)}`;
+  const banned = scanForBannedWords(
+    { copy: check.copy, variant: { caption: check.caption, hashtags: check.hashtags } },
+    check.bannedWords,
+    { ignoreKeys: COPY_BANNED_SCAN_IGNORE, limit: 20 },
+  );
+  if (banned.length === 0) return null;
+  const terms = [...new Set(banned.map((hit) => `"${hit.term}"`))].join(", ");
+  return `it uses the client's banned words ${terms}`;
+}
+
+/** The campaign window, or the next NO_WINDOW_DAYS for a post whose campaign has none. */
+function windowOf(prepared: PreparedPost, today: string): BriefWindow {
+  return prepared.brief?.window ?? { start: today, end: addDays(today, NO_WINDOW_DAYS - 1) };
+}
+
+/** The optimizer's candidates inside the campaign window, or why there are none. */
 async function candidatesFor(
   deps: Deps,
   prepared: PreparedPost,
   variant: PreparedVariant,
   window: BriefWindow,
   today: string,
-): Promise<{ request: CandidateRequest; candidates: SlotCandidate[] } | null> {
-  const base = {
+): Promise<{ request: CandidateRequest; candidates: SlotCandidate[] } | { problem: string }> {
+  const request: CandidateRequest = {
     clientId: prepared.clientId,
     platform: variant.platform,
     timezone: prepared.timezone,
     now: deps.clock.now(),
+    window,
+    targetDate: prepared.targetDate,
   };
-  const request: CandidateRequest = { ...base, window, targetDate: prepared.targetDate };
-  const inside = await candidates(deps.prisma, request);
-  if (inside.length > 0) return { request, candidates: inside };
-
-  const start = window.end >= today ? addDays(window.end, 1) : today;
-  const overflow: CandidateRequest = {
-    ...base,
-    window: { start, end: addDays(start, OVERFLOW_DAYS - 1) },
-    targetDate: null,
-  };
-  const after = await candidates(deps.prisma, overflow);
-  if (after.length === 0) return null;
-  return {
-    request: overflow,
-    candidates: after.map((candidate) => ({
-      ...candidate,
-      reasons: [...candidate.reasons, "After the campaign window: it had no free slot left"],
-    })),
-  };
+  const found = window.end < today ? [] : await candidates(deps.prisma, request);
+  return found.length > 0 ? { request, candidates: found } : { problem: noSlotIn(window, today) };
 }
 
 function briefSummaryOf(brief: Brief | null): string {
@@ -487,13 +525,26 @@ async function commitSchedule(
       if (!pick) {
         problems.push({
           platform: variant.platform,
-          message: "no free slot is left for it",
+          message: noSlotIn(request.window, calendarDay(now, prepared.timezone)),
           actionable: true,
         });
         continue;
       }
       const account = await activeAccountOf(tx, prepared.clientId, variant.platform);
       const liveMode = deps.publishers[variant.platform].mode === "live";
+      if (
+        liveMode &&
+        !account &&
+        (await publishingAccountUnchosen(tx, prepared.clientId, variant.platform))
+      ) {
+        // Several accounts and none chosen: a dry run would pass for a post nobody will see.
+        problems.push({
+          platform: variant.platform,
+          message: `several ${PLATFORM_LABEL[variant.platform]} accounts are connected and none is chosen to publish through; choose one in the client's accounts, then put it on a day on the calendar`,
+          actionable: true,
+        });
+        continue;
+      }
       const fields = {
         socialAccountId: account?.id ?? null,
         platform: variant.platform,
@@ -533,7 +584,10 @@ async function commitSchedule(
         .join("; ");
       const flagged = await tx.post.update({
         where: { id: prepared.postId },
-        data: { needsAttention: true, attentionReason: `Not scheduled on ${summary}` },
+        data: {
+          needsAttention: true,
+          attentionReason: `${UNSCHEDULED_ATTENTION_PREFIXES[0]}${summary}`.slice(0, 500),
+        },
       });
       postUpdated(events, flagged);
       events.alert({
@@ -579,12 +633,8 @@ export async function schedulePost(
   for (const variant of prepared.variants) {
     if (variant.keeps) continue;
     const found = await candidatesFor(deps, prepared, variant, window, today);
-    if (!found) {
-      problems.push({
-        platform: variant.platform,
-        message: "no free slot is left for it",
-        actionable: true,
-      });
+    if ("problem" in found) {
+      problems.push({ platform: variant.platform, message: found.problem, actionable: true });
       continue;
     }
     items.push({ variant, ...found });

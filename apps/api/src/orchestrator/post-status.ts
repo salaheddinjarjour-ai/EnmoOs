@@ -32,8 +32,9 @@ export const POST_TRANSITIONS: Readonly<Record<PostStatus, readonly PostStatus[]
   APPROVED: ["PENDING_APPROVAL", "SCHEDULED", "PUBLISHING", "FAILED"],
   // Publish jobs waiting for their slots: scheduled, a retry queued, or a retryable error waiting.
   SCHEDULED: ["APPROVED", "SCHEDULED", "PUBLISHING", "FAILED"],
-  // A variant is going out (or is out while another still waits); a retry while one is out.
-  PUBLISHING: ["SCHEDULED", "PUBLISHING", "FAILED"],
+  // A variant is going out (or is out while another still waits); a retry while one is out; a
+  // platform nothing was scheduled on put on a day after the rest went out.
+  PUBLISHING: ["SCHEDULED", "PUBLISHING", "FAILED", "LIVE"],
   // Its last variant went out, or a teammate dropped the failed one while the rest is out.
   LIVE: ["PUBLISHING", "FAILED"],
   SCORED: ["LIVE", "SCORED"],

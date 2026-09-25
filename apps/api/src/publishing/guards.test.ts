@@ -105,6 +105,15 @@ describe("evaluateGuards", () => {
       });
     });
 
+    it("needs the one chosen to publish through when several are connected", () => {
+      expect(evaluateGuards(snapshot({ token: { kind: "unchosen" } }))).toMatchObject({
+        guard: "token",
+        message:
+          "None of the client's Instagram accounts is chosen to publish through; choose one in the client's accounts",
+        accountStatus: null,
+      });
+    });
+
     it("needs it ACTIVE, decryptable, unexpired and on the right platform", () => {
       expect(evaluateGuards(snapshot({ token: account({ status: "REVOKED" }) }))).toMatchObject({
         guard: "token",

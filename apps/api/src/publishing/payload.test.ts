@@ -42,6 +42,7 @@ function take(overrides: Partial<PayloadTake> & { slideIndex?: number | null } =
     kind: "IMAGE",
     status: "READY",
     url: `https://files.enmo.test/clients/c1/asset_${sequence}.png`,
+    storageKey: `clients/c1/asset_${sequence}.png`,
     posterUrl: null,
     mimeType: "image/png",
     width: 1080,
@@ -74,7 +75,24 @@ const base = {
   hashtags: ["#Ramadan"],
   copy: COPY,
   publicBaseUrl: "https://api.enmo.test/files",
+  storageUrl: (key: string) => `https://files.enmo.test/${key}`,
 };
+
+/** Where the Instagram rendition of a take's master lives, and what it is. */
+function igRendition(image: PayloadTake, width = 1080, height = 1350) {
+  const stem = image.storageKey!.replace(/\.png$/, "");
+  const key = `${stem}-instagram-${width}x${height}.jpg`;
+  return {
+    rendition: { sourceKey: image.storageKey!, key, mimeType: "image/jpeg", width, height },
+    media: {
+      kind: "IMAGE",
+      url: `https://files.enmo.test/${key}`,
+      width,
+      height,
+      mimeType: "image/jpeg",
+    },
+  };
+}
 
 describe("variantCopyOf", () => {
   it("takes the platform's own caption and the copy's hashtags", () => {
@@ -88,13 +106,18 @@ describe("variantCopyOf", () => {
 });
 
 describe("preparePayload", () => {
-  it("publishes a static post's take with the copy's alt text", () => {
+  it("publishes a static post's take with the copy's alt text: on Facebook, the master as is", () => {
     const image = take();
-    const prepared = preparePayload({ ...base, postType: "STATIC", takes: [image] });
+    const prepared = preparePayload({
+      ...base,
+      platform: "FACEBOOK",
+      postType: "STATIC",
+      takes: [image],
+    });
     expect(prepared).toEqual({
       ok: true,
       payload: {
-        platform: "INSTAGRAM",
+        platform: "FACEBOOK",
         postType: "STATIC",
         variantId: "variant_1",
         caption: "Cold brew after iftar.",
@@ -104,7 +127,42 @@ describe("preparePayload", () => {
           { kind: "IMAGE", url: image.url, width: 1080, height: 1920, mimeType: "image/png" },
         ],
       },
+      renditions: [],
     });
+  });
+
+  it("publishes an Instagram image as a JPEG rendition: 4:5 from the centre for the feed, whole for a story", () => {
+    const image = take();
+    const feed = preparePayload({ ...base, postType: "STATIC", takes: [image] });
+    const cut = igRendition(image);
+    expect(feed).toMatchObject({
+      ok: true,
+      payload: { media: [cut.media] },
+      renditions: [cut.rendition],
+    });
+
+    const story = preparePayload({ ...base, postType: "STORY", takes: [image] });
+    const whole = igRendition(image, 1080, 1920);
+    expect(story).toMatchObject({
+      ok: true,
+      payload: { media: [whole.media] },
+      renditions: [whole.rendition],
+    });
+
+    // A JPEG already inside the feed's range goes out as it is.
+    const jpeg = take({ mimeType: "image/jpeg", width: 1080, height: 1350 });
+    expect(preparePayload({ ...base, postType: "STATIC", takes: [jpeg] })).toMatchObject({
+      ok: true,
+      payload: { media: [{ url: jpeg.url, mimeType: "image/jpeg" }] },
+      renditions: [],
+    });
+
+    // Without a stored master there is nothing to cut it from.
+    const unstored = take({ storageKey: null });
+    const refused = preparePayload({ ...base, postType: "STATIC", takes: [unstored] });
+    expect(refused.ok || describeIssues(refused.issues)).toContain(
+      `Take ${unstored.shotId} can't go out: it has no stored file`,
+    );
   });
 
   it("publishes a reel's first scene at the script's length, whatever the clip runs", () => {
@@ -128,11 +186,10 @@ describe("preparePayload", () => {
   it("publishes a carousel's slides in slide order", () => {
     const slides = [2, 0, 1].map((slideIndex) => take({ slideIndex }));
     const prepared = preparePayload({ ...base, postType: "CAROUSEL", takes: slides });
-    expect(prepared.ok && prepared.payload.media.map((media) => media.url)).toEqual([
-      slides[1]!.url,
-      slides[2]!.url,
-      slides[0]!.url,
-    ]);
+    expect(prepared.ok && prepared.payload.media.map((media) => media.url)).toEqual(
+      [slides[1]!, slides[2]!, slides[0]!].map((slide) => igRendition(slide).media.url),
+    );
+    expect(prepared.ok && prepared.renditions).toHaveLength(3);
   });
 
   it("reports what a platform wouldn't take, a take that isn't ready included", () => {

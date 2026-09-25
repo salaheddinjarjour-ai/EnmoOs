@@ -225,6 +225,49 @@ describe("validateCopy", () => {
     expect(validateCopy(good, revision)[0]!.message).toMatch(/unchanged/);
   });
 
+  it("holds each platform's caption, with the hashtags appended, to that platform's limits", () => {
+    const tags = Array.from({ length: 10 }, (_, i) => `#tag${i}`);
+    const appended = `\n\n${tags.join(" ")}`.length;
+    const instagram = "i".repeat(COPY_LIMITS.captionMaxChars - appended + 1);
+    const long: CopywriterOutput = {
+      ...good,
+      hashtags: tags,
+      platformCaptions: [
+        { platform: "INSTAGRAM", caption: instagram },
+        { platform: "FACEBOOK", caption: "f".repeat(2150) },
+      ],
+    };
+    // Each caption alone is within 2200; Instagram's published text is one over, Facebook takes it.
+    const issues = validateCopy(long, reel);
+    expect(paths(issues)).toEqual(["platformCaptions[0].caption"]);
+    expect(issues[0]!.message).toContain(`${COPY_LIMITS.captionMaxChars + 1} characters`);
+    const fits = {
+      ...long,
+      platformCaptions: [
+        { ...long.platformCaptions[0]!, caption: "Short." },
+        long.platformCaptions[1]!,
+      ],
+    };
+    expect(validateCopy(fits, reel)).toEqual([]);
+
+    // Hashtags written into the caption count with the appended ones: 25 + 10 is over 30.
+    const inline = Array.from({ length: 25 }, (_, i) => `#inline${i}`).join(" ");
+    const crowded = {
+      ...fits,
+      platformCaptions: [
+        { platform: "INSTAGRAM" as const, caption: `Iced. ${inline}` },
+        fits.platformCaptions[1]!,
+      ],
+    };
+    const tagIssues = validateCopy(crowded, reel);
+    expect(paths(tagIssues)).toEqual(["hashtags"]);
+    expect(tagIssues[0]!.message).toMatch(/35 hashtags .* Instagram takes 30\. Drop 5\./);
+    // The same rule for a human edit, and as a failed automated check QA sees.
+    expect(paths(editedCopyIssues(crowded, reel.post))).toEqual(["hashtags"]);
+    const check = automatedCopyChecks(crowded, reel).find((c) => c.name === "publish_limits")!;
+    expect(check.passed).toBe(false);
+  });
+
   it("reports the same rules as automated checks", () => {
     const input: CopywriterInput = { ...reel, brand: brand({ bannedWords: ["sip"] }) };
     const checks = automatedCopyChecks({ ...good, caption: "One sip." }, input);

@@ -17,7 +17,11 @@ import { FormAlert } from "@/components/ui/Field";
 import { Input } from "@/components/ui/Input";
 import { formatDateTime } from "@/components/ui/time";
 import { useToast } from "@/components/ui/Toast";
-import { useCancelPublishJob, useRetryPublishJob } from "@/hooks/usePublishJobs";
+import {
+  useCancelPublishJob,
+  useRetryPublishJob,
+  useSchedulePublishJob,
+} from "@/hooks/usePublishJobs";
 import { errorMessage } from "@/lib/api";
 import { useCan } from "@/lib/auth";
 import {
@@ -27,6 +31,7 @@ import {
   formatShortDay,
   ghostNote,
   isCancellable,
+  isGhostSchedulable,
   isReschedulable,
   isRetryable,
   liveUrlOf,
@@ -38,7 +43,8 @@ import { EventThumb } from "./CalendarEvent";
  * One calendar item in full: when it goes out (client time, and the viewer's), who picked the slot
  * and why, the live link or the last error, and what can be done with it: Move to date (the
  * keyboard's drag), retry a failed publish, cancel one that hasn't started or that failed, or
- * open the post. A ghost explains why nothing is scheduled there (ghostNote).
+ * open the post. A ghost explains why nothing is scheduled there (ghostNote); on an approved post
+ * a manager can put that platform on a day ("Schedule on date").
  */
 
 export function EventDialog({
@@ -77,7 +83,7 @@ export function EventDialog({
                 onMove={onMove}
               />
             ) : (
-              <GhostDetails item={item} />
+              <GhostDetails key={item.id} item={item} today={today} onClose={onClose} />
             )}
             <div className="flex flex-wrap gap-2 border-t border-line pt-4">
               <Button
@@ -107,7 +113,39 @@ function Fact({ label, children }: { label: string; children: ReactNode }) {
   );
 }
 
-function GhostDetails({ item }: { item: CalendarGhostItem }) {
+function GhostDetails({
+  item,
+  today,
+  onClose,
+}: {
+  item: CalendarGhostItem;
+  today: string;
+  onClose: () => void;
+}) {
+  const toast = useToast();
+  const canSchedule = useCan("publish.reschedule") && isGhostSchedulable(item);
+  const schedule = useSchedulePublishJob();
+  // The planned day when it's still ahead, otherwise today.
+  const [date, setDate] = useState(item.date < today ? today : item.date);
+  const platform = PLATFORM_LABEL[item.platform];
+
+  function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!date) return;
+    schedule.mutate(
+      { postId: item.postId, platform: item.platform, date },
+      {
+        onSuccess: (job) => {
+          toast.success(
+            `Scheduled on ${platform}`,
+            `${formatDayTimeIn(job.scheduledFor, job.timezone)} (${job.timezone}).`,
+          );
+          onClose();
+        },
+      },
+    );
+  }
+
   return (
     <>
       <dl className="flex flex-col gap-2.5">
@@ -125,6 +163,26 @@ function GhostDetails({ item }: { item: CalendarGhostItem }) {
         </Fact>
       </dl>
       <p className="text-sm leading-relaxed text-steel">{ghostNote(item)}</p>
+      {canSchedule ? (
+        <form onSubmit={submit} className="flex flex-col gap-3">
+          <div className="flex flex-wrap items-end gap-2">
+            <Input
+              label="Schedule on date"
+              type="date"
+              value={date}
+              min={today}
+              required
+              onChange={(event) => setDate(event.target.value)}
+              hint="The optimizer picks the best free hour that day, even outside the campaign window."
+              className="w-52"
+            />
+            <Button type="submit" size="md" variant="primary" loading={schedule.isPending}>
+              Schedule
+            </Button>
+          </div>
+          {schedule.isError ? <FormAlert>{errorMessage(schedule.error)}</FormAlert> : null}
+        </form>
+      ) : null}
     </>
   );
 }

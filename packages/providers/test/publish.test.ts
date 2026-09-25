@@ -36,12 +36,22 @@ const meta: MetaConfig = {
 };
 const withApp: MetaConfig = { ...meta, appId: "app", appSecret: "secret" };
 
+/** A 4:5 JPEG: what Instagram's feed takes (and every other platform too). */
 const image = (n = 1): PublishMedia => ({
   kind: "IMAGE",
-  url: `https://assets.enmo.marketing/clients/c1/assets/a${n}.png`,
+  url: `https://assets.enmo.marketing/clients/c1/assets/a${n}-instagram-1080x1350.jpg`,
+  width: 1080,
+  height: 1350,
+  mimeType: "image/jpeg",
+});
+/** A Phase 3 master as rendered: a 9:16 PNG. */
+const master: PublishMedia = {
+  kind: "IMAGE",
+  url: "https://assets.enmo.marketing/clients/c1/assets/a1.png",
   width: 1080,
   height: 1920,
-});
+  mimeType: "image/png",
+};
 const video: PublishMedia = {
   kind: "VIDEO",
   url: "https://assets.enmo.marketing/clients/c1/assets/v1.mp4",
@@ -187,6 +197,35 @@ describe("validatePublishPayload", () => {
     ).toEqual([
       { path: "media", message: "A single-image post takes exactly 1 media file, not 2." },
     ]);
+  });
+
+  it("takes Instagram images as JPEG only, and feed images from 4:5 to 1.91:1", () => {
+    const paths = (value: PublishPayload) =>
+      validatePublishPayload(value).map((issue) => issue.path);
+    expect(paths(payload({ media: [master] }))).toEqual(["media[0].mimeType", "media[0]"]);
+    expect(validatePublishPayload(payload({ media: [master] }))[1]!.message).toBe(
+      "A feed image must be 0.80:1 to 1.91:1 (width to height); 1080×1920 is 0.56:1.",
+    );
+    expect(
+      paths(payload({ postType: "CAROUSEL", media: [image(1), { ...image(2), height: 1351 }] })),
+    ).toEqual(["media[1]"]);
+    expect(paths(payload({ media: [{ ...image(), width: 1910, height: 1000 }] }))).toEqual([]);
+    // A story is full-screen: 9:16 is fine, PNG isn't.
+    expect(
+      paths(payload({ postType: "STORY", media: [{ ...master, mimeType: "image/jpeg" }] })),
+    ).toEqual([]);
+    expect(paths(payload({ postType: "STORY", media: [master] }))).toEqual(["media[0].mimeType"]);
+    // Undeclared, the type follows the URL's extension.
+    const { mimeType: _, ...undeclared } = master;
+    expect(validatePublishPayload(payload({ postType: "STORY", media: [undeclared] }))).toEqual([
+      {
+        path: "media[0].mimeType",
+        message: "The platform fetches images as image/jpeg only, not image/png.",
+      },
+    ]);
+    // Facebook and TikTok take the master as it is.
+    expect(paths(payload({ platform: "FACEBOOK", media: [master] }))).toEqual([]);
+    expect(paths(payload({ platform: "TIKTOK", media: [master] }))).toEqual([]);
   });
 
   it("rejects malformed payloads with zod paths", () => {

@@ -1,11 +1,11 @@
 import {
   PLATFORM_LIMITS,
-  hashtagsIn,
   issuesFromZodError,
-  publishedCaption,
+  publishedTextFit,
   type AssetKind,
   type Issue,
 } from "@enmo/shared";
+import { mimeTypeForKey } from "../storage/keys";
 import { PublishError } from "./errors";
 import { publishFlowOf, type PublishFlow } from "./flow";
 import { isPublicHttpsUrl } from "./public-url";
@@ -14,11 +14,14 @@ import { PublishPayload, type PublishMedia } from "./types";
 /*
  * Payload validation shared by every publisher: the dry run checks exactly what a live publish
  * would, so a dry-run PUBLISHED means the platform would take the post. Limits come from
- * PLATFORM_LIMITS. Live publishers also require public https media URLs (requirePublicUrls), which
- * dry runs can't: local storage serves http://localhost. Instagram's feed image ratio (4:5–1.91:1)
- * isn't enforced yet: Phase 4 publishes the 9:16 master as is, and the Adapter's crops (Phase 5)
- * bring feed posts inside it.
+ * PLATFORM_LIMITS: the text as published, media counts, kinds and lengths, and the image formats
+ * and feed ratios a platform fetches (Instagram: JPEG only, feed images 4:5 to 1.91:1). Live
+ * publishers also require public https media URLs (requirePublicUrls), which dry runs can't: local
+ * storage serves http://localhost.
  */
+
+/** Floating-point slack only: 1080×1350 is 4:5 exactly, while 1080×1351 is already outside. */
+const ASPECT_TOLERANCE = 1e-9;
 
 interface MediaRule {
   minItems: number;
@@ -103,22 +106,68 @@ function mediaIssues(rule: MediaRule, media: readonly PublishMedia[]): Issue[] {
 }
 
 function captionIssues(payload: PublishPayload): Issue[] {
-  const limits = PLATFORM_LIMITS[payload.platform];
-  const text = publishedCaption(payload.caption, payload.hashtags);
+  const fit = publishedTextFit(payload.platform, payload.caption, payload.hashtags);
   const issues: Issue[] = [];
-  if (text.length > limits.captionMaxChars) {
+  if (fit.length > fit.maxChars) {
     issues.push({
       path: "caption",
-      message: `The caption with its hashtags runs ${text.length} characters; the platform takes ${limits.captionMaxChars}.`,
+      message: `The caption with its hashtags runs ${fit.length} characters; the platform takes ${fit.maxChars}.`,
     });
   }
-  const tags = hashtagsIn(text).length;
-  if (limits.hashtagsMax !== null && tags > limits.hashtagsMax) {
+  if (fit.maxHashtags !== null && fit.hashtags > fit.maxHashtags) {
     issues.push({
       path: "hashtags",
-      message: `${tags} hashtags; the platform takes ${limits.hashtagsMax}.`,
+      message: `${fit.hashtags} hashtags; the platform takes ${fit.maxHashtags}.`,
     });
   }
+  return issues;
+}
+
+/** Flows whose images go into a feed, where PLATFORM_LIMITS' feedImageAspect applies. */
+const FEED_IMAGE_FLOWS: ReadonlySet<PublishFlow> = new Set([
+  "IG_IMAGE",
+  "IG_CAROUSEL",
+  "FB_PHOTO",
+  "FB_MULTI_PHOTO",
+  "TIKTOK_PHOTO",
+]);
+
+/** The media's type as declared, or else as its URL's extension implies. */
+function mimeTypeOf(item: PublishMedia): string {
+  if (item.mimeType) return item.mimeType.split(";")[0]!.trim().toLowerCase();
+  let path = item.url;
+  try {
+    path = new URL(item.url).pathname;
+  } catch {
+    // The schema already reported a URL that doesn't parse.
+  }
+  return mimeTypeForKey(path);
+}
+
+function imageIssues(flow: PublishFlow, payload: PublishPayload): Issue[] {
+  const limits = PLATFORM_LIMITS[payload.platform];
+  const aspect = FEED_IMAGE_FLOWS.has(flow) ? limits.feedImageAspect : null;
+  const issues: Issue[] = [];
+  payload.media.forEach((item, index) => {
+    if (item.kind !== "IMAGE") return;
+    const type = mimeTypeOf(item);
+    if (limits.imageMimeTypes && !limits.imageMimeTypes.includes(type)) {
+      issues.push({
+        path: `media[${index}].mimeType`,
+        message: `The platform fetches images as ${limits.imageMimeTypes.join(" or ")} only, not ${type}.`,
+      });
+    }
+    const ratio = item.width / item.height;
+    if (
+      aspect &&
+      (ratio < aspect.min - ASPECT_TOLERANCE || ratio > aspect.max + ASPECT_TOLERANCE)
+    ) {
+      issues.push({
+        path: `media[${index}]`,
+        message: `A feed image must be ${aspect.min.toFixed(2)}:1 to ${aspect.max.toFixed(2)}:1 (width to height); ${item.width}×${item.height} is ${ratio.toFixed(2)}:1.`,
+      });
+    }
+  });
   return issues;
 }
 
@@ -153,9 +202,11 @@ export function validatePublishPayload(
   const parsed = PublishPayload.safeParse(payload);
   if (!parsed.success) return issuesFromZodError(parsed.error);
   const value = parsed.data;
+  const flow = publishFlowOf(value);
   return [
     ...captionIssues(value),
-    ...mediaIssues(mediaRule(publishFlowOf(value), value), value.media),
+    ...mediaIssues(mediaRule(flow, value), value.media),
+    ...imageIssues(flow, value),
     ...(options.requirePublicUrls ? urlIssues(value) : []),
   ];
 }

@@ -202,7 +202,8 @@ export async function failJob(
 
 /**
  * A retryable failure with automatic attempts left: the job waits QUEUED (the post back to
- * SCHEDULED unless another variant is out) and publish.run comes back for the next attempt after
+ * SCHEDULED unless the attempt reached the platform or another variant is out: countedPublishStatus)
+ * and publish.run comes back for the next attempt after
  * `delayMs`, in the same chain of retries as `firstAttempt`. A lost enqueue is re-driven by
  * tick.publish.
  */
@@ -291,7 +292,9 @@ async function holdBackArchivedIn(
  * while the post is only approved or scheduled, sends it back: banned words to the Copywriter
  * (the gate before an approval round, as QA's is: reviewers never get copy that can't go out),
  * anything else to its approval, reopened on what the post holds now. A post already partly out,
- * or banned copy outside any plan, stays where it is, flagged.
+ * or banned copy outside any plan, stays where it is, flagged. A retry resuming what an earlier
+ * attempt sent the platform fails instead: the post may be out there, and a job called off would
+ * be scheduled anew from scratch, so a person checks the platform before cancelling it.
  */
 export async function refuseIn(
   tx: DbTransaction,
@@ -309,6 +312,18 @@ export async function refuseIn(
   }
   if (failure.guard === "archived") {
     await holdBackArchivedIn(tx, events, job, ref, failure);
+    return NOTHING_TO_ADVANCE;
+  }
+  if (job.containerId !== null) {
+    const platform = PLATFORM_LABEL[job.platform];
+    await failJobIn(
+      tx,
+      deps,
+      events,
+      job,
+      ref,
+      `${clause(failure.message)}, and an earlier attempt already reached ${platform}, so the post may be there: check ${platform}, then cancel this job`,
+    );
     return NOTHING_TO_ADVANCE;
   }
   const reason = CANCEL_REASON[failure.guard];

@@ -240,12 +240,97 @@ describe("Graph calls", () => {
   });
 
   it("never retry a 2xx answer they can't read, since the post may already exist", async () => {
-    const { fetch } = scriptedFetch(new Response("<html>ok</html>", { status: 200 }));
+    // A call that publishes nothing (a reel's upload session): refused for good, nothing to check.
+    const reel = payload({
+      postType: "REEL",
+      media: [
+        { kind: "VIDEO", url: "https://assets.enmo.marketing/v.mp4", width: 1080, height: 1920 },
+      ],
+    });
+    const session = scriptedFetch(json({ upload_url: "no video_id" }));
     expect(
       await publishError(
-        facebookPublisher(fetch).publish(payload(), account, { containerId: null }),
+        facebookPublisher(session.fetch).publish(reel, account, { containerId: null }),
       ),
     ).toMatchObject({ code: "REJECTED", retryable: false });
+  });
+
+  it("keep the posting mark when the call that publishes answers 2xx unreadably: check the Page first", async () => {
+    const photos = payload({
+      postType: "CAROUSEL",
+      media: [1, 2].map((i) => ({
+        kind: "IMAGE" as const,
+        url: `https://assets.enmo.marketing/clients/c1/assets/a${i}.png`,
+        width: 1080,
+        height: 1920,
+      })),
+    });
+    const cases = [
+      // A proxy's HTML page instead of Graph's JSON.
+      {
+        flow: payload(),
+        responses: [new Response("<html>ok</html>", { status: 200 })],
+        marked: "FB_PHOTO;posting",
+      },
+      // Graph's JSON without the post's id.
+      { flow: payload(), responses: [json({ success: true })], marked: "FB_PHOTO;posting" },
+      {
+        flow: photos,
+        responses: [json({ id: "301" }), json({ id: "302" }), json({})],
+        marked: "FB_MULTI_PHOTO;items=301,302;posting",
+      },
+      {
+        flow: payload({ postType: "STORY" }),
+        responses: [json({ id: "301" }), json({ success: true })],
+        marked: "FB_PHOTO_STORY;items=301;posting",
+      },
+    ];
+    for (const { flow, responses, marked } of cases) {
+      const saved: string[] = [];
+      const { fetch } = scriptedFetch(...responses);
+      const error = await publishError(
+        facebookPublisher(fetch).publish(flow, account, {
+          containerId: null,
+          onContainer: (id) => {
+            saved.push(id);
+            return Promise.resolve();
+          },
+        }),
+      );
+      expect(error).toMatchObject({ code: "UNCONFIRMED", retryable: false });
+      expect(error.message).toMatch(
+        /^Meta answered .*may have published the .+ anyway.*check the Page/,
+      );
+      // The mark stays: a resume stops rather than posting it a second time.
+      expect(saved.at(-1)).toBe(marked);
+    }
+  });
+
+  it("take the posting mark back on a clear refusal, which created nothing", async () => {
+    const refusals = [
+      { flow: payload(), responses: [json({ error: { message: "No", code: 100 } }, 400)] },
+      // A story Meta answers `success: false` for, in a 2xx.
+      {
+        flow: payload({ postType: "STORY" }),
+        responses: [json({ id: "301" }), json({ success: false, post_id: "1001_1" })],
+      },
+    ];
+    for (const { flow, responses } of refusals) {
+      const saved: string[] = [];
+      const { fetch } = scriptedFetch(...responses);
+      const error = await publishError(
+        facebookPublisher(fetch).publish(flow, account, {
+          containerId: null,
+          onContainer: (id) => {
+            saved.push(id);
+            return Promise.resolve();
+          },
+        }),
+      );
+      expect(error).toMatchObject({ code: "REJECTED", retryable: false });
+      expect(saved.at(-2)).toMatch(/;posting$/);
+      expect(saved.at(-1)).not.toMatch(/posting/);
+    }
   });
 
   it("treat network failures and timeouts as UNAVAILABLE", async () => {
@@ -308,7 +393,9 @@ describe("Graph calls", () => {
     // A clear refusal means nothing was created: a rate limit is still retried.
     const { fetch } = scriptedFetch(json({ error: { message: "Slow down", code: 32 } }, 400));
     expect(
-      await publishError(facebookPublisher(fetch).publish(payload(), account, { containerId: null })),
+      await publishError(
+        facebookPublisher(fetch).publish(payload(), account, { containerId: null }),
+      ),
     ).toMatchObject({ code: "RATE_LIMITED", retryable: true });
   });
 });
@@ -357,6 +444,7 @@ describe("progress in PublishJob.containerId", () => {
       items: ["17890000000000001", "17890000000000002"],
       parent: "17890000000000003",
       finished: false,
+      posting: false,
       result: "17900000000000001",
     };
     const text = formatProgress(progress);
@@ -370,6 +458,11 @@ describe("progress in PublishJob.containerId", () => {
       finished: true,
     });
     expect(parseProgress("FB_PHOTO;result=1001_7001")).toMatchObject({ result: "1001_7001" });
+    // A Facebook post whose publishing call went out unanswered.
+    const posting = { ...progress, flow: "FB_MULTI_PHOTO" as const, parent: null, result: null };
+    const marked = formatProgress({ ...posting, posting: true });
+    expect(marked).toBe("FB_MULTI_PHOTO;items=17890000000000001,17890000000000002;posting");
+    expect(parseProgress(marked)).toEqual({ ...posting, posting: true });
   });
 
   it("rejects anything that isn't one of ours", () => {
@@ -381,6 +474,7 @@ describe("progress in PublishJob.containerId", () => {
       "IG_IMAGE;items=1;items=2",
       "IG_IMAGE;parent",
       "IG_IMAGE;finished=yes",
+      "FB_PHOTO;posting=1",
       "IG_IMAGE;items=1 2",
       "IG_IMAGE;owner=1",
     ]) {

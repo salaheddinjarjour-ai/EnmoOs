@@ -9,6 +9,7 @@ import { browserHeaders, buildTestApp, type TestApp } from "../helpers/app";
 import { sessionCookieFor, type CookieHeader } from "../helpers/auth";
 import { testDb } from "../helpers/db";
 import { createClient, createUser, type TestUser } from "../helpers/factories";
+import { seedPublishPost } from "../helpers/publish-fixtures";
 
 const ACCESS_TOKEN = "EAAG-access-token-that-must-never-leak";
 const REFRESH_TOKEN = "refresh-token-that-must-never-leak";
@@ -132,6 +133,8 @@ describe("POST /v1/clients/:id/social-accounts", () => {
       handle: "qahwa.co",
       displayName: "Qahwa Co",
       status: "ACTIVE",
+      // The client's only Instagram account: the one it publishes through.
+      isPrimary: true,
       scopes: ["instagram_basic", "instagram_content_publish"],
       meta: { igUserId: "17841400000000001", pageId: "1000001", username: "qahwa.co" },
       tokenExpiresAt,
@@ -292,6 +295,126 @@ describe("DELETE /v1/social-accounts/:id", () => {
       headers: { ...browserHeaders(cookies.admin), "content-type": "application/json" },
     });
     expect(response.statusCode).toBe(204);
+  });
+});
+
+describe("the account a client publishes through", () => {
+  const primaryOf = async (platform: "INSTAGRAM" | "FACEBOOK" = "INSTAGRAM") =>
+    (
+      await testDb().socialAccount.findMany({
+        where: { clientId: client.id, platform, isPrimary: true },
+        select: { id: true },
+      })
+    ).map((row) => row.id);
+
+  it("is a client's only account on the platform; with a second, it stays until an admin chooses", async () => {
+    const first = await connect();
+    expect(first.isPrimary).toBe(true);
+    const second = await connect({ externalId: "17841400000000002", handle: "qahwa.events" });
+    expect(second.isPrimary).toBe(false);
+    // Another platform is chosen for on its own.
+    expect((await connect({ platform: "FACEBOOK", externalId: "1000001" })).isPrimary).toBe(true);
+    expect(await primaryOf()).toEqual([first.id]);
+  });
+
+  it("switches to the account an admin picks, moving the posts waiting to go out; audited", async () => {
+    const first = await connect();
+    const second = await connect({ externalId: "17841400000000002", handle: "qahwa.events" });
+    const { jobs } = await seedPublishPost({
+      createdBy: admin,
+      client,
+      platforms: ["INSTAGRAM"],
+      jobs: [
+        {
+          platform: "INSTAGRAM",
+          scheduledFor: new Date(t.clock.now().getTime() + DAY_MS),
+          dryRun: false,
+          socialAccountId: first.id,
+        },
+      ],
+    });
+    const out = await seedPublishPost({
+      createdBy: admin,
+      client,
+      ref: "p2",
+      platforms: ["INSTAGRAM"],
+      status: "LIVE",
+      jobs: [
+        {
+          platform: "INSTAGRAM",
+          status: "PUBLISHED",
+          scheduledFor: t.clock.now(),
+          dryRun: false,
+          socialAccountId: first.id,
+        },
+      ],
+    });
+
+    for (const cookie of [cookies.manager, cookies.editor]) {
+      const refused = await send("POST", `/v1/social-accounts/${second.id}/primary`, cookie);
+      expect(refused.statusCode).toBe(403);
+    }
+    const response = await send("POST", `/v1/social-accounts/${second.id}/primary`, cookies.admin);
+    expect(response.statusCode, response.body).toBe(200);
+    expectNoTokens(response.body);
+    expect(response.json<SocialAccountDto>()).toMatchObject({ id: second.id, isPrimary: true });
+    expect(await primaryOf()).toEqual([second.id]);
+
+    const waiting = await testDb().publishJob.findUniqueOrThrow({
+      where: { id: jobs.INSTAGRAM!.id },
+    });
+    expect(waiting.socialAccountId).toBe(second.id);
+    // What already went out stays with the account it went out through.
+    const published = await testDb().publishJob.findUniqueOrThrow({
+      where: { id: out.jobs.INSTAGRAM!.id },
+    });
+    expect(published.socialAccountId).toBe(first.id);
+    const [audit] = await testDb().auditLog.findMany({
+      where: { action: AUDIT_ACTIONS.socialAccountPrimary },
+    });
+    expect(audit).toMatchObject({
+      actorId: admin.id,
+      entityId: second.id,
+      data: { clientId: client.id, platform: "INSTAGRAM", previousId: first.id, movedJobs: 1 },
+    });
+
+    // Again: nothing changes.
+    const again = await send("POST", `/v1/social-accounts/${second.id}/primary`, cookies.admin);
+    expect(again.json<SocialAccountDto>().isPrimary).toBe(true);
+    expect(
+      await testDb().auditLog.count({ where: { action: AUDIT_ACTIONS.socialAccountPrimary } }),
+    ).toBe(1);
+  });
+
+  it("refuses an account that can't publish", async () => {
+    await connect();
+    const expired = await connect({
+      externalId: "17841400000000002",
+      tokenExpiresAt: new Date(t.clock.now().getTime() - 1000).toISOString(),
+    });
+    const response = await send("POST", `/v1/social-accounts/${expired.id}/primary`, cookies.admin);
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toMatchObject({
+      error: { code: "CONFLICT", details: { status: "EXPIRED" } },
+    });
+    expect((await send("POST", "/v1/social-accounts/nope/primary", cookies.admin)).statusCode).toBe(
+      404,
+    );
+  });
+
+  it("passes to the only account left once the publishing one is disconnected, never to one of several", async () => {
+    const first = await connect();
+    const second = await connect({ externalId: "17841400000000002", handle: "b" });
+    const third = await connect({ externalId: "17841400000000003", handle: "c" });
+
+    await send("DELETE", `/v1/social-accounts/${first.id}`, cookies.admin);
+    expect(await primaryOf()).toEqual([]);
+    await send("DELETE", `/v1/social-accounts/${second.id}`, cookies.admin);
+    expect(await primaryOf()).toEqual([third.id]);
+    const [audit] = await testDb().auditLog.findMany({
+      where: { action: AUDIT_ACTIONS.socialAccountPrimary },
+    });
+    expect(audit).toMatchObject({ entityId: third.id, data: { disconnectedId: second.id } });
   });
 });
 

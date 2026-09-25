@@ -3,6 +3,7 @@ import { publishedCaption } from "@enmo/shared";
 import { PublishError } from "./errors";
 import { GraphId } from "./graph-client";
 import { defined, graphPath, onlyMedia, processing, type MetaFlowContext } from "./meta-context";
+import { mayHaveTakenEffect } from "./meta-errors";
 import { startProgress, type MetaProgress } from "./meta-progress";
 import type { PublishOutcome } from "./types";
 
@@ -17,7 +18,9 @@ import type { PublishOutcome } from "./types";
  *   video story  the same through /{page}/video_stories (best effort: Meta's story API is young)
  * and the live URL from GET /{post}?fields=permalink_url, or for videos from
  * GET /{video}?fields=status,permalink_url once processing is done. The calls that publish a photo,
- * feed post or story can't be repeated safely, so an outage on one of them is final (publishOnce).
+ * feed post or story can't be repeated safely: each is marked in the saved progress before it goes
+ * out, and neither an outage or an unreadable answer on it nor a resume that finds the mark sends
+ * it again (publishOnce).
  */
 
 const Photo = z.looseObject({ id: GraphId, post_id: GraphId.optional() });
@@ -72,7 +75,7 @@ async function recordResult(
   progress: MetaProgress,
   postId: string,
 ): Promise<PublishOutcome> {
-  await ctx.save({ ...progress, result: postId });
+  await ctx.save({ ...progress, posting: false, result: postId });
   return published(ctx, postId);
 }
 
@@ -82,18 +85,39 @@ function refused(what: string): PublishError {
 
 /**
  * The POST that makes a post public (a published photo, the feed post, the story) isn't
- * idempotent, and Meta can create the post and still time out or answer 5xx. Such an ambiguous
- * failure (UNAVAILABLE) is final, never retried automatically, so the Page never gets the post
- * twice: a person checks it, then retries or cancels. A clear refusal (rate limit, token, a 4xx)
- * means nothing was created and stays as it is.
+ * idempotent: Meta can create the post and still time out, answer 5xx or answer 2xx with a body
+ * that can't be read, and the worker can stop (or fail to save the answer) right after Meta
+ * created it. So the progress is saved with `posting` before the call goes out, and whatever
+ * leaves the answer unknown is final, never retried automatically, and keeps the mark: an outage
+ * (UNAVAILABLE), an unreadable answer (UNCONFIRMED), or a resume that finds `posting` without a
+ * result (UNCONFIRMED). A person checks the Page, then retries (which clears the mark,
+ * withoutPostingMarker) or cancels, so the Page never gets the post twice. A clear refusal (rate
+ * limit, token, a 4xx) means nothing was created: the mark is taken back and the error stays.
  */
-async function publishOnce<T>(what: string, call: () => Promise<T>): Promise<T> {
+async function publishOnce<T>(
+  ctx: MetaFlowContext,
+  progress: MetaProgress,
+  what: string,
+  call: () => Promise<T>,
+): Promise<T> {
+  if (progress.posting) {
+    throw new PublishError(
+      "UNCONFIRMED",
+      `an earlier attempt sent the ${what} to Facebook and never recorded the answer, so it may be on the Page already: check the Page, then retry to post it again, or cancel the job`,
+      { retryable: false },
+    );
+  }
+  await ctx.save({ ...progress, posting: true });
   try {
     return await call();
   } catch (error) {
-    if (!(error instanceof PublishError) || error.code !== "UNAVAILABLE") throw error;
+    if (!(error instanceof PublishError)) throw error;
+    if (!mayHaveTakenEffect(error)) {
+      await ctx.save(progress);
+      throw error;
+    }
     throw new PublishError(
-      "UNAVAILABLE",
+      error.code === "UNAVAILABLE" ? "UNAVAILABLE" : "UNCONFIRMED",
       `${error.message}. Facebook may have published the ${what} anyway, so it isn't retried automatically: check the Page, then retry or cancel the job`,
       { status: error.status, retryable: false, cause: error },
     );
@@ -102,16 +126,17 @@ async function publishOnce<T>(what: string, call: () => Promise<T>): Promise<T> 
 
 async function photo(ctx: MetaFlowContext, progress: MetaProgress | null) {
   if (progress?.result) return published(ctx, progress.result);
+  const current = progress ?? startProgress("FB_PHOTO");
   const body = defined({
     url: onlyMedia(ctx.payload).url,
     message: messageOf(ctx),
     alt_text_custom: ctx.payload.altText,
     published: true,
   });
-  const created = await publishOnce("photo post", () =>
+  const created = await publishOnce(ctx, current, "photo post", () =>
     ctx.post(graphPath(ctx.nodeId, "photos"), body, Photo),
   );
-  return recordResult(ctx, startProgress("FB_PHOTO"), created.post_id ?? created.id);
+  return recordResult(ctx, current, created.post_id ?? created.id);
 }
 
 /** Uploads the photos not uploaded yet as unpublished, recording each id as it arrives. */
@@ -132,7 +157,7 @@ async function stagePhotos(ctx: MetaFlowContext, progress: MetaProgress): Promis
 async function multiPhoto(ctx: MetaFlowContext, progress: MetaProgress | null) {
   if (progress?.result) return published(ctx, progress.result);
   const current = await stagePhotos(ctx, progress ?? startProgress("FB_MULTI_PHOTO"));
-  const post = await publishOnce("multi-photo post", () =>
+  const post = await publishOnce(ctx, current, "multi-photo post", () =>
     ctx.post(
       graphPath(ctx.nodeId, "feed"),
       {
@@ -150,10 +175,16 @@ async function photoStory(ctx: MetaFlowContext, progress: MetaProgress | null) {
   const current = await stagePhotos(ctx, progress ?? startProgress("FB_PHOTO_STORY"));
   const [photoId] = current.items;
   if (!photoId) throw new Error("A story's photo is staged before the story is posted");
-  const story = await publishOnce("photo story", () =>
-    ctx.post(graphPath(ctx.nodeId, "photo_stories"), { photo_id: photoId }, Story),
-  );
-  if (story.success === false) throw refused("photo story");
+  const story = await publishOnce(ctx, current, "photo story", async () => {
+    const answer = await ctx.post(
+      graphPath(ctx.nodeId, "photo_stories"),
+      { photo_id: photoId },
+      Story,
+    );
+    // Meta's refusal in a 2xx: nothing went on the Page, so publishOnce takes its mark back.
+    if (answer.success === false) throw refused("photo story");
+    return answer;
+  });
   return recordResult(ctx, current, story.post_id);
 }
 

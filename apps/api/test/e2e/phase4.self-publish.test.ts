@@ -1,3 +1,4 @@
+import { MockLlm, type LlmClient, type LlmRequest, type LlmResponse } from "@enmo/agents";
 import { DryRunPublisher, MetaPublisher } from "@enmo/providers";
 import {
   AssetParams,
@@ -5,11 +6,14 @@ import {
   CopywriterOutput,
   PublisherInput,
   publishedCaption,
+  topSlotCandidate,
   type AlertPayload,
+  type PublisherOutput,
   type PostDto,
   type PublishJobDto,
   type PublishUpdatedPayload,
 } from "@enmo/shared";
+import sharp from "sharp";
 import { afterEach, describe, expect, it } from "vitest";
 import { DAY_MS, FakeClock } from "../../src/lib/clock";
 import { currentContentHash } from "../../src/orchestrator/approval-round";
@@ -44,7 +48,8 @@ import {
  *   (a) approve → the Publisher picks each variant's slot among the optimizer's candidates (best
  *       times in the client's own time zone) → SCHEDULED; the FakeClock reaches each slot and
  *       tick.publish sends it through the dry-run publisher → PUBLISHED with its live URL and
- *       publishedAt → the post LIVE once both are out;
+ *       publishedAt → the post LIVE once both are out; a Publisher that picks a lower-ranked
+ *       candidate gets its own pick, not the optimizer's;
  *   (b) the same flow in PUBLISH_MODE=live through the real MetaPublisher against the fake Graph
  *       server, asserting the exact Graph call sequence of every Meta flow: Instagram image,
  *       reel (polled while processing, resumed on its persisted container after an outage),
@@ -53,6 +58,31 @@ import {
  *       schedules the same job rows again with the edited caption;
  *   (d) a calendar drag moves a job to the best free hour of the new day.
  */
+
+/** MockLlm, except that the Publisher picks each variant's last candidate, saying so. */
+class LastCandidateLlm implements LlmClient {
+  readonly provider = "mock" as const;
+  readonly #mock = new MockLlm();
+  readonly model = this.#mock.model;
+
+  static reasonFor(candidates: number): string {
+    return `The last of ${candidates} candidates: a quieter feed that day.`;
+  }
+
+  async complete(request: LlmRequest): Promise<LlmResponse> {
+    const response = await this.#mock.complete(request);
+    if (request.meta.agent !== "PUBLISHER") return response;
+    const input = PublisherInput.parse(request.meta.input);
+    const output: PublisherOutput = {
+      assignments: input.items.map((item) => ({
+        variantId: item.variantId,
+        slotStart: item.candidates.at(-1)!.slotStart,
+        reason: LastCandidateLlm.reasonFor(item.candidates.length),
+      })),
+    };
+    return { ...response, text: JSON.stringify(output) };
+  }
+}
 
 let harness: Harness | undefined;
 let graph: FakeGraph | undefined;
@@ -67,6 +97,22 @@ afterEach(async () => {
 async function start(options: HarnessOptions = {}): Promise<Harness> {
   harness = await startHarness({ clock: new FakeClock(NOW), ...options });
   return harness;
+}
+
+/**
+ * The JPEG Instagram fetches instead of a 9:16 PNG master (publishing/renditions.ts): 4:5 for the
+ * feed, whole for a story. Checks the file is in storage as that, and answers its public URL.
+ */
+async function instagramFrame(
+  h: Harness,
+  masterKey: string | null,
+  size: { width: number; height: number } = { width: 1080, height: 1350 },
+): Promise<string> {
+  const key = masterKey!.replace(/\.png$/, `-instagram-${size.width}x${size.height}.jpg`);
+  const stored = await h.deps.storage.get(key);
+  expect(stored, key).not.toBeNull();
+  expect(await sharp(stored!.body).metadata()).toMatchObject({ format: "jpeg", ...size });
+  return h.deps.storage.publicUrl(key);
 }
 
 describe("phase4.self-publish", () => {
@@ -180,6 +226,9 @@ describe("phase4.self-publish", () => {
     expectSameInstant(published.INSTAGRAM!.publishedAt, IG_TUESDAY_1100);
     expectSameInstant(live.liveAt, IG_TUESDAY_1100);
     expect(live.needsAttention).toBe(false);
+    // The dry run wrote the JPEG a live Instagram publish would hand Meta.
+    const [master] = await db.asset.findMany({ where: { postId, isCurrent: true } });
+    await instagramFrame(h, master!.storageKey);
 
     // Events go out just after the commit the wait above saw: wait for the last of them.
     const postStatuses = await h.waitFor(async () => {
@@ -212,6 +261,35 @@ describe("phase4.self-publish", () => {
     // A late duplicate tick or run changes nothing.
     await h.runTick("tick.publish");
     expect((await testDb().post.findUniqueOrThrow({ where: { id: postId } })).status).toBe("LIVE");
+  }, 90_000);
+
+  it("(a) puts each job on the slot the Publisher picked, even one the optimizer ranks lower", async () => {
+    const llm = new LastCandidateLlm();
+    const h = await start({ llm });
+    const seeded = await seedMetaPlan(h);
+    const [post] = await runToApproval(h, seeded);
+    const postId = post!.id;
+    await approvePost(h, seeded, postId);
+    await waitForPostStatus(h, postId, "SCHEDULED");
+
+    const jobs = await jobsOf(postId);
+    const run = await testDb().agentRun.findFirstOrThrow({
+      where: { agent: "PUBLISHER", action: "schedule", outcome: "OK" },
+    });
+    const { items } = PublisherInput.parse(run.inputSnapshot);
+    expect(items).toHaveLength(2);
+    for (const item of items) {
+      const pick = item.candidates.at(-1)!;
+      // The agent's own call, not the optimizer's top candidate the fallback would take.
+      expect(pick.slotStart).not.toBe(topSlotCandidate(item.candidates)!.slotStart);
+      const job = Object.values(jobs).find((entry) => entry.variantId === item.variantId)!;
+      expectSameInstant(job.scheduledFor, pick.slotStart);
+      expect(job).toMatchObject({
+        status: "SCHEDULED",
+        slotSource: "publisher",
+        slotReason: LastCandidateLlm.reasonFor(item.candidates.length),
+      });
+    }
   }, 90_000);
 
   it("(b) publishes live through the Meta Graph API with the exact call sequence", async () => {
@@ -274,8 +352,9 @@ describe("phase4.self-publish", () => {
       `GET /v26.0/${media!.id}`,
     ]);
     const instagram = variantOf("INSTAGRAM");
+    // Not the 9:16 PNG master: Instagram fetches a 4:5 JPEG cut from it.
     expect(container!.params).toMatchObject({
-      image_url: take!.url,
+      image_url: await instagramFrame(h, take!.storageKey),
       caption: publishedCaption(instagram.caption, instagram.hashtags),
     });
     const published = await jobsOf(postId);
@@ -320,6 +399,7 @@ describe("phase4.self-publish", () => {
         const { shot } = AssetParams.parse(take.params);
         return {
           url: take.url,
+          storageKey: take.storageKey,
           at: {
             shotId: take.shotId,
             sceneIndex: shot?.sceneIndex ?? take.sceneIndex,
@@ -327,7 +407,7 @@ describe("phase4.self-publish", () => {
           },
         };
       });
-      return placed.sort((a, b) => compareShotPosition(a.at, b.at)).map((take) => take.url);
+      return placed.sort((a, b) => compareShotPosition(a.at, b.at));
     };
     // Each post goes out on its plan's day, Facebook at 09:00 and Instagram at 11:00 in Riyadh.
     const slot = (day: string, hour: "09" | "11") =>
@@ -343,7 +423,7 @@ describe("phase4.self-publish", () => {
       `POST ${V}/${page.id}/video_reels`,
       `GET ${V}/${fbReel!.id}`,
     ]);
-    const [reelTake] = await takesOf(reel!);
+    const reelTake = (await takesOf(reel!))[0]!.url;
     expect(graph.calls[1]!.headers.file_url).toBe(reelTake);
     expect(graph.calls[2]!.body).toMatchObject({
       upload_phase: "finish",
@@ -419,8 +499,10 @@ describe("phase4.self-publish", () => {
       `POST ${V}/${ig}/media_publish`,
       `GET ${V}/${carouselMedia!.id}`,
     ]);
+    const frames: string[] = [];
+    for (const slide of slides) frames.push(await instagramFrame(h, slide.storageKey));
     expect(children.map((child) => child.params)).toEqual(
-      slides.map((url) => ({ image_url: url, is_carousel_item: true })),
+      frames.map((url) => ({ image_url: url, is_carousel_item: true })),
     );
     expect(parent.children).toEqual(children.map((child) => child.id));
 
@@ -450,7 +532,10 @@ describe("phase4.self-publish", () => {
       `POST ${V}/${ig}/media_publish`,
       `GET ${V}/${storyMedia!.id}`,
     ]);
-    expect(storyContainer!.params).toEqual({ media_type: "STORIES", image_url: storyTake });
+    expect(storyContainer!.params).toEqual({
+      media_type: "STORIES",
+      image_url: await instagramFrame(h, storyTake!.storageKey, { width: 1080, height: 1920 }),
+    });
   }, 90_000);
 
   it("(c) an edit after approval cancels the scheduled jobs; re-approval reschedules the same rows", async () => {
@@ -499,6 +584,7 @@ describe("phase4.self-publish", () => {
     ]);
 
     // Re-approval: the same job rows, reset and scheduled again, the edited captions going out.
+    // Their attempt count moves on rather than back to 0, so no run reuses an earlier one's id.
     h.clock.set(NOW);
     await approvePost(h, seeded, postId);
     await waitForPostStatus(h, postId, "SCHEDULED");
@@ -507,7 +593,7 @@ describe("phase4.self-publish", () => {
       expect(again[platform]).toMatchObject({
         id: before[platform]!.id,
         status: "SCHEDULED",
-        attempts: 0,
+        attempts: before[platform]!.attempts + 1,
         lastError: null,
         liveUrl: null,
       });
@@ -526,6 +612,9 @@ describe("phase4.self-publish", () => {
     await tickAt(h, FB_TUESDAY_0900);
     await tickAt(h, IG_TUESDAY_1100);
     await waitForPostStatus(h, postId, "LIVE");
+    for (const job of Object.values(await jobsOf(postId))) {
+      expect(job).toMatchObject({ status: "PUBLISHED", attempts: 2 });
+    }
   }, 90_000);
 
   it("(d) a calendar drag moves the job to the best free hour of the new day", async () => {

@@ -2,12 +2,13 @@ import {
   COPY_LIMITS,
   COPY_SHAPE_BY_POST_TYPE,
   PLATFORM_LABEL,
+  PLATFORM_LIMITS,
   type CopywriterInput,
 } from "@enmo/shared";
 import { BANNED_WORDS_RULE, ENMO_PREAMBLE, OUTPUT_RULES, json } from "./shared";
 
 /** Bump whenever the system prompt or the user-turn template changes. */
-export const COPYWRITER_PROMPT_VERSION = "copywriter.write.v2";
+export const COPYWRITER_PROMPT_VERSION = "copywriter.write.v3";
 
 export const COPYWRITER_SYSTEM_PROMPT = `${ENMO_PREAMBLE}
 
@@ -37,6 +38,7 @@ Write the complete copy for the post described in the request, in the brand's vo
 - caption: the master caption, ≤ ${COPY_LIMITS.captionMaxChars} characters, hook in the first line.
 - platformCaptions: exactly one entry per platform the post is going to, and no others, each ≤ ${COPY_LIMITS.captionMaxChars} characters and written for that platform.
 - hashtags: 3 to 10 relevant tags (never more than ${COPY_LIMITS.hashtagsMax}), each "#" followed by letters, digits or underscores with no spaces, no duplicates. Keep them in "hashtags", not inside the captions; they're appended at publishing.
+- Each platform publishes its caption with the hashtags appended after a blank line, and that whole text must fit the platform: at most ${PLATFORM_LIMITS.INSTAGRAM.captionMaxChars} characters and ${PLATFORM_LIMITS.INSTAGRAM.hashtagsMax} hashtags (inline ones included) on Instagram, ${PLATFORM_LIMITS.TIKTOK.captionMaxChars} characters on TikTok. Leave room for the tags.
 - altText: describes the visual for screen-reader users in a sentence or two.
 
 ## Revisions

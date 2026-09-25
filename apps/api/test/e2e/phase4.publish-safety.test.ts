@@ -1,22 +1,43 @@
-import { MockLlm, type LlmClient, type LlmRequest, type LlmResponse } from "@enmo/agents";
+import {
+  COPY_BANNED_SCAN_IGNORE,
+  MockLlm,
+  type LlmClient,
+  type LlmRequest,
+  type LlmResponse,
+} from "@enmo/agents";
 import type { Client } from "@enmo/db";
+import { DryRunPublisher } from "@enmo/providers";
 import {
   CopywriterOutput,
+  Feedback,
+  scanForBannedWords,
   type AlertPayload,
   type ApproveAllResponse,
   type Platform,
+  type PublishJobDto,
 } from "@enmo/shared";
-import { afterEach, describe, expect, it } from "vitest";
-import { enqueuePublishRun, jobIds, publishPollMaxPolls } from "../../src/jobs/queues";
+import { UnrecoverableError, Worker, type Job } from "bullmq";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it, onTestFinished } from "vitest";
+import { closeRedis, createWorkerConnection } from "../../src/jobs/connection";
+import {
+  enqueuePublishRun,
+  jobIds,
+  publishPollMaxPolls,
+  type QueueName,
+} from "../../src/jobs/queues";
 import { DAY_MS, FakeClock, HOUR_MS, MINUTE_MS } from "../../src/lib/clock";
 import { currentContentHash } from "../../src/orchestrator/approval-round";
 import { EventBatch } from "../../src/orchestrator/events";
 import { PUBLISH_CANCEL_REASONS, syncPostPublishStatus } from "../../src/orchestrator/publishing";
-import { pollPublish } from "../../src/publishing/publish-service";
+import { pollPublish, runPublish } from "../../src/publishing/publish-service";
+import { browserHeaders } from "../helpers/app";
 import { testDb } from "../helpers/db";
 import { createClient, createUser } from "../helpers/factories";
 import { startHarness, type Harness, type HarnessOptions } from "../helpers/harness";
-import { GRAPH_ERRORS, startFakeGraph, type FakeGraph } from "../fakes/meta-graph";
+import { FAKE_META_PAGES, GRAPH_ERRORS, startFakeGraph, type FakeGraph } from "../fakes/meta-graph";
 import {
   apiFor,
   approvePost,
@@ -30,19 +51,27 @@ import {
   publisherNotes,
   runToApproval,
   seedMetaPlan,
+  THURSDAY,
   tickAt,
+  TUESDAY,
   waitForJobs,
   waitForPostStatus,
+  WEDNESDAY,
   type SeededMetaPlan,
 } from "./phase4.fixtures";
 
 /*
  * Phase 4 publishing safety (DESIGN §F "Publishing safety", §D ticks), on the pipeline harness:
  *   - publisher.schedule: the optimizer's top candidates when the Publisher agent fails (never an
- *     escalation), and a post no platform would take left approved and flagged;
- *   - the publish guard at the slot: content changed behind the approval's back, banned words
- *     added since, an expired token; content refusals cancel and reopen approval, a token refusal
- *     fails the job (retryable once reconnected);
+ *     escalation), a post no platform would take left approved and flagged, and a platform it
+ *     couldn't place put on a day by a teammate even after the rest of the post went out;
+ *   - the publish guard at the slot: archived work, content changed behind the approval's back,
+ *     banned words added since, an expired token; content refusals cancel and reopen approval
+ *     (banned copy through the Copywriter first) and the re-approved job goes out at its new slot,
+ *     archived work is held back, a token refusal fails the job (retryable once reconnected);
+ *   - dry run or live settled at the slot: a kill switch after scheduling, an account connected
+ *     after scheduling, Pages connected with none chosen and an account disconnected (both fail,
+ *     never faked), and a live publish still processing when publishing is switched off;
  *   - the live publisher's failures against the fake Graph server: a transient error retried
  *     automatically on the same container, a permanent refusal, a revoked token, media still
  *     processing (publish.poll) and a poll that never finishes;
@@ -98,6 +127,21 @@ async function alerts(): Promise<AlertPayload[]> {
   return eventsOfType<AlertPayload>("alert");
 }
 
+/** The fake Graph's second Page (the client's Events Page), connected but not chosen to publish. */
+function connectSecondPage(h: Harness, client: Client) {
+  const page = FAKE_META_PAGES[1]!;
+  return testDb().socialAccount.create({
+    data: {
+      clientId: client.id,
+      platform: "FACEBOOK",
+      externalId: page.id,
+      handle: page.name,
+      accessTokenEnc: h.deps.tokenCipher.encrypt(page.accessToken),
+      meta: { pageId: page.id, pageName: page.name, source: "oauth" },
+    },
+  });
+}
+
 /**
  * The alerts once at least `count` have landed. A worker publishes its events just after the
  * commit the test waited on, so reading them straight after would race it.
@@ -133,6 +177,121 @@ describe("publisher.schedule", () => {
     // Flagged posts are not re-driven by the tick.
     await tickAt(h, new Date(Date.parse(NOW) + 10 * MINUTE_MS).toISOString());
     expect(await testDb().publishJob.count()).toBe(0);
+  }, 90_000);
+
+  it("keeps to the campaign window: a post approved after it ended waits for a teammate's day", async () => {
+    const h = await start();
+    const seeded = await seedMetaPlan(h, { platforms: ["INSTAGRAM"] });
+    const [post] = await runToApproval(h, seeded);
+    const postId = post!.id;
+    // The window closed before the approval came in (a Ramadan post approved after Eid).
+    const campaign = await testDb().campaign.findUniqueOrThrow({
+      where: { id: seeded.campaignId },
+    });
+    await testDb().campaign.update({
+      where: { id: seeded.campaignId },
+      data: {
+        brief: {
+          ...(campaign.brief as Record<string, unknown>),
+          window: { start: "2027-02-20", end: "2027-02-28" },
+        },
+      },
+    });
+    await approvePost(h, seeded, postId);
+
+    const flagged = await h.waitFor(async () => {
+      const row = await testDb().post.findUniqueOrThrow({ where: { id: postId } });
+      return row.needsAttention ? row : null;
+    });
+    expect(flagged).toMatchObject({
+      status: "APPROVED",
+      attentionReason:
+        "Not scheduled on Instagram: the campaign window ended on 2027-02-28; put it on a day on the calendar",
+    });
+    // Nothing went on a day nobody chose.
+    expect(await testDb().publishJob.count()).toBe(0);
+    expect(
+      (await alertsAfter(h, 1)).map((alert) => [alert.kind, alert.entityType, alert.entityId]),
+    ).toEqual([["failed", "Post", postId]]);
+
+    // A teammate picks Thursday; the optimizer picks its best Instagram hour.
+    const job = await apiFor(h, seeded.cookie)<PublishJobDto>("POST", "/v1/publish-jobs", {
+      postId,
+      platform: "INSTAGRAM",
+      date: THURSDAY,
+    });
+    expect(job).toMatchObject({
+      status: "SCHEDULED",
+      slotSource: "manual",
+      date: THURSDAY,
+      scheduledFor: "2027-03-04T08:00:00.000Z",
+    });
+    const scheduled = await waitForPostStatus(h, postId, "SCHEDULED");
+    expect(scheduled).toMatchObject({ needsAttention: false, attentionReason: null });
+    await tickAt(h, job.scheduledFor);
+    await waitForPostStatus(h, postId, "LIVE");
+  }, 90_000);
+
+  it("lets a teammate put a platform it couldn't place on a day after the rest of the post went out", async () => {
+    const h = await startLive();
+    const seeded = await seedMetaPlan(h);
+    // Instagram publishes through its account; Facebook has two Pages and neither is chosen.
+    await connectMetaAccounts(h, seeded.client);
+    await testDb().socialAccount.updateMany({
+      where: { clientId: seeded.client.id, platform: "FACEBOOK" },
+      data: { isPrimary: null },
+    });
+    const eventsPage = await connectSecondPage(h, seeded.client);
+    const [post] = await runToApproval(h, seeded);
+    const postId = post!.id;
+    await approvePost(h, seeded, postId);
+    const flagged = await h.waitFor(async () => {
+      const row = await testDb().post.findUniqueOrThrow({ where: { id: postId } });
+      return row.needsAttention ? row : null;
+    });
+    expect(flagged.status).toBe("SCHEDULED");
+    expect(flagged.attentionReason).toMatch(
+      /^Not scheduled on Facebook: several Facebook accounts are connected and none is chosen/,
+    );
+    expect(Object.keys(await jobsOf(postId))).toEqual(["INSTAGRAM"]);
+
+    // Instagram goes out before anyone gets to Facebook: LIVE on it, still flagged for Facebook.
+    await tickAt(h, IG_TUESDAY_1100);
+    const live = await waitForPostStatus(h, postId, "LIVE");
+    expect(live).toMatchObject({ needsAttention: true, attentionReason: flagged.attentionReason });
+
+    // The flag's action still works: the admin chooses a Page, a teammate picks Wednesday.
+    const api = apiFor(h, seeded.cookie);
+    await api("POST", `/v1/social-accounts/${eventsPage.id}/primary`, {});
+    const job = await api<PublishJobDto>("POST", "/v1/publish-jobs", {
+      postId,
+      platform: "FACEBOOK",
+      date: WEDNESDAY,
+    });
+    expect(job).toMatchObject({
+      status: "SCHEDULED",
+      slotSource: "manual",
+      date: WEDNESDAY,
+      dryRun: false,
+      socialAccountId: eventsPage.id,
+    });
+    // Part of the post waits again, and nothing is left unscheduled.
+    expect(await testDb().post.findUniqueOrThrow({ where: { id: postId } })).toMatchObject({
+      status: "PUBLISHING",
+      needsAttention: false,
+      attentionReason: null,
+    });
+
+    await tickAt(h, job.scheduledFor);
+    const done = await waitForPostStatus(h, postId, "LIVE");
+    expectSameInstant(done.liveAt, job.scheduledFor);
+    const jobs = await jobsOf(postId);
+    expect([jobs.INSTAGRAM!.status, jobs.FACEBOOK!.status]).toEqual(["PUBLISHED", "PUBLISHED"]);
+    expect(graph!.sequence()).toContain(`POST /v26.0/${FAKE_META_PAGES[1]!.id}/photos`);
+    const announced = (await publisherNotes(seeded.threadId)).at(-1)!;
+    expect(announced).toMatch(/^p1 is live\.\n/);
+    expect(announced).toContain(`Facebook: ${jobs.FACEBOOK!.liveUrl}`);
+    expect(announced).toContain(`Instagram: ${jobs.INSTAGRAM!.liveUrl}`);
   }, 90_000);
 
   it("falls back to the optimizer's top candidates when the Publisher can't answer", async () => {
@@ -267,20 +426,109 @@ describe("the publish guard", () => {
     expect(graph!.calls).toEqual([]);
   }, 90_000);
 
-  it("cancels a post that uses a word the client banned after approval", async () => {
+  it("publishes a job the guard refused at its new slot once the post is approved again", async () => {
     const h = await start();
-    const { postId } = await scheduledPost(h);
-    const [variant] = await testDb().postVariant.findMany({ where: { postId } });
-    const word = /\p{L}{5,}/u.exec(variant!.caption)![0];
-    await testDb().client.updateMany({ data: { bannedWords: [word] } });
+    const { seeded, postId } = await scheduledPost(h);
+    const db = testDb();
+    const { INSTAGRAM: job } = await jobsOf(postId);
+    const stored = await db.post.findUniqueOrThrow({ where: { id: postId } });
+    const copy = CopywriterOutput.parse(stored.copy);
+    await db.post.update({
+      where: { id: postId },
+      data: { copy: { ...copy, caption: "Changed behind the approval's back." } },
+    });
 
     await tickAt(h, IG_TUESDAY_1100);
     const reopened = await waitForPostStatus(h, postId, "PENDING_APPROVAL");
-    expect(reopened.attentionReason).toBe(`The post uses the client's banned words: "${word}"`);
-    expect((await jobsOf(postId)).INSTAGRAM).toMatchObject({
-      status: "CANCELLED",
-      lastError: PUBLISH_CANCEL_REASONS.bannedWords,
+    expect(reopened.needsAttention).toBe(true);
+    // The refused run is done, and BullMQ keeps its id taken for a day.
+    const runOne = jobIds.publishRun({ publishJobId: job!.id, attempt: 1 });
+    await h.waitFor(async () => {
+      const run = await h.deps.queues.queue("ops").getJob(runOne);
+      return run && (await run.getState()) === "completed";
     });
+
+    await approvePost(h, seeded, postId);
+    const rescheduled = await waitForPostStatus(h, postId, "SCHEDULED");
+    // The reviewers' approval answers the refusal's flag.
+    expect(rescheduled).toMatchObject({ needsAttention: false, attentionReason: null });
+    const again = (await jobsOf(postId)).INSTAGRAM!;
+    expect(again).toMatchObject({ id: job!.id, status: "SCHEDULED", attempts: 1, lastError: null });
+    expect(again.scheduledFor.getTime()).toBeGreaterThan(Date.parse(IG_TUESDAY_1100));
+
+    await tickAt(h, again.scheduledFor.toISOString());
+    const live = await waitForPostStatus(h, postId, "LIVE");
+    expect(live.needsAttention).toBe(false);
+    expect((await jobsOf(postId)).INSTAGRAM).toMatchObject({ status: "PUBLISHED", attempts: 2 });
+  }, 90_000);
+
+  it("sends copy that uses a word the client banned after approval back to the Copywriter", async () => {
+    const h = await start();
+    const { seeded, postId } = await scheduledPost(h);
+    const db = testDb();
+    const [variant] = await db.postVariant.findMany({ where: { postId } });
+    const word = /\p{L}{5,}/u.exec(variant!.caption)![0];
+    await db.client.updateMany({ data: { bannedWords: [word] } });
+
+    await tickAt(h, IG_TUESDAY_1100);
+    const message = `The post uses the client's banned words: "${word}"`;
+    const held = await waitForJobs(h, postId, "CANCELLED", ["INSTAGRAM"]);
+    expect(held.INSTAGRAM!.lastError).toBe(PUBLISH_CANCEL_REASONS.bannedWords);
+    // No round opens on copy that can't go out: the Copywriter rewrites it and QA sends it on.
+    const write = await db.agentTask.findFirstOrThrow({
+      where: { postId, action: "write", revision: { gt: 0 } },
+    });
+    const feedback = Feedback.parse(write.feedback);
+    expect(feedback).toMatchObject({ source: "QA", decisionId: null });
+    expect(feedback.verbatim).toContain(`Uses the banned term "${word}"`);
+    expect((await publisherNotes(seeded.threadId)).at(-1)).toBe(
+      `I held back p1 on Instagram: ${message}. It's back with the Copywriter.`,
+    );
+
+    const revised = await waitForPostStatus(h, postId, "PENDING_APPROVAL");
+    expect(revised.needsAttention).toBe(false);
+    expect(
+      scanForBannedWords(revised.copy, [word], { ignoreKeys: COPY_BANNED_SCAN_IGNORE }),
+    ).toEqual([]);
+    const rounds = await db.approvalRequest.findMany({
+      where: { postId },
+      orderBy: { round: "asc" },
+    });
+    expect(rounds.map((round) => round.status)).toEqual(["CANCELLED", "PENDING"]);
+    expect(rounds[1]!.contentHash).toBe(await currentContentHash(db, postId));
+  }, 90_000);
+
+  it("holds back a job whose campaign was archived behind its back, reopening nothing", async () => {
+    const h = await startLive();
+    const { seeded, postId } = await scheduledPost(h, ["INSTAGRAM"], (client) =>
+      connectMetaAccounts(h, client),
+    );
+    const { INSTAGRAM: job } = await jobsOf(postId);
+    // Archived without the service, which would have cancelled the job itself.
+    await testDb().campaign.update({
+      where: { id: seeded.campaignId },
+      data: { status: "ARCHIVED" },
+    });
+
+    await tickAt(h, IG_TUESDAY_1100);
+    const held = await waitForJobs(h, postId, "CANCELLED", ["INSTAGRAM"]);
+    expect(held.INSTAGRAM).toMatchObject({
+      id: job!.id,
+      lastError: PUBLISH_CANCEL_REASONS.campaignArchived,
+      liveUrl: null,
+    });
+    const post = await waitForPostStatus(h, postId, "APPROVED");
+    expect(post.needsAttention).toBe(false);
+    expect(await testDb().approvalRequest.count({ where: { postId, status: "PENDING" } })).toBe(0);
+    expect((await publisherNotes(seeded.threadId)).at(-1)).toBe(
+      "I held back p1 on Instagram: The post's campaign is archived.",
+    );
+    expect(graph!.calls).toEqual([]);
+
+    // Nothing schedules it again.
+    await tickAt(h, new Date(Date.parse(IG_TUESDAY_1100) + 10 * MINUTE_MS).toISOString());
+    expect((await jobsOf(postId)).INSTAGRAM!.status).toBe("CANCELLED");
+    expect(await alerts()).toEqual([]);
   }, 90_000);
 
   it("fails a live job whose token expired, marks the account, and publishes on a retry once reconnected", async () => {
@@ -338,6 +586,191 @@ describe("the publish guard", () => {
   }, 90_000);
 });
 
+describe("dry run or live, settled at the slot", () => {
+  it("publishes a job scheduled live as a dry run once publishing is switched off, and says so", async () => {
+    // Both processes share the storage the takes were rendered into, as a deploy would.
+    const storage = { STORAGE_LOCAL_DIR: await mkdtemp(path.join(tmpdir(), "enmo-kill-switch-")) };
+    onTestFinished(() => rm(storage.STORAGE_LOCAL_DIR, { recursive: true, force: true }));
+    const live = await startLive(storage);
+    const { seeded, postId } = await scheduledPost(live, ["INSTAGRAM"], (client) =>
+      connectMetaAccounts(live, client),
+    );
+    expect((await jobsOf(postId)).INSTAGRAM).toMatchObject({ dryRun: false });
+    // The kill switch: the next process runs with PUBLISH_MODE=dry-run.
+    await live.stop();
+    harness = undefined;
+    const h = await start({ env: storage });
+
+    await tickAt(h, IG_TUESDAY_1100);
+    await waitForPostStatus(h, postId, "LIVE");
+    const { INSTAGRAM: job } = await jobsOf(postId);
+    expect(job).toMatchObject({
+      status: "PUBLISHED",
+      dryRun: true,
+      externalId: `dryrun_${job!.variantId}`,
+      liveUrl: `https://dryrun.enmo.marketing/instagram/${job!.variantId}`,
+    });
+    expect(graph!.calls).toEqual([]);
+    expect((await publisherNotes(seeded.threadId)).at(-1)).toBe(
+      `p1 is live.\nInstagram: ${job!.liveUrl} (dry run)`,
+    );
+  }, 90_000);
+
+  it("publishes for real a post scheduled before its account was connected", async () => {
+    const h = await startLive();
+    const { seeded, postId } = await scheduledPost(h);
+    expect((await jobsOf(postId)).INSTAGRAM).toMatchObject({
+      dryRun: true,
+      socialAccountId: null,
+    });
+    expect((await publisherNotes(seeded.threadId)).at(-1)).toContain(
+      "[dry run: no Instagram account connected]",
+    );
+    const { instagram } = await connectMetaAccounts(h, seeded.client);
+
+    await tickAt(h, IG_TUESDAY_1100);
+    await waitForPostStatus(h, postId, "LIVE");
+    const [media] = [...graph!.state.media.values()];
+    expect((await jobsOf(postId)).INSTAGRAM).toMatchObject({
+      status: "PUBLISHED",
+      dryRun: false,
+      socialAccountId: instagram.id,
+      externalId: media!.id,
+      liveUrl: media!.permalink,
+    });
+  }, 90_000);
+
+  it("never picks one of a client's Pages by itself: the post waits for the admin's choice", async () => {
+    const h = await startLive();
+    const seeded = await seedMetaPlan(h, { platforms: ["FACEBOOK"] });
+    // Two Pages connected, neither chosen to publish through (a second one arrived later).
+    await connectMetaAccounts(h, seeded.client, { isPrimary: null });
+    const events = FAKE_META_PAGES[1]!;
+    const eventsPage = await connectSecondPage(h, seeded.client);
+    const [post] = await runToApproval(h, seeded);
+    const postId = post!.id;
+    await approvePost(h, seeded, postId);
+
+    const flagged = await h.waitFor(async () => {
+      const row = await testDb().post.findUniqueOrThrow({ where: { id: postId } });
+      return row.needsAttention ? row : null;
+    });
+    expect(flagged.attentionReason).toBe(
+      "Not scheduled on Facebook: several Facebook accounts are connected and none is chosen to publish through; choose one in the client's accounts, then put it on a day on the calendar",
+    );
+    expect(await testDb().publishJob.count()).toBe(0);
+
+    // The admin chooses the Events Page, then a teammate puts the post on Tuesday.
+    const api = apiFor(h, seeded.cookie);
+    await api("POST", `/v1/social-accounts/${eventsPage.id}/primary`, {});
+    const job = await api<PublishJobDto>("POST", "/v1/publish-jobs", {
+      postId,
+      platform: "FACEBOOK",
+      date: TUESDAY,
+    });
+    expect(job).toMatchObject({ dryRun: false, socialAccountId: eventsPage.id });
+    await tickAt(h, job.scheduledFor);
+    await waitForPostStatus(h, postId, "LIVE");
+    expect(graph!.sequence()[0]).toBe(`POST /v26.0/${events.id}/photos`);
+  }, 90_000);
+
+  it("fails, rather than fakes, a post whose client connected Pages after scheduling and chose none", async () => {
+    const h = await startLive();
+    const { seeded, postId } = await scheduledPost(h, ["FACEBOOK"]);
+    const { FACEBOOK: job } = await jobsOf(postId);
+    expect(job).toMatchObject({ dryRun: true, socialAccountId: null });
+    // Two Pages arrive by OAuth before the slot, neither chosen to publish through.
+    await connectMetaAccounts(h, seeded.client, { isPrimary: null });
+    const eventsPage = await connectSecondPage(h, seeded.client);
+
+    await tickAt(h, FB_TUESDAY_0900);
+    const failed = await waitForPostStatus(h, postId, "FAILED");
+    const reason =
+      "None of the client's Facebook accounts is chosen to publish through; choose one in the client's accounts";
+    expect(failed).toMatchObject({ needsAttention: true, attentionReason: reason });
+    // A live publish that failed: nothing simulated, nothing sent.
+    expect((await jobsOf(postId)).FACEBOOK).toMatchObject({
+      status: "FAILED",
+      dryRun: false,
+      socialAccountId: null,
+      lastError: reason,
+      externalId: null,
+      liveUrl: null,
+    });
+    expect(graph!.calls).toEqual([]);
+
+    // The admin chooses the Events Page; the retry goes out there, for real.
+    const api = apiFor(h, seeded.cookie);
+    await api("POST", `/v1/social-accounts/${eventsPage.id}/primary`, {});
+    await api("POST", `/v1/publish-jobs/${job!.id}/retry`, {});
+    await waitForPostStatus(h, postId, "LIVE");
+    const [fbPost] = [...graph!.state.posts.values()];
+    expect((await jobsOf(postId)).FACEBOOK).toMatchObject({
+      status: "PUBLISHED",
+      dryRun: false,
+      socialAccountId: eventsPage.id,
+      externalId: fbPost!.id,
+    });
+    expect(graph!.sequence()[0]).toBe(`POST /v26.0/${FAKE_META_PAGES[1]!.id}/photos`);
+  }, 90_000);
+
+  it("fails a live job whose account was disconnected before its slot, faking nothing", async () => {
+    const h = await startLive();
+    const { seeded, postId } = await scheduledPost(h, ["INSTAGRAM"], (client) =>
+      connectMetaAccounts(h, client),
+    );
+    const { INSTAGRAM: job } = await jobsOf(postId);
+    expect(job).toMatchObject({ dryRun: false, socialAccountId: expect.any(String) as string });
+    const disconnect = await h.app.inject({
+      method: "DELETE",
+      url: `/v1/social-accounts/${job!.socialAccountId}`,
+      headers: browserHeaders(seeded.cookie),
+    });
+    expect(disconnect.statusCode, disconnect.body).toBeLessThan(300);
+    expect((await jobsOf(postId)).INSTAGRAM!.socialAccountId).toBeNull();
+
+    await tickAt(h, IG_TUESDAY_1100);
+    const failed = await waitForPostStatus(h, postId, "FAILED");
+    const reason = "No Instagram account is connected to publish through";
+    expect(failed).toMatchObject({ needsAttention: true, attentionReason: reason });
+    expect((await jobsOf(postId)).INSTAGRAM).toMatchObject({
+      status: "FAILED",
+      dryRun: false,
+      lastError: reason,
+      externalId: null,
+      liveUrl: null,
+    });
+    expect(graph!.calls).toEqual([]);
+  }, 90_000);
+
+  it("fails a live publish still processing once publishing is switched off, faking nothing", async () => {
+    const h = await startLive();
+    const { postId } = await scheduledPost(h, ["INSTAGRAM"], (client) =>
+      connectMetaAccounts(h, client),
+    );
+    graph!.state.containerPolls = 10_000;
+    await tickAt(h, IG_TUESDAY_1100);
+    const publishing = await h.waitFor(async () => {
+      const { INSTAGRAM: job } = await jobsOf(postId);
+      return job?.status === "PUBLISHING" && job.containerId ? job : null;
+    });
+
+    const switchedOff = {
+      ...h.deps,
+      publishers: { ...h.deps.publishers, INSTAGRAM: new DryRunPublisher("INSTAGRAM") },
+    };
+    const result = await pollPublish(
+      switchedOff,
+      { publishJobId: publishing.id, attempt: 1, poll: 1 },
+      { isLast: false },
+    );
+    expect(result).toBe("failed");
+    const { INSTAGRAM: failed } = await jobsOf(postId);
+    expect(failed).toMatchObject({ status: "FAILED", dryRun: false, liveUrl: null });
+    expect(failed!.lastError).toMatch(/^Instagram publishing was switched to dry run /);
+  }, 90_000);
+});
+
 describe("the live publisher's failures", () => {
   it("retries a transient error automatically on the same container", async () => {
     const h = await startLive();
@@ -362,6 +795,11 @@ describe("the live publisher's failures", () => {
     const published = await waitForJobs(h, postId, "PUBLISHED", ["INSTAGRAM"]);
     expect(published.INSTAGRAM).toMatchObject({ attempts: 2, lastError: null });
     await waitForPostStatus(h, postId, "LIVE");
+    // The automatic retry runs in the chain its first attempt began.
+    const retried = await h.deps.queues
+      .queue("ops")
+      .getJob(jobIds.publishRun({ publishJobId: retrying.id, attempt: 2 }));
+    expect(retried?.data).toEqual({ publishJobId: retrying.id, attempt: 2, firstAttempt: 1 });
     const calls = graph!.sequence();
     expect(calls.filter((call) => /\/media$/.test(call))).toHaveLength(1);
     expect(calls.filter((call) => /\/media_publish$/.test(call))).toHaveLength(2);
@@ -460,39 +898,87 @@ describe("the live publisher's failures", () => {
   }, 90_000);
 });
 
+/** A post with one job in `status`, written straight to the database (no worker involved). */
+async function seedJobRow(
+  h: Harness,
+  input: {
+    status: "QUEUED" | "PUBLISHING";
+    platform?: Platform;
+    attempts?: number;
+    containerId?: string | null;
+  },
+) {
+  const platform = input.platform ?? "INSTAGRAM";
+  const admin = await createUser({ role: "ADMIN" });
+  const client = await createClient({ name: "Qahwa Co" });
+  const campaign = await testDb().campaign.create({
+    data: { clientId: client.id, name: "Iced", status: "ACTIVE", createdById: admin.id },
+  });
+  const post = await testDb().post.create({
+    data: {
+      campaignId: campaign.id,
+      clientId: client.id,
+      ref: "p1",
+      type: "STATIC",
+      platforms: [platform],
+      status: input.status === "QUEUED" ? "SCHEDULED" : "PUBLISHING",
+      approvedAt: h.clock.now(),
+    },
+  });
+  const variant = await testDb().postVariant.create({
+    data: {
+      postId: post.id,
+      platform,
+      format: platform === "FACEBOOK" ? "SQUARE_1_1" : "PORTRAIT_4_5",
+      caption: "Iced.",
+    },
+  });
+  const job = await testDb().publishJob.create({
+    data: {
+      variantId: variant.id,
+      platform,
+      status: input.status,
+      scheduledFor: h.clock.now(),
+      slotSource: "optimizer",
+      dryRun: true,
+      attempts: input.attempts ?? 1,
+      containerId: input.containerId ?? null,
+    },
+  });
+  return { post, job };
+}
+
+/**
+ * Takes the waiting job `jobId` off `queue` as a worker would and fails it for good, as BullMQ
+ * keeps a run whose last attempt threw (e.g. the database was down for longer than its backoff).
+ */
+async function failRun(
+  h: Harness,
+  jobId: string,
+  reason: string,
+  queue: QueueName = "ops",
+): Promise<void> {
+  const connection = createWorkerConnection(h.deps.config.REDIS_URL, h.deps.logger);
+  const worker = new Worker(queue, null, { connection, prefix: h.deps.queues.prefix });
+  try {
+    const token = `test-${jobId}`;
+    // Typed as always there, but a worker finds nothing when the queue is empty.
+    const job = (await worker.getNextJob(token, { block: false })) as Job | undefined;
+    if (job?.id !== jobId) throw new Error(`Expected ${jobId} waiting, got ${job?.id}`);
+    await job.moveToFailed(new UnrecoverableError(reason), token);
+    expect(await job.getState()).toBe("failed");
+  } finally {
+    await worker.close();
+    await closeRedis(connection);
+  }
+}
+
 describe("tick.publish", () => {
   it("fails a PUBLISHING job nothing is working on any more, as stuck", async () => {
     const h = await start({ workers: false });
-    const admin = await createUser({ role: "ADMIN" });
-    const client = await createClient({ name: "Qahwa Co" });
-    const campaign = await testDb().campaign.create({
-      data: { clientId: client.id, name: "Iced", status: "ACTIVE", createdById: admin.id },
-    });
-    const post = await testDb().post.create({
-      data: {
-        campaignId: campaign.id,
-        clientId: client.id,
-        ref: "p1",
-        type: "STATIC",
-        platforms: ["INSTAGRAM"],
-        status: "PUBLISHING",
-        approvedAt: h.clock.now(),
-      },
-    });
-    const variant = await testDb().postVariant.create({
-      data: { postId: post.id, platform: "INSTAGRAM", format: "PORTRAIT_4_5", caption: "Iced." },
-    });
-    const job = await testDb().publishJob.create({
-      data: {
-        variantId: variant.id,
-        platform: "INSTAGRAM",
-        status: "PUBLISHING",
-        scheduledFor: h.clock.now(),
-        slotSource: "optimizer",
-        dryRun: true,
-        attempts: 1,
-        containerId: "IG_IMAGE;items=1",
-      },
+    const { post, job } = await seedJobRow(h, {
+      status: "PUBLISHING",
+      containerId: "IG_IMAGE;items=1",
     });
 
     await h.runTick("tick.publish");
@@ -507,6 +993,154 @@ describe("tick.publish", () => {
     expect((await alerts()).map((alert) => [alert.kind, alert.entityId])).toEqual([
       ["stuck", job.id],
     ]);
+  });
+
+  it("tells people to check the Page before retrying a Facebook post that stalled mid-publish", async () => {
+    const h = await start({ workers: false });
+    const { job } = await seedJobRow(h, {
+      status: "PUBLISHING",
+      platform: "FACEBOOK",
+      containerId: "FB_PHOTO;posting",
+    });
+    await h.runTick("tick.publish");
+    expect(await testDb().publishJob.findUniqueOrThrow({ where: { id: job.id } })).toMatchObject({
+      status: "FAILED",
+      lastError:
+        "publishing stalled right after Facebook was sent the post, so it may be live already: check Facebook, then retry to post it again, or cancel the job",
+    });
+  });
+
+  it("re-drives a QUEUED job whose run gave up once, and fails it with an alert when that gives up too", async () => {
+    const h = await start({ workers: false });
+    const { post, job } = await seedJobRow(h, { status: "QUEUED", attempts: 0 });
+    const ops = h.deps.queues.queue("ops");
+    const run = { publishJobId: job.id, attempt: 1 };
+    await enqueuePublishRun(h.deps.queues, run);
+    await failRun(h, jobIds.publishRun(run), "Can't reach database server at 127.0.0.1:54329");
+
+    // The failed run keeps its id for a week, so a plain re-add would do nothing: a new id.
+    await h.runTick("tick.publish");
+    const sweep = jobIds.publishRun(run, "sweep");
+    expect(await (await ops.getJob(sweep))?.getState()).toBe("waiting");
+    expect(await testDb().publishJob.findUniqueOrThrow({ where: { id: job.id } })).toMatchObject({
+      status: "QUEUED",
+      attempts: 0,
+    });
+    // While it waits, later ticks leave it be.
+    await h.runTick("tick.publish");
+    expect(await ops.getJobCountByTypes("waiting", "failed")).toBe(2);
+
+    await failRun(h, sweep, "Can't reach database server at 127.0.0.1:54329");
+    await h.runTick("tick.publish");
+    expect(await testDb().publishJob.findUniqueOrThrow({ where: { id: job.id } })).toMatchObject({
+      status: "FAILED",
+      attempts: 1,
+      lastError:
+        "publishing couldn't start (Can't reach database server at 127.0.0.1:54329); retry it",
+    });
+    expect((await testDb().post.findUniqueOrThrow({ where: { id: post.id } })).status).toBe(
+      "FAILED",
+    );
+    expect((await alerts()).map((alert) => [alert.kind, alert.entityId])).toEqual([
+      ["stuck", job.id],
+    ]);
+    // Settled: nothing more is queued for it.
+    await h.runTick("tick.publish");
+    expect(await ops.getJobCountByTypes("waiting", "delayed")).toBe(0);
+  });
+
+  it("fails a QUEUED job whose run can't claim it on BullMQ's last attempt", async () => {
+    const h = await start({ workers: false });
+    const { job } = await seedJobRow(h, { status: "QUEUED", attempts: 0 });
+    // The claim's transaction fails (a timeout, an outage); what comes after it works again.
+    const prisma = h.deps.prisma;
+    let broken = 0;
+    const flaky = new Proxy(prisma, {
+      get(target, property) {
+        if (property === "$transaction" && broken > 0) {
+          broken -= 1;
+          return () =>
+            Promise.reject(new Error("Transaction API error: Transaction already closed"));
+        }
+        const value: unknown = Reflect.get(target, property, target);
+        return typeof value === "function" ? (value as () => unknown).bind(target) : value;
+      },
+    });
+    const deps = { ...h.deps, prisma: flaky };
+    const data = { publishJobId: job.id, attempt: 1 };
+
+    broken = 1;
+    await expect(runPublish(deps, data, { isLast: false })).rejects.toThrow(/Transaction/);
+    expect((await testDb().publishJob.findUniqueOrThrow({ where: { id: job.id } })).status).toBe(
+      "QUEUED",
+    );
+
+    broken = 1;
+    await expect(runPublish(deps, data, { isLast: true })).rejects.toThrow(/Transaction/);
+    expect(await testDb().publishJob.findUniqueOrThrow({ where: { id: job.id } })).toMatchObject({
+      status: "FAILED",
+      attempts: 1,
+      lastError:
+        "publishing couldn't start (Transaction API error: Transaction already closed); retry it",
+    });
+    expect((await alerts()).map((alert) => [alert.kind, alert.entityId])).toEqual([
+      ["stuck", job.id],
+    ]);
+  });
+
+  it("flags an approved post whose re-driven publisher.schedule gave up too, and stops re-driving it", async () => {
+    const h = await start({ workers: false });
+    const seeded = await seedMetaPlan(h, { platforms: ["INSTAGRAM"] });
+    const post = await testDb().post.create({
+      data: {
+        campaignId: seeded.campaignId,
+        clientId: seeded.client.id,
+        ref: "p9",
+        type: "STATIC",
+        platforms: ["INSTAGRAM"],
+        status: "APPROVED",
+        approvedAt: h.clock.now(),
+      },
+    });
+    await testDb().approvalRequest.create({
+      data: {
+        postId: post.id,
+        round: 1,
+        status: "APPROVED",
+        chain: [],
+        currentStep: 0,
+        contentHash: "fixture",
+        resolvedAt: h.clock.now(),
+      },
+    });
+    const agents = h.deps.queues.queue("agents");
+    const later = (minutes: number) =>
+      new Date(Date.parse(NOW) + minutes * MINUTE_MS).toISOString();
+
+    await tickAt(h, later(6));
+    const sweep = jobIds.publisherSchedule({ postId: post.id, round: 1 }, "sweep");
+    expect(await (await agents.getJob(sweep))?.getState()).toBe("waiting");
+    await failRun(h, sweep, "LLM budget store unreachable", "agents");
+
+    await tickAt(h, later(7));
+    const flagged = await testDb().post.findUniqueOrThrow({ where: { id: post.id } });
+    expect(flagged).toMatchObject({
+      status: "APPROVED",
+      needsAttention: true,
+      attentionReason: "The Publisher couldn't schedule it: LLM budget store unreachable",
+    });
+    expect(await alerts()).toEqual([
+      expect.objectContaining({
+        kind: "failed",
+        entityType: "Post",
+        entityId: post.id,
+        message:
+          "The Publisher couldn't schedule p9: LLM budget store unreachable. Pick its days on the calendar.",
+      }),
+    ]);
+    await tickAt(h, later(8));
+    expect(await agents.getJobCountByTypes("waiting", "delayed")).toBe(0);
+    expect(await alerts()).toHaveLength(1);
   });
 
   it("re-drives an approved post whose publisher.schedule never ran", async () => {
