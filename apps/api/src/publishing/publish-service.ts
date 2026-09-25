@@ -204,9 +204,9 @@ function onThisAttempt(job: { status: string; attempts: number }, attempt: numbe
 }
 
 /**
- * One transaction under the locks an edit takes (rounds, then the post): the guard, the payload,
- * then QUEUED → PUBLISHING. From then on the post is PUBLISHING, which no edit touches, so what
- * the guard passed is what goes out.
+ * One transaction under the locks an edit takes (rounds, then the post): the publish mode, the
+ * guard, the payload, then QUEUED → PUBLISHING with the mode stored. From then on the post is
+ * PUBLISHING, which no edit touches, so what the guard passed is what goes out.
  */
 async function claim(deps: Deps, data: PublishRunJob): Promise<Claim> {
   const events = new EventBatch();

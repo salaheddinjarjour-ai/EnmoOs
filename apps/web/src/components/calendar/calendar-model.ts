@@ -200,7 +200,13 @@ export function ghostNote(item: CalendarGhostItem): string {
     case "LIVE":
     case "SCORED":
       return `The post went out without ${platform}: nothing is scheduled there, and a post that is out can't be scheduled again.`;
-    default:
+    case "IDEA":
+    case "DRAFTING":
+    case "VISUALIZING":
+    case "ADAPTING":
+    case "QA":
+    case "CHANGES_REQUESTED":
+    case "PENDING_APPROVAL":
       return `The campaign plan puts this post here; nothing is scheduled yet. Once the post is approved, the Publisher picks its slot on ${platform}.`;
   }
 }
