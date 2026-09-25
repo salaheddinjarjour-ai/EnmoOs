@@ -810,6 +810,26 @@ NEXT_PUBLIC_API_URL=https://api.enmo.marketing pnpm --filter @enmo/web run deplo
 - The app uses no middleware and no image optimisation (`images.unoptimized`), because OpenNext on
   Workers supports neither Node middleware nor the Next image optimiser.
 
+**Deploying from the Cloudflare dashboard (Workers Builds / Git integration).** The repo is a pnpm
+monorepo, so the dashboard's defaults (`npm run build`, then `npx wrangler deploy` at the repo root)
+fail: the root has no Wrangler config, and a plain `next build` doesn't produce the Worker. In the
+Worker's _Settings → Build_, set:
+
+| Setting        | Value                                                                           |
+| -------------- | ------------------------------------------------------------------------------- |
+| Root directory | `/` (the repo root, so pnpm installs the whole workspace)                       |
+| Build command  | `pnpm --filter @enmo/web run build:cf`                                          |
+| Deploy command | `pnpm --filter @enmo/web exec wrangler deploy`                                  |
+| Build variable | `NEXT_PUBLIC_API_URL` = your API URL (defaults to `https://api.enmo.marketing`) |
+
+- The Worker's name in the dashboard must match `"name"` in `apps/web/wrangler.jsonc`
+  (`enmo-web`, also used by the `WORKER_SELF_REFERENCE` service binding). Rename one or the other.
+- The `app.enmo.marketing` custom domain needs the `enmo.marketing` zone in the same Cloudflare
+  account and no existing DNS record for `app`. Without that zone, remove `routes` from
+  `wrangler.jsonc` and the Worker deploys to its `workers.dev` address instead.
+- The web app only works end to end once the API is live: sign-in cookies are scoped to
+  `.enmo.marketing`, so the web app and API must be served from `app.` and `api.enmo.marketing`.
+
 ## Credentials needed later
 
 None of these block development: mocks and dry-run cover every integration. Put each one in the
