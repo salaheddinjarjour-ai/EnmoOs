@@ -1,6 +1,7 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "enmo-web",
+  // Must match the Worker's name in the Cloudflare dashboard (Workers Builds overrides it otherwise).
+  "name": "enmoos",
   // Custom entry: the OpenNext handler plus a cron that keeps the Render API awake.
   "main": "worker.ts",
   "compatibility_date": "2026-09-20",
@@ -13,10 +14,12 @@
     {
       // OpenNext self-reference binding; must match "name".
       "binding": "WORKER_SELF_REFERENCE",
-      "service": "enmo-web",
+      "service": "enmoos",
     },
   ],
-  "routes": [{ "pattern": "app.enmo.marketing", "custom_domain": true }],
+  // Serves on the Worker's workers.dev address. For app.enmo.marketing (needs the enmo.marketing
+  // zone in this Cloudflare account), add:
+  //   "routes": [{ "pattern": "app.enmo.marketing", "custom_domain": true }],
   "triggers": {
     // Render's free tier sleeps after 15 idle minutes.
     "crons": ["*/5 * * * *"],

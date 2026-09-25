@@ -663,11 +663,11 @@ Render redeploys each commit after CI passes (`autoDeployTrigger: checksPass`).
 
 **DNS and cookies.** Keep the `enmo.marketing` zone on Cloudflare DNS.
 
-| Host                    | Points to                               | Created by                                                      |
-| ----------------------- | --------------------------------------- | --------------------------------------------------------------- |
-| `app.enmo.marketing`    | Worker `enmo-web` (custom domain)       | `wrangler deploy` (`routes` in `apps/web/wrangler.jsonc`)       |
-| `api.enmo.marketing`    | `CNAME enmo-api.onrender.com`           | You, after Render lists the domain (`domains` in `render.yaml`) |
-| `assets.enmo.marketing` | R2 bucket `enmo-assets` (custom domain) | R2 → bucket → Settings → Custom Domains                         |
+| Host                    | Points to                               | Created by                                                                                 |
+| ----------------------- | --------------------------------------- | ------------------------------------------------------------------------------------------ |
+| `app.enmo.marketing`    | Worker `enmoos` (custom domain)         | Workers → `enmoos` → Settings → Domains & Routes, or `routes` in `apps/web/wrangler.jsonc` |
+| `api.enmo.marketing`    | `CNAME enmo-api.onrender.com`           | You, after Render lists the domain (`domains` in `render.yaml`)                            |
+| `assets.enmo.marketing` | R2 bucket `enmo-assets` (custom domain) | R2 → bucket → Settings → Custom Domains                                                    |
 
 The API sets `enmo_session` as `HttpOnly; Secure; SameSite=Lax; Domain=.enmo.marketing`.
 `app.` and `api.` are the same _site_, so the browser sends that cookie with the web app's
@@ -784,13 +784,15 @@ minutes to keep it awake.
 
 ### 4. Cloudflare Workers (web)
 
-`apps/web/wrangler.jsonc` sets up the Worker `enmo-web`:
+`apps/web/wrangler.jsonc` sets up the Worker `enmoos`:
 
 - entry `worker.ts`, which is the OpenNext handler plus a keep-alive cron
 - the flags `nodejs_compat` and `global_fetch_strictly_public`
 - static assets from `.open-next/assets`
-- the custom domain `app.enmo.marketing`
 - the cron `*/5 * * * *`, which pings `KEEPALIVE_URL`
+
+It serves on the Worker's `workers.dev` address. To put it on `app.enmo.marketing`, add the custom
+domain under the Worker's _Settings → Domains & Routes_, or uncomment `routes` in `wrangler.jsonc`.
 
 Deploy from a machine or CI job that has a Cloudflare API token. Create the token from the _Edit
 Cloudflare Workers_ template, with the `enmo.marketing` zone included:
@@ -822,11 +824,10 @@ Worker's _Settings → Build_, set:
 | Deploy command | `pnpm --filter @enmo/web exec wrangler deploy`                                  |
 | Build variable | `NEXT_PUBLIC_API_URL` = your API URL (defaults to `https://api.enmo.marketing`) |
 
-- The Worker's name in the dashboard must match `"name"` in `apps/web/wrangler.jsonc`
-  (`enmo-web`, also used by the `WORKER_SELF_REFERENCE` service binding). Rename one or the other.
+- The Worker's name in the dashboard must match `"name"` in `apps/web/wrangler.jsonc` (`enmoos`,
+  also used by the `WORKER_SELF_REFERENCE` service binding). If you rename the Worker, change both.
 - The `app.enmo.marketing` custom domain needs the `enmo.marketing` zone in the same Cloudflare
-  account and no existing DNS record for `app`. Without that zone, remove `routes` from
-  `wrangler.jsonc` and the Worker deploys to its `workers.dev` address instead.
+  account and no existing DNS record for `app`.
 - The web app only works end to end once the API is live: sign-in cookies are scoped to
   `.enmo.marketing`, so the web app and API must be served from `app.` and `api.enmo.marketing`.
 
