@@ -1,11 +1,12 @@
 "use client";
 
-import type { ReactNode } from "react";
+import { useCallback, useState, type ReactNode } from "react";
 import { BudgetMeter } from "@/components/dashboard/BudgetMeter";
 import { LiveStatus } from "@/components/dashboard/LiveStatus";
 import { Sidebar } from "@/components/ui/Sidebar";
 import { ToastProvider } from "@/components/ui/Toast";
 import { Topbar } from "@/components/ui/Topbar";
+import { useApprovals } from "@/hooks/useApprovals";
 import { AuthGate, useSession } from "@/lib/auth";
 import { RealtimeProvider } from "@/lib/realtime";
 import { SessionLoading, SessionUnavailable } from "./SessionScreens";
@@ -32,15 +33,27 @@ export function AppShell({ children }: { children: ReactNode }) {
 
 function SignedInLayout({ children }: { children: ReactNode }) {
   const { capabilities } = useSession();
+  const [navOpen, setNavOpen] = useState(false);
+  const openNav = useCallback(() => setNavOpen(true), []);
+  const closeNav = useCallback(() => setNavOpen(false), []);
+  // The same query as the Approvals Queue, so realtime approval events keep the count current.
+  const approvals = useApprovals();
+  const waitingOnViewer = approvals.data?.filter((request) => request.canDecide).length ?? 0;
+
   return (
     <div className="flex min-h-dvh">
-      <Sidebar capabilities={capabilities} />
+      <Sidebar
+        capabilities={capabilities}
+        counts={{ "/approvals": waitingOnViewer }}
+        mobileOpen={navOpen}
+        onMobileClose={closeNav}
+      />
       <div className="flex min-w-0 flex-1 flex-col">
-        <Topbar>
+        <Topbar onOpenNav={openNav} navOpen={navOpen}>
           <LiveStatus />
           <BudgetMeter />
         </Topbar>
-        <main className="flex-1 px-10 py-10">
+        <main className="flex-1 px-5 py-8 sm:px-8 lg:px-10 lg:py-10">
           <div className="mx-auto w-full max-w-6xl">{children}</div>
         </main>
       </div>
