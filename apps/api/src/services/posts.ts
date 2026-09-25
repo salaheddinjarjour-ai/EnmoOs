@@ -17,6 +17,7 @@ import {
   type CopyRuleErrorDetails,
   type PostDto,
   type PostListQuery,
+  type PostPlatformPublishDto,
   type PostStatus,
   type UpdatePostCopyRequest,
 } from "@enmo/shared";
@@ -38,6 +39,7 @@ import { advance } from "../orchestrator/graph";
 import { lockPost, shareLockCampaign } from "../orchestrator/locks";
 import { postUpdated, requireTransition } from "../orchestrator/post-status";
 import { refNumber } from "../orchestrator/progress";
+import { cancelScheduledForPost } from "../orchestrator/publishing";
 import { shotGaps } from "../orchestrator/takes";
 import { UNFINISHED_STATUSES } from "../orchestrator/tasks";
 import type { ServiceUser } from "./actor";
@@ -78,12 +80,31 @@ export const POST_INCLUDE = {
       durationSec: true,
     },
   },
+  // PostDto.publishing: each platform variant and its publish job.
+  variants: {
+    select: {
+      id: true,
+      platform: true,
+      publishJob: {
+        select: {
+          id: true,
+          status: true,
+          scheduledFor: true,
+          publishedAt: true,
+          liveUrl: true,
+          dryRun: true,
+          lastError: true,
+        },
+      },
+    },
+  },
   ...EDIT_STATE_INCLUDE,
 } as const satisfies Prisma.PostInclude;
 
 export type PostRow = Prisma.PostGetPayload<{ include: typeof POST_INCLUDE }>;
 type ApprovalRow = PostRow["approvalRequests"][number];
 type CurrentAssetRow = PostRow["assets"][number];
+type VariantRow = PostRow["variants"][number];
 
 /** Statuses whose content is already out in the world. */
 const PUBLISHED_STATUSES: ReadonlySet<PostStatus> = new Set(["PUBLISHING", "LIVE", "SCORED"]);
@@ -142,6 +163,28 @@ function approvalSummary(request: ApprovalRow, user: ServiceUser): ApprovalSumma
   };
 }
 
+/** One entry per platform of the post, in its `platforms` order, whether or not a variant exists. */
+function publishingOf(
+  platforms: readonly PostRow["platforms"][number][],
+  variants: readonly VariantRow[],
+): PostPlatformPublishDto[] {
+  return platforms.map((platform) => {
+    const variant = variants.find((candidate) => candidate.platform === platform);
+    const job = variant?.publishJob ?? null;
+    return {
+      platform,
+      variantId: variant?.id ?? null,
+      jobId: job?.id ?? null,
+      status: job?.status ?? null,
+      scheduledFor: job?.scheduledFor.toISOString() ?? null,
+      publishedAt: job?.publishedAt?.toISOString() ?? null,
+      liveUrl: job?.liveUrl ?? null,
+      dryRun: job?.dryRun ?? null,
+      lastError: job?.lastError ?? null,
+    };
+  });
+}
+
 function toAssetThumb(row: CurrentAssetRow): AssetThumbDto {
   const params = parseStored(AssetParams, row.params, `Asset ${row.id}.params`);
   return {
@@ -190,6 +233,7 @@ export function toPostDto(row: PostRow, user: ServiceUser): PostDto {
     qaNotes: row.qaNotes,
     approvedAt: row.approvedAt?.toISOString() ?? null,
     liveAt: row.liveAt?.toISOString() ?? null,
+    publishing: publishingOf(row.platforms, row.variants),
     currentApproval: latest ? approvalSummary(latest, user) : null,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
@@ -329,6 +373,8 @@ export async function editCopy(
         feedback: null,
         enabledActions: deps.config.PIPELINE_ACTIONS,
         now,
+        events,
+        cancelReason: "copyEdited",
       });
       const updated = await tx.post.update({ where: { id: postId }, data: edit });
       for (const round of revision.cancelled) approvalResolved(events, round, context);
@@ -339,10 +385,7 @@ export async function editCopy(
     const cancelled = await cancelOpenRounds(tx, postId, now);
     let updated = await tx.post.update({ where: { id: postId }, data: edit });
     if (cancelled.length > 0) {
-      await tx.publishJob.updateMany({
-        where: { variant: { postId }, status: { in: ["SCHEDULED", "QUEUED"] } },
-        data: { status: "CANCELLED" },
-      });
+      await cancelScheduledForPost(tx, events, postId, "copyEdited");
       updated = await requireTransition(tx, postId, "PENDING_APPROVAL", {
         approvedAt: null,
         needsAttention: false,

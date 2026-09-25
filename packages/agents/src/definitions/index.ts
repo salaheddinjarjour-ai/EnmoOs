@@ -7,6 +7,8 @@ import type {
   ManagerPlanOutput,
   ManagerQaInput,
   ManagerQaOutput,
+  PublisherInput,
+  PublisherOutput,
   VisualDirectInput,
   VisualDirectOutput,
   VisualReviewInput,
@@ -15,6 +17,7 @@ import type {
 import type { AgentDefinition } from "../definition";
 import { copywriterWrite } from "./copywriter";
 import { managerIntake, managerPlan, managerQa } from "./manager";
+import { publisherSchedule } from "./publisher";
 import { visualDirectorDirect, visualDirectorReview } from "./visual-director";
 
 export { copywriterWrite } from "./copywriter";
@@ -25,6 +28,7 @@ export {
   managerPlan,
   managerQa,
 } from "./manager";
+export { publisherSchedule } from "./publisher";
 export { visualDirectorDirect, visualDirectorReview } from "./visual-director";
 
 /** Every agent action the orchestrator runs, by `${agent}.${action}`. Later phases add theirs. */
@@ -35,6 +39,7 @@ export interface AgentDefinitions {
   "COPYWRITER.write": AgentDefinition<CopywriterInput, CopywriterOutput>;
   "VISUAL_DIRECTOR.direct": AgentDefinition<VisualDirectInput, VisualDirectOutput>;
   "VISUAL_DIRECTOR.review": AgentDefinition<VisualReviewInput, VisualReviewOutput>;
+  "PUBLISHER.schedule": AgentDefinition<PublisherInput, PublisherOutput>;
 }
 
 export type AgentKey = keyof AgentDefinitions;
@@ -48,6 +53,7 @@ export const AGENT_DEFINITIONS: AgentRegistry = {
   "COPYWRITER.write": copywriterWrite,
   "VISUAL_DIRECTOR.direct": visualDirectorDirect,
   "VISUAL_DIRECTOR.review": visualDirectorReview,
+  "PUBLISHER.schedule": publisherSchedule,
 };
 
 /** The definition for `key`; throws if it hasn't been registered. */

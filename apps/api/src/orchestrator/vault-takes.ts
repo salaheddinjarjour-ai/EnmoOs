@@ -17,6 +17,7 @@ import { EventBatch } from "./events";
 import { shareLockCampaign } from "./locks";
 import { FROZEN_POST_STATUSES, postUpdated, requireTransition } from "./post-status";
 import { reportProgress } from "./progress";
+import { cancelScheduledForPost } from "./publishing";
 import { failTake } from "./render-outcomes";
 import {
   assetUpdated,
@@ -317,10 +318,7 @@ async function reopenApproval(
   await shareLockCampaign(tx, post.campaignId);
   const cancelled = await cancelOpenRounds(tx, postId, deps.clock.now());
   if (cancelled.length === 0) return;
-  await tx.publishJob.updateMany({
-    where: { variant: { postId }, status: { in: ["SCHEDULED", "QUEUED"] } },
-    data: { status: "CANCELLED" },
-  });
+  await cancelScheduledForPost(tx, events, postId, "takeReplaced");
   const updated = await requireTransition(tx, postId, "PENDING_APPROVAL", { approvedAt: null });
   const request = await openApprovalRound(tx, updated);
   const context = { campaignId: updated.campaignId, clientId: updated.clientId };

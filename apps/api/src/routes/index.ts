@@ -5,14 +5,18 @@ import { approvalsRoutes } from "./approvals";
 import { assetsRoutes } from "./assets";
 import { authRoutes } from "./auth";
 import { budgetRoutes } from "./budget";
+import { calendarRoutes } from "./calendar";
 import { campaignsRoutes } from "./campaigns";
 import { capabilitiesRoutes } from "./capabilities";
 import { clientsRoutes } from "./clients";
+import { e2eHooksRoutes } from "./e2e-hooks";
 import { eventsRoutes } from "./events";
 import { filesRoutes } from "./files";
 import { healthRoutes } from "./health";
 import { invitesRoutes } from "./invites";
+import { oauthMetaRoutes } from "./oauth-meta";
 import { postsRoutes } from "./posts";
+import { publishJobsRoutes } from "./publish-jobs";
 import { socialAccountsRoutes } from "./social-accounts";
 import { taskGraphsRoutes } from "./task-graphs";
 import { threadsRoutes } from "./threads";
@@ -38,6 +42,12 @@ export const V1_ROUTES: readonly RouteModule[] = [
   eventsRoutes,
   // Phase 3
   assetsRoutes,
+  // Phase 4
+  calendarRoutes,
+  publishJobsRoutes,
+  oauthMetaRoutes,
+  // Browser-test hooks: registers nothing unless ENMO_E2E=1 outside production.
+  e2eHooksRoutes,
 ];
 
 export async function registerRoutes(app: ApiApp): Promise<void> {

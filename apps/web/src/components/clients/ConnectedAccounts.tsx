@@ -1,11 +1,6 @@
 "use client";
 
-import {
-  PLATFORM_LABEL,
-  type AccountStatus,
-  type ClientDto,
-  type SocialAccountDto,
-} from "@enmo/shared";
+import { type AccountStatus, type ClientDto, type SocialAccountDto } from "@enmo/shared";
 import { useState } from "react";
 import { Badge, type BadgeTone } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
@@ -21,14 +16,19 @@ import {
   useSocialAccounts,
 } from "@/hooks/useSocialAccounts";
 import { errorMessage } from "@/lib/api";
+import { accountNames, accountSource, scopeCheck, tokenExpiry } from "./accounts-model";
 import { ConnectAccountForm } from "./ConnectAccountForm";
+import { ConnectMetaButton } from "./ConnectMetaButton";
 import { EditorSection } from "./EditorFrame";
+import { OAuthResultNotice } from "./OAuthResultNotice";
 import { PLATFORM_DOT } from "./platforms";
 
 /*
- * Accounts tab: where the Publisher posts for this client. Everyone sees the list; only ADMINs
- * (socialAccounts.manage) connect, check and disconnect. Tokens are never displayed: the DTO has
- * no token fields.
+ * Accounts tab: where the Publisher posts for this client. Everyone sees the list: each account's
+ * platform, name, status, token expiry, last check and whether its token may publish. Only ADMINs
+ * (socialAccounts.manage) connect (Meta sign-in, or a pasted token), check and disconnect. Tokens
+ * are never displayed: the DTO has no token fields. Meta's sign-in comes back here with its result
+ * in the address (OAuthResultNotice).
  */
 
 const STATUS: Readonly<Record<AccountStatus, { tone: BadgeTone; label: string }>> = {
@@ -54,6 +54,7 @@ export function ConnectedAccounts({
 
   return (
     <div className="flex flex-col gap-12">
+      <OAuthResultNotice />
       <EditorSection
         title="Connected accounts"
         description="Pages and profiles the Publisher posts to. Tokens are encrypted at rest and never leave the API."
@@ -75,7 +76,7 @@ export function ConnectedAccounts({
         ) : accounts.data.length === 0 ? (
           <p className="rounded-lg border border-dashed border-line px-5 py-8 text-center text-sm text-steel">
             No accounts connected yet.{" "}
-            {canManage ? "Connect one below." : "An admin connects them."}
+            {canManage ? "Connect Meta, or paste a token below." : "An admin connects them."}
           </p>
         ) : (
           <ul aria-label="Connected accounts" className="flex flex-col gap-2">
@@ -92,22 +93,63 @@ export function ConnectedAccounts({
       </EditorSection>
 
       {canManage ? (
-        <EditorSection
-          title="Connect manually"
-          description="Until OAuth sign-in is available, paste a long-lived page or account token. It is stored encrypted and never shown again."
-        >
-          <ConnectAccountForm
-            key={formGeneration}
-            client={client}
-            onConnected={() => setFormGeneration((value) => value + 1)}
-          />
-        </EditorSection>
+        <>
+          <EditorSection
+            title="Connect with Meta"
+            description="Sign in with Facebook and tick this client's Pages. Each Page, and the Instagram business account linked to it, is connected with a long-lived token."
+          >
+            <ConnectMetaButton clientId={client.id} />
+          </EditorSection>
+          <EditorSection
+            title="Connect manually"
+            description="Or paste a long-lived page or account token (a Meta system user's, say, or TikTok's until its sign-in arrives). It is stored encrypted and never shown again."
+          >
+            <ConnectAccountForm
+              key={formGeneration}
+              client={client}
+              onConnected={() => setFormGeneration((value) => value + 1)}
+            />
+          </EditorSection>
+        </>
       ) : (
         <p className="border-t border-line pt-5 font-mono text-[11px] uppercase tracking-[0.16em] text-steel">
           {readOnlyReason ?? "Only admins connect and disconnect accounts"}
         </p>
       )}
     </div>
+  );
+}
+
+function TokenLine({ account }: { account: SocialAccountDto }) {
+  const expiry = tokenExpiry(account);
+  switch (expiry.kind) {
+    case "never":
+      return <dd>no expiry</dd>;
+    case "valid":
+      return <dd>expires {formatDate(expiry.at)}</dd>;
+    case "soon":
+      return <dd className="text-amber-200">expires {formatDate(expiry.at)}</dd>;
+    case "expired":
+      return <dd className="text-red-300">expired {formatDate(expiry.at)}</dd>;
+  }
+}
+
+function ScopeNote({ account }: { account: SocialAccountDto }) {
+  const check = scopeCheck(account);
+  if (check.kind === "ok") return null;
+  if (check.kind === "unknown") {
+    return (
+      <p className="w-full font-mono text-[11px] text-steel">
+        Permissions unknown: none were recorded with this token.
+      </p>
+    );
+  }
+  return (
+    <p className="w-full text-xs text-amber-200">
+      Can&apos;t publish yet: missing{" "}
+      <span className="font-mono text-[11px]">{check.scopes.join(", ")}</span>. Connect it again and
+      grant them.
+    </p>
   );
 }
 
@@ -125,7 +167,9 @@ function AccountRow({
   const disconnect = useDisconnectSocialAccount(clientId);
   const [confirming, setConfirming] = useState(false);
   const status = STATUS[account.status];
-  const handle = `@${account.handle}`;
+  const names = accountNames(account);
+  const source = accountSource(account);
+  const name = names.primary;
 
   return (
     <li className="flex flex-wrap items-center gap-x-5 gap-y-3 rounded-lg border border-line bg-panel px-4 py-3.5">
@@ -134,9 +178,10 @@ function AccountRow({
         className={cx("size-2 shrink-0 rounded-full", PLATFORM_DOT[account.platform])}
       />
       <div className="flex min-w-0 flex-col">
-        <span className="truncate text-sm text-paper">{handle}</span>
+        <span className="truncate text-sm text-paper">{name}</span>
         <span className="truncate font-mono text-[11px] text-steel">
-          {PLATFORM_LABEL[account.platform]} · {account.displayName ?? account.externalId}
+          {names.secondary}
+          {source ? ` · ${source}` : ""}
         </span>
       </div>
       <Badge tone={status.tone} dot>
@@ -145,9 +190,7 @@ function AccountRow({
       <dl className="flex flex-col font-mono text-[11px] text-steel sm:ml-auto sm:items-end">
         <div className="flex gap-1.5">
           <dt>Token</dt>
-          <dd>
-            {account.tokenExpiresAt ? `expires ${formatDate(account.tokenExpiresAt)}` : "no expiry"}
-          </dd>
+          <TokenLine account={account} />
         </div>
         <div className="flex gap-1.5">
           <dt>Checked</dt>
@@ -158,16 +201,16 @@ function AccountRow({
         <div className="flex items-center gap-2">
           <Button
             size="sm"
-            aria-label={`Check ${handle}`}
+            aria-label={`Check ${name}`}
             loading={check.isPending}
             onClick={() =>
               check.mutate(account.id, {
                 onSuccess: (checked) =>
                   toast.show({
-                    title: `${handle} is ${STATUS[checked.status].label.toLowerCase()}`,
+                    title: `${name} is ${STATUS[checked.status].label.toLowerCase()}`,
                     tone: checked.status === "ACTIVE" ? "success" : "error",
                   }),
-                onError: (error) => toast.error(`Couldn't check ${handle}`, errorMessage(error)),
+                onError: (error) => toast.error(`Couldn't check ${name}`, errorMessage(error)),
               })
             }
           >
@@ -176,17 +219,18 @@ function AccountRow({
           <Button
             size="sm"
             variant="danger"
-            aria-label={`Disconnect ${handle}`}
+            aria-label={`Disconnect ${name}`}
             onClick={() => setConfirming(true)}
           >
             Disconnect
           </Button>
         </div>
       ) : null}
+      <ScopeNote account={account} />
       <ConfirmDialog
         open={confirming}
         onClose={() => setConfirming(false)}
-        title={`Disconnect ${handle}?`}
+        title={`Disconnect ${name}?`}
         description="Its token is deleted and scheduled posts for this account stop until it is connected again."
         confirmLabel="Disconnect"
         pending={disconnect.isPending}
@@ -195,7 +239,7 @@ function AccountRow({
           disconnect.mutate(account.id, {
             onSuccess: () => {
               setConfirming(false);
-              toast.success(`${handle} disconnected`);
+              toast.success(`${name} disconnected`);
             },
           })
         }

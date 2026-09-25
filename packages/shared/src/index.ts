@@ -15,6 +15,7 @@ export * from "./contracts/common";
 export * from "./contracts/manager";
 export * from "./contracts/copywriter";
 export * from "./contracts/visual-director";
+export * from "./contracts/publisher";
 
 export * from "./dto/common";
 export * from "./dto/user";
@@ -32,3 +33,6 @@ export * from "./dto/approval";
 export * from "./dto/budget";
 export * from "./dto/agent-task";
 export * from "./dto/asset";
+export * from "./dto/publish-job";
+export * from "./dto/calendar";
+export * from "./dto/oauth";

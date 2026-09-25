@@ -1,7 +1,8 @@
 import { defineConfig } from "vitest/config";
 
 /*
- * unit:        src/**\/*.test.ts, no services needed.
+ * unit:        src/**\/*.test.ts, no services needed; test/contract: the real provider code against
+ *              the fake platform servers in test/fakes (DESIGN §H "Contract fakes").
  * integration: test/integration + test/e2e against real Postgres (TEST_DATABASE_URL, default the
  *              local enmo_test; see test/helpers/databases.ts) and Redis. Migrated once by the
  *              global setup; test/setup.ts truncates every table before each test. One file at a
@@ -14,7 +15,7 @@ export default defineConfig({
         extends: true,
         test: {
           name: "unit",
-          include: ["src/**/*.test.ts"],
+          include: ["src/**/*.test.ts", "test/contract/**/*.test.ts"],
           env: { NODE_ENV: "test" },
         },
       },

@@ -6,8 +6,10 @@ import {
   type Platform,
   type SocialAccountDto,
 } from "@enmo/shared";
+import { isMetaPlatform, OAuthError, type TokenInfo } from "@enmo/providers";
+import type { OAuthProviders } from "../deps";
 import { TokenCryptoError, type TokenCipher } from "../lib/crypto";
-import { conflict, notFound } from "../lib/errors";
+import { AppError, conflict, notFound } from "../lib/errors";
 import {
   auditChange,
   AUDITED_ENTITY,
@@ -113,6 +115,29 @@ export const verifyByExpiry: AccountVerifier = ({ account, tokens, now }) => {
   // Only the platform (or a reconnect) can clear a revocation it reported.
   return Promise.resolve(status === "ACTIVE" && account.status === "REVOKED" ? "REVOKED" : status);
 };
+
+/**
+ * Asks the platform about the token where an OAuth provider can (Meta's debug_token): valid means
+ * ACTIVE (clearing a revocation it reported earlier), invalid means EXPIRED or REVOKED. Other
+ * platforms, and Meta without its app configured, fall back to the stored expiry.
+ */
+export function verifyWithPlatform(oauth: Pick<OAuthProviders, "meta">): AccountVerifier {
+  return async (input) => {
+    const byExpiry = await verifyByExpiry(input);
+    if (byExpiry === "EXPIRED" || !isMetaPlatform(input.account.platform)) return byExpiry;
+    let info: TokenInfo;
+    try {
+      info = await oauth.meta.debugToken(input.tokens.accessToken);
+    } catch (error) {
+      if (error instanceof OAuthError && error.code === "NOT_CONFIGURED") return byExpiry;
+      const message = "Meta couldn't be reached to check the token; try again shortly";
+      throw new AppError("UNAVAILABLE", message, { cause: error });
+    }
+    if (info.valid) return "ACTIVE";
+    const lapsed = info.expiresAt !== null && info.expiresAt.getTime() <= input.now.getTime();
+    return lapsed ? "EXPIRED" : "REVOKED";
+  };
+}
 
 // ── Service ─────────────────────────────────────────────────────────────────
 

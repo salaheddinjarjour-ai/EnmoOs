@@ -2,7 +2,7 @@
 
 import type { ClientDto } from "@enmo/shared";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { useState } from "react";
 import { PageHeader } from "@/components/shell/PageHeader";
 import { Badge } from "@/components/ui/Badge";
@@ -68,6 +68,8 @@ const sliceKey = (value: unknown) => JSON.stringify(value);
 
 function ClientDetail({ client }: { client: ClientDto }) {
   const router = useRouter();
+  // `?tab=accounts`: where Meta's sign-in comes back to (OAuthResultNotice reads the rest).
+  const initialTab = useSearchParams().get("tab") ?? undefined;
   const toast = useToast();
   const canWrite = useCan("clients.write");
   const canArchive = useCan("clients.archive");
@@ -122,6 +124,7 @@ function ClientDetail({ client }: { client: ClientDto }) {
       <Tabs
         label="Client settings"
         keepMounted
+        defaultValue={initialTab}
         items={[
           {
             id: "brand-voice",

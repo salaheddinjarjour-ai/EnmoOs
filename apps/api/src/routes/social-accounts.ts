@@ -11,6 +11,7 @@ import {
   connectSocialAccount,
   disconnectSocialAccount,
   listSocialAccounts,
+  verifyWithPlatform,
 } from "../services/social-accounts";
 import type { RouteModule } from "../types";
 import { actorOf } from "./clients";
@@ -21,7 +22,8 @@ import { actorOf } from "./clients";
  *   DELETE /social-accounts/:id · POST /social-accounts/:id/check
  */
 export const socialAccountsRoutes: RouteModule = (app) => {
-  const { prisma, clock, tokenCipher: cipher } = app.deps;
+  const { prisma, clock, tokenCipher: cipher, oauth } = app.deps;
+  const verify = verifyWithPlatform(oauth);
 
   app.get(
     "/clients/:id/social-accounts",
@@ -72,6 +74,7 @@ export const socialAccountsRoutes: RouteModule = (app) => {
         cipher,
         actor: actorOf(request),
         now: clock.now(),
+        verify,
       }),
   );
 };

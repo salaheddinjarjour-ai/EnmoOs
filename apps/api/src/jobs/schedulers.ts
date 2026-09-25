@@ -1,5 +1,5 @@
 import type { RepeatOptions } from "bullmq";
-import { DAY_MS, MINUTE_MS } from "../lib/clock";
+import { DAY_MS, HOUR_MS, MINUTE_MS } from "../lib/clock";
 import type { Logger } from "../lib/logger";
 import { JOB, JOB_OPTIONS, JOB_QUEUE, type JobQueues, type TickJobName } from "./queues";
 
@@ -7,8 +7,8 @@ import { JOB, JOB_OPTIONS, JOB_QUEUE, type JobQueues, type TickJobName } from ".
  * The scheduler ticks (DESIGN §D "Queues and schedulers"), registered with upsertJobScheduler on
  * worker boot unless SCHEDULERS_ENABLED=false (tests call the tick processors directly). Upserting
  * is idempotent, so every worker process may register them; the scheduler id is the job name, so
- * a changed interval replaces the old schedule instead of adding a second one. Later phases add
- * tick.publish, tick.metrics, tick.tokens and tick.analyst here.
+ * a changed interval replaces the old schedule instead of adding a second one. Phase 6 adds
+ * tick.metrics and tick.analyst here.
  */
 
 export interface TickSchedule {
@@ -19,6 +19,8 @@ export interface TickSchedule {
 export const TICK_SCHEDULES: readonly TickSchedule[] = [
   { name: JOB.tickSweeper, repeat: { every: 5 * MINUTE_MS } },
   { name: JOB.tickPrune, repeat: { every: DAY_MS } },
+  { name: JOB.tickPublish, repeat: { every: MINUTE_MS } },
+  { name: JOB.tickTokens, repeat: { every: HOUR_MS } },
 ];
 
 export async function registerSchedulers(queues: JobQueues, logger: Logger): Promise<void> {

@@ -41,6 +41,9 @@ export const DEFAULT_PIPELINE_ACTIONS: readonly PipelineAction[] = ["write", "di
  */
 export const LOCAL_FILES_PATH = "/files";
 
+/** Where the API receives Meta's OAuth redirect (routes/oauth-meta.ts serves it). */
+export const META_OAUTH_CALLBACK_PATH = "/v1/oauth/meta/callback";
+
 /** Public base of the R2 bucket's custom domain (DESIGN §F). */
 export const DEFAULT_R2_PUBLIC_BASE_URL = "https://assets.enmo.marketing";
 
@@ -51,6 +54,8 @@ const secret = z.string().trim().min(1);
 const EffortLevel = z.enum(EFFORT_LEVELS);
 
 const HttpUrl = z.url({ protocol: /^https?$/ }).transform((url) => url.replace(/\/+$/, ""));
+/** Taken verbatim: OAuth providers compare the redirect URI byte for byte with the registered one. */
+const ExactHttpUrl = z.url({ protocol: /^https?$/ });
 
 const Origin = z.string().refine((value) => {
   try {
@@ -216,7 +221,13 @@ const EnvSchema = z.object({
   R2_PUBLIC_BASE_URL: HttpUrl.default(DEFAULT_R2_PUBLIC_BASE_URL),
 
   // ── Publishing ──
+  /**
+   * "live" publishes for real, but only on platforms whose app credentials are set and only for
+   * clients with a connected account there; everything else stays a dry run (DESIGN §F).
+   */
   PUBLISH_MODE: PublishMode.default("dry-run"),
+  /** Where the OAuth callback sends the browser back to; defaults to APP_ORIGINS' first entry. */
+  APP_PUBLIC_URL: HttpUrl.optional(),
   META_APP_ID: secret.optional(),
   META_APP_SECRET: secret.optional(),
   META_GRAPH_VERSION: z
@@ -224,6 +235,21 @@ const EnvSchema = z.object({
     .regex(/^v\d+\.\d+$/)
     .default("v26.0"),
   META_GRAPH_BASE_URL: HttpUrl.default("https://graph.facebook.com"),
+  /** Facebook Reels uploads; its own host, so tests aim it at the fake Graph server too. */
+  META_RUPLOAD_BASE_URL: HttpUrl.default("https://rupload.facebook.com"),
+  /** Host of the OAuth consent dialog (`/{version}/dialog/oauth`). */
+  META_OAUTH_DIALOG_URL: HttpUrl.default("https://www.facebook.com"),
+  /**
+   * The callback registered with the Meta app; defaults to API_PUBLIC_URL/v1/oauth/meta/callback.
+   * Meta compares it byte for byte, so it is used exactly as given.
+   */
+  META_REDIRECT_URI: ExactHttpUrl.optional(),
+  /** How long to wait between two checks of media the platform is still processing. */
+  PUBLISH_POLL_INTERVAL_SEC: int(1, 300).default(10),
+  /** How long a publish may wait on the platform's processing before it fails. */
+  PUBLISH_POLL_MAX_MIN: int(1, 24 * 60).default(10),
+  /** Publish attempts per PublishJob (the first one included) before it fails for good. */
+  PUBLISH_MAX_ATTEMPTS: int(1, 10).default(3),
   TIKTOK_CLIENT_KEY: secret.optional(),
   TIKTOK_CLIENT_SECRET: secret.optional(),
   TIKTOK_API_BASE_URL: HttpUrl.default("https://open.tiktokapis.com"),
@@ -284,6 +310,28 @@ function resolveHiggsfieldKeys(env: Env) {
     keySecret: env.HIGGSFIELD_KEY_SECRET,
     problems,
   };
+}
+
+const metaCredentialsSet = (env: Env) => Boolean(env.META_APP_ID && env.META_APP_SECRET);
+const tiktokCredentialsSet = (env: Env) =>
+  Boolean(env.TIKTOK_CLIENT_KEY && env.TIKTOK_CLIENT_SECRET);
+
+/**
+ * Live publishing is decided per platform (a platform without its app credentials stays a dry
+ * run), so "live" with no credentials at all would silently publish nothing; half a Meta app
+ * would do the same and fail every OAuth connect.
+ */
+function publishingProblems(env: Env): string[] {
+  const problems: string[] = [];
+  if (Boolean(env.META_APP_ID) !== Boolean(env.META_APP_SECRET)) {
+    problems.push("Set both META_APP_ID and META_APP_SECRET, or neither");
+  }
+  if (env.PUBLISH_MODE === "live" && !metaCredentialsSet(env) && !tiktokCredentialsSet(env)) {
+    problems.push(
+      "PUBLISH_MODE=live needs a platform's app credentials (META_APP_ID + META_APP_SECRET, or TIKTOK_CLIENT_KEY + TIKTOK_CLIENT_SECRET); platforms without them stay in dry-run",
+    );
+  }
+  return problems;
 }
 
 /** The AGENT_EFFORT_<AGENT> values that are set. */
@@ -357,6 +405,7 @@ function resolveConfig(env: Env) {
       "TRUST_PROXY=true lets any client choose its IP; list the proxies instead (Render: loopback,uniquelocal,cloudflare)",
     );
   }
+  problems.push(...publishingProblems(env));
   if (Boolean(env.SEED_ADMIN_EMAIL) !== Boolean(env.SEED_ADMIN_PASSWORD)) {
     problems.push("Set both SEED_ADMIN_EMAIL and SEED_ADMIN_PASSWORD, or neither");
   }
@@ -374,6 +423,8 @@ function resolveConfig(env: Env) {
   }
 
   const apiPublicUrl = env.API_PUBLIC_URL ?? `http://localhost:${env.PORT}`;
+  // APP_ORIGINS' schema guarantees at least one entry.
+  const appPublicUrl: string = env.APP_PUBLIC_URL ?? (env.APP_ORIGINS[0] as string);
   return Object.freeze({
     ...env,
     LOG_LEVEL: env.LOG_LEVEL ?? (isTest ? "silent" : "info"),
@@ -385,6 +436,8 @@ function resolveConfig(env: Env) {
     /** AGENT_EFFORT_<AGENT> overrides by agent; unset agents keep their definition's effort. */
     AGENT_EFFORT: agentEffortOverrides(env),
     API_PUBLIC_URL: apiPublicUrl,
+    APP_PUBLIC_URL: appPublicUrl,
+    META_REDIRECT_URI: env.META_REDIRECT_URI ?? `${apiPublicUrl}${META_OAUTH_CALLBACK_PATH}`,
     HIGGSFIELD_KEY_ID: higgsfield.keyId,
     HIGGSFIELD_KEY_SECRET: higgsfield.keySecret,
     PUBLIC_ASSET_BASE_URL: env.PUBLIC_ASSET_BASE_URL ?? `${apiPublicUrl}${LOCAL_FILES_PATH}`,

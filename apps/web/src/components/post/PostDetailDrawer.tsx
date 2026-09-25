@@ -9,6 +9,7 @@ import {
 } from "@enmo/shared";
 import Link from "next/link";
 import { useEffect, useId, useRef, useState, type ReactNode } from "react";
+import { viewerTimeZone } from "@/components/calendar/zoned-time";
 import { Badge } from "@/components/ui/Badge";
 import { cx } from "@/components/ui/cx";
 import { frameSizeOf, isVideoTake } from "@/components/vault/media";
@@ -21,12 +22,15 @@ import { CopyEditor } from "./CopyEditor";
 import { PlatformChips, PostTypeChip } from "./PlatformChips";
 import { canEditPost, PostActions } from "./PostActions";
 import { PostPreview } from "./PostPreview";
+import { hasPublishing } from "./publishing";
+import { PublishStatusList } from "./PublishStatus";
 import { StatusPill } from "./StatusPill";
 
 /*
  * Everything about one post in a side sheet: the preview, its shots (the current take of each,
  * linked to the Vault), the full copy (captions per platform, script scenes, slides, on-screen
- * text), QA notes and where its approval stands, with the same actions as the card. "Edit" swaps
+ * text), QA notes, where its approval stands and, once scheduled, each platform's publish state
+ * (live link, dry run, last error), with the same actions as the card. "Edit" swaps
  * the reading view for the CopyEditor in place. Built on the native <dialog> (focus trap, Escape,
  * inert page) like ui/Dialog, anchored to the right edge.
  */
@@ -175,6 +179,15 @@ function DrawerBody({
                 {post.qaNotes ? (
                   <Detail label="Manager QA">
                     <p className="text-sm leading-relaxed text-paper/90">{post.qaNotes}</p>
+                  </Detail>
+                ) : null}
+                {hasPublishing(post.publishing) ? (
+                  <Detail label="Publishing">
+                    <PublishStatusList
+                      publishing={post.publishing}
+                      timeZone={client.data?.timezone ?? viewerTimeZone()}
+                      detailed
+                    />
                   </Detail>
                 ) : null}
                 <PostActions post={post} onEdit={() => setMode("edit")} />

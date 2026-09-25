@@ -1,14 +1,14 @@
 import type { Metadata } from "next";
-import { ScreenPlaceholder } from "@/components/shell/ScreenPlaceholder";
+import { Suspense } from "react";
+import { CalendarScreen } from "@/components/calendar/CalendarScreen";
 
 export const metadata: Metadata = { title: "Calendar" };
 
+/* The screen reads its month and client filter from the address, which only the browser knows. */
 export default function CalendarPage() {
   return (
-    <ScreenPlaceholder
-      eyebrow="Calendar · Phase 4"
-      title="Every slot, every client."
-      description="A month across all clients, colour-coded by platform. Drag to reschedule and the Publisher re-optimises the slot."
-    />
+    <Suspense>
+      <CalendarScreen />
+    </Suspense>
   );
 }

@@ -1,10 +1,15 @@
 import { managerIntakeProcessor } from "./processors/manager-intake";
 import { managerPlanProcessor } from "./processors/manager-plan";
+import { publishPollProcessor } from "./processors/publish-poll";
+import { publishRunProcessor } from "./processors/publish-run";
+import { publisherScheduleProcessor } from "./processors/publisher-schedule";
 import { renderPollProcessor } from "./processors/render-poll";
 import { renderSubmitProcessor } from "./processors/render-submit";
 import { taskRunProcessor } from "./processors/task-run";
 import { tickPruneProcessor } from "./processors/tick-prune";
+import { tickPublishProcessor } from "./processors/tick-publish";
 import { tickSweeperProcessor } from "./processors/tick-sweeper";
+import { tickTokensProcessor } from "./processors/tick-tokens";
 import { visualRegenerateProcessor } from "./processors/visual-regenerate";
 import { visualReviewProcessor } from "./processors/visual-review";
 import { JOB, QUEUE_NAMES, type QueueName } from "./queues";
@@ -30,14 +35,19 @@ export const processors: ProcessorRegistry = {
     [JOB.taskRun]: taskRunProcessor,
     [JOB.visualReview]: visualReviewProcessor,
     [JOB.visualRegenerate]: visualRegenerateProcessor,
+    [JOB.publisherSchedule]: publisherScheduleProcessor,
   },
   media: {
     [JOB.renderSubmit]: renderSubmitProcessor,
     [JOB.renderPoll]: renderPollProcessor,
   },
   ops: {
+    [JOB.publishRun]: publishRunProcessor,
+    [JOB.publishPoll]: publishPollProcessor,
     [JOB.tickSweeper]: tickSweeperProcessor,
     [JOB.tickPrune]: tickPruneProcessor,
+    [JOB.tickPublish]: tickPublishProcessor,
+    [JOB.tickTokens]: tickTokensProcessor,
   },
 };
 

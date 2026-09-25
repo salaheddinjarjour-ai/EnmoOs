@@ -3,12 +3,14 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { Storage, VisualProvider } from "@enmo/providers";
+import type { PublishMode } from "@enmo/shared";
 import { buildApp } from "../../src/app";
 import { loadConfig, TEST_TOKEN_ENC_KEY, type Config, type EnvSource } from "../../src/config";
-import { createDeps, type Deps } from "../../src/deps";
+import { createDeps, type Deps, type DepsOverrides } from "../../src/deps";
 import { FakeClock } from "../../src/lib/clock";
 import type { Logger } from "../../src/lib/logger";
 import type { ApiApp, RouteModule } from "../../src/types";
+import { fakeGraphEnv } from "../fakes/meta-graph";
 import { LOCAL_REDIS_URL } from "./databases";
 import { integrationDatabaseUrl } from "./db";
 
@@ -54,6 +56,38 @@ export function testConfig(overrides: EnvSource = {}): Config {
   return loadConfig(testEnv(overrides));
 }
 
+/** How a test app or harness publishes (both default to dry-run with no Meta app). */
+export interface PublishingOptions {
+  /** PUBLISH_MODE; `env` may set it too. */
+  publishMode?: PublishMode;
+  /**
+   * One base URL for every Meta host (Graph, rupload, the OAuth dialog), e.g. a startFakeGraph()
+   * url. Also configures the fake's Meta app (fakeGraphEnv), so live Meta publishing and OAuth
+   * are available.
+   */
+  metaBaseUrl?: string;
+  /** Replaces the publishers of the platforms listed; the others follow PUBLISH_MODE. */
+  publishers?: DepsOverrides["publishers"];
+  /** Replaces the OAuth providers listed. */
+  oauth?: DepsOverrides["oauth"];
+}
+
+/** The env PublishingOptions stand for (applied before the caller's own `env`). */
+export function publishingEnv(options: PublishingOptions): EnvSource {
+  return {
+    ...(options.publishMode ? { PUBLISH_MODE: options.publishMode } : {}),
+    ...(options.metaBaseUrl ? fakeGraphEnv(options.metaBaseUrl) : {}),
+  };
+}
+
+/** The deps overrides PublishingOptions stand for. */
+export function publishingOverrides(options: PublishingOptions): DepsOverrides {
+  return {
+    ...(options.publishers ? { publishers: options.publishers } : {}),
+    ...(options.oauth ? { oauth: options.oauth } : {}),
+  };
+}
+
 export interface TestApp {
   app: ApiApp;
   deps: Deps;
@@ -63,7 +97,7 @@ export interface TestApp {
   close(): Promise<void>;
 }
 
-export interface BuildTestAppOptions {
+export interface BuildTestAppOptions extends PublishingOptions {
   /** Env overrides on top of testEnv(), e.g. { SESSION_TTL_DAYS: "1" }. */
   env?: EnvSource;
   clock?: FakeClock;
@@ -75,18 +109,26 @@ export interface BuildTestAppOptions {
   visual?: VisualProvider;
   /** Replaces the Storage STORAGE_DRIVER builds (LocalStorage in `storageDir`). */
   storage?: Storage;
+  /** deps.fetch: what the providers (publishers, OAuth) call through. */
+  fetch?: typeof globalThis.fetch;
 }
 
 /** A ready app wired to the test database and Redis, with a FakeClock. Call close() in afterAll. */
 export async function buildTestApp(options: BuildTestAppOptions = {}): Promise<TestApp> {
   const clock = options.clock ?? new FakeClock();
   const tempDir = await createTempStorageDir();
-  const config = testConfig({ STORAGE_LOCAL_DIR: tempDir.path, ...options.env });
+  const config = testConfig({
+    STORAGE_LOCAL_DIR: tempDir.path,
+    ...publishingEnv(options),
+    ...options.env,
+  });
   const deps = createDeps(config, {
     clock,
     ...(options.logger ? { logger: options.logger } : {}),
     ...(options.visual ? { visual: options.visual } : {}),
     ...(options.storage ? { storage: options.storage } : {}),
+    ...(options.fetch ? { fetch: options.fetch } : {}),
+    ...publishingOverrides(options),
   });
   try {
     const app = await buildApp(deps);

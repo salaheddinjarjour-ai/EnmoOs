@@ -19,20 +19,27 @@ import { processorFor, processors } from "../../src/jobs/registry";
 import { startWorkers, type WorkerRuntime } from "../../src/jobs/runtime";
 import { DAY_MS, FakeClock } from "../../src/lib/clock";
 import type { ApiApp, RouteModule } from "../../src/types";
-import { createTempStorageDir, testConfig } from "./app";
+import {
+  createTempStorageDir,
+  publishingEnv,
+  publishingOverrides,
+  testConfig,
+  type PublishingOptions,
+} from "./app";
 import { testDb } from "./db";
 import { createClient, createUser } from "./factories";
 
 /*
  * The pipeline e2e harness (DESIGN §H "Pipeline e2e", test/e2e/phaseN.*): the real app listening
  * on a free port, in-process queue workers on a unique BULLMQ_PREFIX, the MockLlm (fault
- * injection through env MOCK_LLM_FAULTS), MockProvider, LocalStorage in a temporary directory and
- * a FakeClock. Scheduler ticks never fire on their own (SCHEDULERS_ENABLED=false); tests call
- * runTick(). Runs in the vitest "integration" project, whose setup truncates every table before
- * each test.
+ * injection through env MOCK_LLM_FAULTS), MockProvider, LocalStorage in a temporary directory,
+ * dry-run publishers (or, with `publishMode: "live"` and `metaBaseUrl`, the real Meta publisher
+ * against a fake Graph server) and a FakeClock. Scheduler ticks never fire on their own
+ * (SCHEDULERS_ENABLED=false); tests call runTick(). Runs in the vitest "integration" project,
+ * whose setup truncates every table before each test.
  */
 
-export interface HarnessOptions {
+export interface HarnessOptions extends PublishingOptions {
   /**
    * Env overrides on top of testEnv() (test/helpers/app.ts), e.g.
    * { MOCK_LLM_FAULTS: "COPYWRITER.write:invalid*2" } or { DAILY_TOKEN_CAP: "1" }.
@@ -129,6 +136,7 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
     config = testConfig({
       STORAGE_LOCAL_DIR: tempDir.path,
       ...(options.pipeline ? { PIPELINE_ACTIONS: options.pipeline.join(",") } : {}),
+      ...publishingEnv(options),
       ...options.env,
       SCHEDULERS_ENABLED: "false",
     });
@@ -138,6 +146,7 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
       ...(options.visual ? { visual: options.visual } : {}),
       ...(options.storage ? { storage: options.storage } : {}),
       ...(options.fetch ? { fetch: options.fetch } : {}),
+      ...publishingOverrides(options),
     });
   } catch (error) {
     await tempDir.remove();

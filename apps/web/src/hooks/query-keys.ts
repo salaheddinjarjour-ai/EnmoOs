@@ -1,6 +1,7 @@
 import type {
   ApprovalListQuery,
   AssetListQuery,
+  CalendarQuery,
   CampaignListQuery,
   PostListQuery,
 } from "@enmo/shared";
@@ -62,4 +63,18 @@ export const queryKeys = {
     list: (filters: ApprovalListQuery = {}) => ["approvals", "list", filters] as const,
   },
   budget: ["budget"] as const,
+  /** GET /calendar: publish jobs and ghost slots over a range of client-local days. */
+  calendar: {
+    all: ["calendar"] as const,
+    range: (query: CalendarQuery) => ["calendar", "range", query] as const,
+  },
+  /**
+   * PATCH /publish-jobs/:id and its retry/cancel: no GET of its own (jobs reach the web on
+   * calendar items and PostDto.publishing), so this root is the reschedule, retry and cancel
+   * mutations' `mutationKey`, letting the calendar hold refetches while a drag is in flight.
+   */
+  publishJobs: {
+    all: ["publish-jobs"] as const,
+    detail: (jobId: string) => ["publish-jobs", jobId] as const,
+  },
 };

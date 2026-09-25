@@ -5,6 +5,7 @@ import {
   ManagerIntakeInput,
   ManagerPlanInput,
   ManagerQaInput,
+  PublisherInput,
   VisualDirectInput,
   VisualReviewInput,
   type Brief,
@@ -16,6 +17,7 @@ import { mockCopy, mockCopyWithBannedWord } from "./copywriter";
 import { faultAt, parseMockFaults, type MockFault, type MockFaultKind } from "./faults";
 import { mockIntake } from "./intake";
 import { mockPlan } from "./plan";
+import { mockPublisherSchedule, publisherSubject } from "./publisher";
 import { mockQa, mockWeakQa } from "./qa";
 import { hashOf } from "./seed";
 import {
@@ -113,6 +115,10 @@ const FIXTURES: Readonly<Record<string, (rawInput: unknown, call: MockCall) => B
     subject: visualReviewSubject,
     build: mockVisualReview,
     weak: mockWeakVisualReview,
+  }),
+  "PUBLISHER.schedule": fixture(PublisherInput, {
+    subject: publisherSubject,
+    build: mockPublisherSchedule,
   }),
 };
 

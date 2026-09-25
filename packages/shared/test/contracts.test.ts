@@ -22,6 +22,7 @@ import {
   ManagerQaOutput,
   PostDto,
   PostType,
+  PublisherOutput,
   REALTIME_EVENT_SCOPE,
   REALTIME_PAYLOADS,
   RealtimeEvent,
@@ -160,6 +161,7 @@ describe("agent output schemas are structured-output safe", () => {
     ["CopywriterOutput", CopywriterOutput],
     ["VisualDirectOutput", VisualDirectOutput],
     ["VisualReviewOutput", VisualReviewOutput],
+    ["PublisherOutput", PublisherOutput],
   ] as const)("%s", (_name, schema) => {
     expect(structuredOutputProblems(schema)).toEqual([]);
   });
@@ -451,6 +453,19 @@ const post = {
   qaNotes: null,
   approvedAt: null,
   liveAt: null,
+  publishing: [
+    {
+      platform: "INSTAGRAM" as const,
+      variantId: null,
+      jobId: null,
+      status: null,
+      scheduledFor: null,
+      publishedAt: null,
+      liveUrl: null,
+      dryRun: null,
+      lastError: null,
+    },
+  ],
   currentApproval: {
     id: "ar1",
     round: 1,

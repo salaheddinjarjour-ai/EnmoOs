@@ -50,14 +50,29 @@ export const JOB = {
   visualReview: "visual.review",
   /** A Vault regenerate: the Visual Director re-plans one shot in its original context. */
   visualRegenerate: "visual.regenerate",
+  /** After a post's final approval: slot candidates, the Publisher's pick, one PublishJob each. */
+  publisherSchedule: "publisher.schedule",
+  /** Publish one due PublishJob (or resume its container) through the platform's publisher. */
+  publishRun: "publish.run",
+  /** Check media the platform is still processing; re-enqueued until it is live or times out. */
+  publishPoll: "publish.poll",
   /** Every 5 min: stuck RUNNING tasks, BLOCKED_BUDGET after the UTC day rolls, stale WAITING. */
   tickSweeper: "tick.sweeper",
   /** Daily: RealtimeEvent rows older than 7 days and expired Session rows. */
   tickPrune: "tick.prune",
+  /** Every minute: SCHEDULED PublishJobs whose slot has come are QUEUED and handed to publish.run. */
+  tickPublish: "tick.publish",
+  /** Hourly: social account tokens checked (debug_token), expired ones marked with an alert. */
+  tickTokens: "tick.tokens",
 } as const;
 export type JobName = (typeof JOB)[keyof typeof JOB];
 
-export const TICK_JOB_NAMES = [JOB.tickSweeper, JOB.tickPrune] as const;
+export const TICK_JOB_NAMES = [
+  JOB.tickSweeper,
+  JOB.tickPrune,
+  JOB.tickPublish,
+  JOB.tickTokens,
+] as const;
 export type TickJobName = (typeof TICK_JOB_NAMES)[number];
 
 /** The queue each job runs on. */
@@ -69,8 +84,13 @@ export const JOB_QUEUE: Readonly<Record<JobName, QueueName>> = {
   "render.poll": "media",
   "visual.review": "agents",
   "visual.regenerate": "agents",
+  "publisher.schedule": "agents",
+  "publish.run": "ops",
+  "publish.poll": "ops",
   "tick.sweeper": "ops",
   "tick.prune": "ops",
+  "tick.publish": "ops",
+  "tick.tokens": "ops",
 };
 
 /** A short token that makes a deliberate re-queue a new job, e.g. "stall1" or "budget-2026-09-25". */
@@ -127,6 +147,37 @@ export type VisualReviewJob = z.infer<typeof VisualReviewJob>;
 export const VisualRegenerateJob = z.object({ assetId: Id });
 export type VisualRegenerateJob = z.infer<typeof VisualRegenerateJob>;
 
+/**
+ * publisher.schedule: the post whose approval round `round` just ended APPROVED. The round makes a
+ * re-approval (an edit after approval reopens it) a new job, and lets a late job for an older round
+ * see that it is stale.
+ */
+export const PublisherScheduleJob = z.object({
+  postId: Id,
+  round: z.int().positive(),
+});
+export type PublisherScheduleJob = z.infer<typeof PublisherScheduleJob>;
+
+/**
+ * publish.run: one attempt at publishing a PublishJob. `attempt` is the PublishJob.attempts value
+ * this run makes (1 for the first, +1 for each automatic or manual retry), so every retry is a new
+ * BullMQ job while a duplicate trigger of the same attempt is not.
+ */
+export const PublishRunJob = z.object({
+  publishJobId: Id,
+  attempt: z.int().positive(),
+});
+export type PublishRunJob = z.infer<typeof PublishRunJob>;
+
+export const PublishPollJob = z.object({
+  publishJobId: Id,
+  /** The publish.run attempt whose container this polls. */
+  attempt: z.int().positive(),
+  /** 1 for the first check after the container was created; each re-enqueue adds one. */
+  poll: z.int().positive(),
+});
+export type PublishPollJob = z.infer<typeof PublishPollJob>;
+
 /** Scheduler ticks carry no data; everything they act on is read from the database. */
 export const TickJob = z.object({});
 export type TickJob = z.infer<typeof TickJob>;
@@ -139,8 +190,13 @@ export const JOB_PAYLOADS = {
   "render.poll": RenderPollJob,
   "visual.review": VisualReviewJob,
   "visual.regenerate": VisualRegenerateJob,
+  "publisher.schedule": PublisherScheduleJob,
+  "publish.run": PublishRunJob,
+  "publish.poll": PublishPollJob,
   "tick.sweeper": TickJob,
   "tick.prune": TickJob,
+  "tick.publish": TickJob,
+  "tick.tokens": TickJob,
 } as const satisfies Record<JobName, z.ZodType>;
 export type JobData<N extends JobName> = z.infer<(typeof JOB_PAYLOADS)[N]>;
 
@@ -181,6 +237,14 @@ export const jobIds = {
     `review-${assetId}${requeueSuffix(requeue)}`,
   visualRegenerate: ({ assetId }: VisualRegenerateJob, requeue?: RequeueToken | null) =>
     `regenerate-${assetId}${requeueSuffix(requeue)}`,
+  /** A requeue token lets the sweeper schedule a post whose job was lost. */
+  publisherSchedule: ({ postId, round }: PublisherScheduleJob, requeue?: RequeueToken | null) =>
+    `schedule-${postId}-r${round}${requeueSuffix(requeue)}`,
+  /** DESIGN's publish:<id>:run, one per attempt. */
+  publishRun: ({ publishJobId, attempt }: PublishRunJob) => `publish-${publishJobId}-run${attempt}`,
+  /** DESIGN's publish:<id>:poll:<n>, scoped to the attempt that created the container. */
+  publishPoll: ({ publishJobId, attempt, poll }: PublishPollJob) =>
+    `publish-${publishJobId}-run${attempt}-poll${poll}`,
 } as const;
 
 function requeueSuffix(requeue: RequeueToken | null | undefined): string {
@@ -206,6 +270,26 @@ export function renderPollDelayMs(
   return Math.min(Math.max(base, RENDER_POLL_MAX_DELAY_MS), delay);
 }
 
+/* ─── publish polling ────────────────────────────────────────────────────────────────────────── */
+
+/** The wait before each publish.poll (PUBLISH_POLL_INTERVAL_SEC). */
+export function publishPollDelayMs(config: Pick<Config, "PUBLISH_POLL_INTERVAL_SEC">): number {
+  return config.PUBLISH_POLL_INTERVAL_SEC * 1_000;
+}
+
+/**
+ * The polls one container gets before the publish fails as timed out: as many intervals as fit
+ * in PUBLISH_POLL_MAX_MIN, at least one.
+ */
+export function publishPollMaxPolls(
+  config: Pick<Config, "PUBLISH_POLL_INTERVAL_SEC" | "PUBLISH_POLL_MAX_MIN">,
+): number {
+  return Math.max(
+    1,
+    Math.floor((config.PUBLISH_POLL_MAX_MIN * 60) / config.PUBLISH_POLL_INTERVAL_SEC),
+  );
+}
+
 /* ─── options ────────────────────────────────────────────────────────────────────────────────── */
 
 const KEEP_COMPLETED = { age: 86_400, count: 1_000 } as const;
@@ -228,6 +312,8 @@ export const DEFAULT_JOB_OPTIONS = {
 export const JOB_OPTIONS: Readonly<Partial<Record<JobName, JobsOptions>>> = {
   "tick.sweeper": { attempts: 1 },
   "tick.prune": { attempts: 1 },
+  "tick.publish": { attempts: 1 },
+  "tick.tokens": { attempts: 1 },
 };
 
 /** BullMQ Worker settings shared by every queue (runtime.ts adds concurrency and drainDelay). */
@@ -414,5 +500,39 @@ export function enqueueVisualRegenerate(
   return queues.add(JOB.visualRegenerate, data, {
     jobId: jobIds.visualRegenerate(data, requeue),
     ...(delayMs ? { delayMs } : {}),
+  });
+}
+
+export function enqueuePublisherSchedule(
+  queues: JobQueues,
+  data: PublisherScheduleJob,
+  { requeue }: { requeue?: RequeueToken | null } = {},
+): Promise<string> {
+  return queues.add(JOB.publisherSchedule, data, {
+    jobId: jobIds.publisherSchedule(data, requeue),
+  });
+}
+
+/** `delayMs` holds an automatic retry back (e.g. until a rate limit resets). */
+export function enqueuePublishRun(
+  queues: JobQueues,
+  data: PublishRunJob,
+  { delayMs }: { delayMs?: number } = {},
+): Promise<string> {
+  return queues.add(JOB.publishRun, data, {
+    jobId: jobIds.publishRun(data),
+    ...(delayMs ? { delayMs } : {}),
+  });
+}
+
+/** Pass `delayMs: publishPollDelayMs(deps.config)`. */
+export function enqueuePublishPoll(
+  queues: JobQueues,
+  data: PublishPollJob,
+  options: { delayMs: number },
+): Promise<string> {
+  return queues.add(JOB.publishPoll, data, {
+    jobId: jobIds.publishPoll(data),
+    delayMs: options.delayMs,
   });
 }

@@ -84,6 +84,9 @@ export default defineConfig({
         // for the cards and long enough for phase3.spec to see a card shimmer while it renders.
         RENDER_POLL_DELAY_MS: "1000",
         PUBLISH_MODE: "dry-run",
+        // Test-only hooks (apps/api/src/routes/e2e-hooks.ts): phase4.spec runs tick.publish at a
+        // post's slot instead of waiting the half hour a slot is at least away.
+        ENMO_E2E: "1",
         STORAGE_DRIVER: "local",
         STORAGE_LOCAL_DIR: ".data/e2e-storage",
         TOKEN_ENC_KEY: E2E_TOKEN_ENC_KEY,

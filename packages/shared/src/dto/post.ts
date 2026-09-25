@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { ApprovalStatus, Platform, PostStatus, PostType } from "../enums";
+import { ApprovalStatus, Platform, PostStatus, PostType, PublishStatus } from "../enums";
 import { KanbanColumn, StatusPill } from "../status";
 import {
   COPY_LIMITS,
@@ -26,6 +26,24 @@ export const ApprovalSummary = z.object({
   canDecide: z.boolean(),
 });
 export type ApprovalSummary = z.infer<typeof ApprovalSummary>;
+
+/**
+ * Where the post stands on one of its platforms: its variant and that variant's publish job, when
+ * they exist. `status` null means nothing is scheduled there yet.
+ */
+export const PostPlatformPublishDto = z.object({
+  platform: Platform,
+  variantId: Id.nullable(),
+  jobId: Id.nullable(),
+  status: PublishStatus.nullable(),
+  scheduledFor: IsoDateTime.nullable(),
+  publishedAt: IsoDateTime.nullable(),
+  /** The live post (a https://dryrun.enmo.marketing/… URL for a dry run). */
+  liveUrl: z.string().nullable(),
+  dryRun: z.boolean().nullable(),
+  lastError: z.string().nullable(),
+});
+export type PostPlatformPublishDto = z.infer<typeof PostPlatformPublishDto>;
 
 export const PostDto = z.object({
   id: Id,
@@ -64,6 +82,8 @@ export const PostDto = z.object({
   qaNotes: z.string().nullable(),
   approvedAt: IsoDateTime.nullable(),
   liveAt: IsoDateTime.nullable(),
+  /** One entry per platform of the post, in `platforms` order. */
+  publishing: z.array(PostPlatformPublishDto),
   currentApproval: ApprovalSummary.nullable(),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,

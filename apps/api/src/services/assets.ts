@@ -308,6 +308,8 @@ export async function regenerateAsset(
             : { verbatim: instruction, source: "HUMAN", decisionId: null },
         enabledActions: deps.config.PIPELINE_ACTIONS,
         now,
+        events,
+        cancelReason: "visualRevision",
       });
       taskId = revision.direct.id;
       const context = { campaignId: revision.post.campaignId, clientId: revision.post.clientId };

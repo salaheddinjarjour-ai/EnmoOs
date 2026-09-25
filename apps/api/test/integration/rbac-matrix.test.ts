@@ -9,7 +9,8 @@ import { testCopy } from "../helpers/route-fixtures";
 /*
  * The RBAC matrix (DESIGN §E) against every route: Phase 1's auth, users, audit, invites, clients,
  * social accounts, capabilities and health, Phase 2's campaigns, threads, plans, tasks, posts,
- * approvals, budget and the SSE stream, and Phase 3's vault and local files.
+ * approvals, budget and the SSE stream, Phase 3's vault and local files, and Phase 4's calendar,
+ * publish jobs and Meta OAuth.
  *
  * 1. Statically: the access rule each route declares (recorded by plugins/rbac.ts) must equal the
  *    table below, and every registered route must appear in it. A new route (e.g. Phase 6's
@@ -300,6 +301,41 @@ const ROUTES: readonly RouteCase[] = [
     access: "public",
     url: "/files/clients/x/assets/missing.png",
   },
+
+  // ── calendar, publish jobs and Meta OAuth (Phase 4) ──
+  {
+    method: "GET",
+    route: "/v1/calendar",
+    access: "calendar.read",
+    url: `/v1/calendar?from=2026-10-01&to=2026-10-31&clientId=${MISSING}`,
+  },
+  {
+    method: "PATCH",
+    route: "/v1/publish-jobs/:id",
+    access: "publish.reschedule",
+    url: `/v1/publish-jobs/${MISSING}`,
+    payload: () => ({ date: "2026-10-02" }),
+  },
+  {
+    method: "POST",
+    route: "/v1/publish-jobs/:id/retry",
+    access: "publish.retry",
+    url: `/v1/publish-jobs/${MISSING}/retry`,
+  },
+  {
+    method: "POST",
+    route: "/v1/publish-jobs/:id/cancel",
+    access: "publish.cancel",
+    url: `/v1/publish-jobs/${MISSING}/cancel`,
+  },
+  {
+    method: "GET",
+    route: "/v1/oauth/meta/start",
+    access: "socialAccounts.manage",
+    url: `/v1/oauth/meta/start?clientId=${MISSING}`,
+  },
+  // Meta redirects the browser here; without a valid state it redirects back with an error.
+  { method: "GET", route: "/v1/oauth/meta/callback", access: "public" },
 ];
 
 /*

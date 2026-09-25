@@ -337,6 +337,81 @@ describe("loadConfig", () => {
     ).toThrow(/R2_PUBLIC_BASE_URL/);
   });
 
+  it("defaults publishing to dry-run with Meta's real hosts and a callback on this API", () => {
+    const config = loadConfig({
+      NODE_ENV: "test",
+      API_PUBLIC_URL: "https://api.enmo.test/",
+      APP_ORIGINS: "https://app.enmo.test,http://localhost:3000",
+    });
+    expect(config).toMatchObject({
+      PUBLISH_MODE: "dry-run",
+      APP_PUBLIC_URL: "https://app.enmo.test",
+      META_GRAPH_VERSION: "v26.0",
+      META_GRAPH_BASE_URL: "https://graph.facebook.com",
+      META_RUPLOAD_BASE_URL: "https://rupload.facebook.com",
+      META_OAUTH_DIALOG_URL: "https://www.facebook.com",
+      META_REDIRECT_URI: "https://api.enmo.test/v1/oauth/meta/callback",
+      PUBLISH_POLL_INTERVAL_SEC: 10,
+      PUBLISH_POLL_MAX_MIN: 10,
+      PUBLISH_MAX_ATTEMPTS: 3,
+    });
+  });
+
+  it("takes the publishing overrides, keeping the redirect URI exactly as registered", () => {
+    const config = loadConfig({
+      NODE_ENV: "test",
+      APP_PUBLIC_URL: "https://studio.enmo.test/",
+      META_GRAPH_BASE_URL: "http://127.0.0.1:9999/",
+      META_RUPLOAD_BASE_URL: "http://127.0.0.1:9999",
+      META_OAUTH_DIALOG_URL: "http://127.0.0.1:9999",
+      META_REDIRECT_URI: "https://api.enmo.test/v1/oauth/meta/callback/",
+      PUBLISH_POLL_INTERVAL_SEC: "1",
+      PUBLISH_POLL_MAX_MIN: "2",
+      PUBLISH_MAX_ATTEMPTS: "5",
+    });
+    expect(config).toMatchObject({
+      APP_PUBLIC_URL: "https://studio.enmo.test",
+      META_GRAPH_BASE_URL: "http://127.0.0.1:9999",
+      META_RUPLOAD_BASE_URL: "http://127.0.0.1:9999",
+      META_OAUTH_DIALOG_URL: "http://127.0.0.1:9999",
+      META_REDIRECT_URI: "https://api.enmo.test/v1/oauth/meta/callback/",
+      PUBLISH_POLL_INTERVAL_SEC: 1,
+      PUBLISH_POLL_MAX_MIN: 2,
+      PUBLISH_MAX_ATTEMPTS: 5,
+    });
+    expect(() => loadConfig({ NODE_ENV: "test", PUBLISH_MAX_ATTEMPTS: "0" })).toThrow(
+      /PUBLISH_MAX_ATTEMPTS/,
+    );
+    expect(() => loadConfig({ NODE_ENV: "test", PUBLISH_POLL_INTERVAL_SEC: "0" })).toThrow(
+      /PUBLISH_POLL_INTERVAL_SEC/,
+    );
+  });
+
+  it("goes live only with a platform's app credentials, and never with half a Meta app", () => {
+    expect(() => loadConfig({ NODE_ENV: "test", PUBLISH_MODE: "live" })).toThrow(
+      /PUBLISH_MODE=live needs a platform's app credentials/,
+    );
+    expect(() => loadConfig({ NODE_ENV: "test", META_APP_ID: "id" })).toThrow(
+      /META_APP_ID and META_APP_SECRET/,
+    );
+    const live = loadConfig({
+      NODE_ENV: "test",
+      PUBLISH_MODE: "live",
+      META_APP_ID: "id",
+      META_APP_SECRET: "secret",
+    });
+    expect(live.PUBLISH_MODE).toBe("live");
+    expect(configuredIntegrations(live).meta).toBe(true);
+    expect(
+      loadConfig({
+        NODE_ENV: "test",
+        PUBLISH_MODE: "live",
+        TIKTOK_CLIENT_KEY: "key",
+        TIKTOK_CLIENT_SECRET: "secret",
+      }).PUBLISH_MODE,
+    ).toBe("live");
+  });
+
   it("refuses local storage in production unless the disk is declared durable", () => {
     const production = { NODE_ENV: "production", TOKEN_ENC_KEY: KEY_HEX } as const;
     expect(() => loadConfig(production)).toThrow(/STORAGE_DRIVER=local in production/);

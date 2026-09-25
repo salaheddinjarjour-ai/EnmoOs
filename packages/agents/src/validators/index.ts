@@ -9,6 +9,7 @@ export {
 } from "./copy";
 export { validateIntake } from "./intake";
 export { validatePlan } from "./plan";
+export { validatePublisher } from "./publisher";
 export { validateQa } from "./qa";
 export {
   SHOTS_CHECK,

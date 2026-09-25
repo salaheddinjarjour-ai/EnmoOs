@@ -68,12 +68,23 @@ export function effectsOf(event: RealtimeEvent): CacheEffect[] {
         invalidate(queryKeys.taskGraphs.all),
       ];
     case "post.updated":
-      return [{ kind: "patchPost", post: event.payload }, invalidate(queryKeys.posts.all)];
+      // The calendar's ghost slots show the planned post's status and hook.
+      return [
+        { kind: "patchPost", post: event.payload },
+        invalidate(queryKeys.posts.all),
+        invalidate(queryKeys.calendar.all),
+      ];
     case "asset.updated":
-      // Cards read PostDto.currentAssets; the Vault lists and lineages read the assets.
-      return [invalidate(queryKeys.posts.all), invalidate(queryKeys.assets.all)];
+      // Cards read PostDto.currentAssets; the Vault lists and lineages read the assets; calendar
+      // items show the post's first current take.
+      return [
+        invalidate(queryKeys.posts.all),
+        invalidate(queryKeys.assets.all),
+        invalidate(queryKeys.calendar.all),
+      ];
     case "publish.updated":
-      return [invalidate(queryKeys.posts.all)];
+      // Cards read PostDto.publishing; the calendar places the job on its day.
+      return [invalidate(queryKeys.posts.all), invalidate(queryKeys.calendar.all)];
     case "approval.created":
     case "approval.resolved":
       return [invalidate(queryKeys.approvals.all), invalidate(queryKeys.posts.all)];

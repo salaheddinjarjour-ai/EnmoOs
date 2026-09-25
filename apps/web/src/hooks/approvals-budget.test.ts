@@ -32,6 +32,7 @@ function pending(currentStep: number, stepCount: number): PostDto {
     qaNotes: null,
     approvedAt: null,
     liveAt: null,
+    publishing: [],
     currentApproval: {
       id: "r1",
       round: 1,

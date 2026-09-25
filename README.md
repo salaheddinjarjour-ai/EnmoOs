@@ -45,7 +45,7 @@ mock or dry-run mode.
 | 1 · Foundation     | Monorepo, full Prisma schema, auth + RBAC, invites, client CRUD (brand voice, visual style, banned words, approval chain), Command Center shell, Render + Cloudflare deploy config, CI | Log in, create a client, see the dashboard             | **Done** |
 | 2 · First words    | Brief chat, Manager intake/plan, task graph, BullMQ, Copywriter, approvals (text only)                                                                                                 | Brief → caption drafts → approve in the UI             | **Done** |
 | 3 · Eyes           | Visual provider abstraction + MockProvider, Visual Director, Vault, asset versioning                                                                                                   | Brief → approvable post card with a placeholder visual | **Done** |
-| 4 · Go live (Meta) | Meta Graph publishing, Publisher agent, Calendar + slot optimizer, Approvals Queue                                                                                                     | An approved post publishes itself to IG/FB             | Planned  |
+| 4 · Go live (Meta) | Meta Graph publishing, Publisher agent, Calendar + slot optimizer, Approvals Queue                                                                                                     | An approved post publishes itself to IG/FB             | **Done** |
 | 5 · Everywhere     | TikTok publishing, Adapter agent, Higgsfield provider                                                                                                                                  | One brief → three platforms, in native formats         | Planned  |
 | 6 · The loop       | Metrics pull, Analyst, LearningLog, Strategist, growth dashboard                                                                                                                       | Content visibly improves week over week                | Planned  |
 
@@ -241,6 +241,91 @@ reviews each one; for now the renders are branded placeholders.
   misbehave, for example `VISUAL_DIRECTOR.review:weak*3`.
 - Approved posts are still not published (Phase 4). The Adapter's per-platform variants arrive in
   Phase 5, so for now each post has one master visual per shot.
+
+### Phase 4: what works today
+
+An approved post now schedules and publishes itself: as a dry run by default, and live on
+Instagram and Facebook through the Meta Graph API once a Meta app and the client's accounts are
+connected.
+
+- **Scheduling.** When a post's final approval commits, `publisher.schedule` creates one
+  `PostVariant` per platform that takes the post type (its caption from the copy's platform
+  caption) and asks the slot optimizer for each variant's top 5 candidates. The optimizer scores
+  hourly slots in the client's own time zone (DST-safe): the platform's best-time prior (Instagram
+  weekdays 11–13 and 19–21, Facebook weekdays 9–13, TikTok evenings with Tuesday and Thursday
+  peaks) blended with the client's learned `SlotScore`. It keeps inside the campaign window, at
+  least 30 minutes from now, 4 hours apart and at most 2 a day per client and platform, and prefers
+  the plan's target date ±1 day. The **Publisher** agent picks among the candidates; if it fails,
+  each variant takes the top candidate (`slotSource=optimizer`), never an escalation. The payload
+  and banned words are checked before a slot is spent. Each job is written `SCHEDULED` under a
+  per-client lock, so posts approved together never share a slot. The post goes `SCHEDULED` and
+  the Publisher signs a note in the thread. A post no platform can take (no visuals, say) stays
+  approved, flagged, with an alert.
+- **Publishing.** `tick.publish` (every minute) queues due jobs. `publish.run` re-checks the
+  publish guard under the same locks an edit takes: the latest approval is APPROVED, its content
+  hash still matches, no banned words, and the account's token is valid. Then it publishes through
+  the dry-run or the Meta publisher and saves the platform's container as soon as it exists.
+  Media still processing goes to `publish.poll` (every `PUBLISH_POLL_INTERVAL_SEC`, up to
+  `PUBLISH_POLL_MAX_MIN`). Transient errors retry on the same container, up to
+  `PUBLISH_MAX_ATTEMPTS`. The job ends `PUBLISHED` with its `liveUrl`, `externalId` and
+  `publishedAt` (what Phase 6's metric pull-back reads), and the post goes `LIVE` once every
+  variant is out. The tick also re-drives work a lost enqueue or a dead worker left behind.
+- **Safety.** Any edit after approval (copy, a visual revision, a regenerated take) cancels the
+  post's waiting jobs and reopens approval; re-approval schedules the same job rows again. At the
+  slot, a job whose approval no longer stands, whose content changed or that uses a banned word is
+  `CANCELLED` before any platform call, with an alert, and its approval reopens. A token problem
+  (expired, revoked, missing publishing scopes) `FAILS` the job instead, marks the account and
+  raises an alert, so it can be retried once the account is reconnected.
+- **Meta.** `MetaPublisher` (Graph `v26.0`) posts Instagram images, reels, stories and carousels
+  through containers (checking `content_publishing_limit` first, polling `status_code`, then
+  `media_publish` and the permalink), and Facebook photos, multi-photo posts (unpublished photos,
+  then one `feed` post), reels (`video_reels` start, `rupload` with `file_url`, finish) and photo
+  or video stories. Tokens travel in the `Authorization` header with an `appsecret_proof`. The
+  progress record in `PublishJob.containerId` lets a retry resume exactly where it stopped, so
+  nothing is created twice. Graph errors map to AUTH, RATE_LIMITED, UNAVAILABLE, MEDIA_FAILED or
+  REJECTED.
+- **Meta OAuth.** An ADMIN's **Connect Meta** (`GET /v1/oauth/meta/start`) sends the browser to
+  Meta's consent dialog with a one-time state (and PKCE) bound to the session in Redis for 10
+  minutes. The callback exchanges the code, swaps it for a long-lived token, reads the granted
+  scopes with `debug_token`, and stores one `SocialAccount` per Page and per linked Instagram
+  account with AES-256-GCM encrypted Page tokens. `tick.tokens` asks `debug_token` about every
+  Meta account once a day: a revoked token marks the account REVOKED, a lapsed one EXPIRED, each
+  with an alert, and tokens expiring within 7 days get a warning. "Check" on an account asks Meta
+  too.
+- **Calendar** (`GET /v1/calendar`). A month grid across all clients (or one), with each job on
+  its client-local day in its platform's colour, its thumbnail and time, and ghost slots (dashed,
+  40% opacity) for planned posts that have no job yet. MANAGERs and ADMINs drag a scheduled job
+  to another day (`PATCH /v1/publish-jobs/:id {date}`): the optimizer picks that day's best free
+  hour, with no LLM call, and records `slotSource=manual`. The move shows at once and snaps back
+  with the reason if the day is full. The event dialog offers the same move by keyboard, plus
+  Retry for a failed job and Cancel. LIVE events link to the live post, and the grid updates
+  live over SSE.
+- **Approvals Queue.** Everything waiting on a person across all clients, newest first, filtered
+  by client, platform and campaign in the address. Each tile is the post's thumbnail with Approve
+  and Request changes; MANAGERs and ADMINs tick tiles (or "Select all") and approve them in one
+  confirmed, logged batch.
+- **Web.** Post cards and the drawer show each platform's publish state, time, DRY RUN tag and
+  live link. The client's Accounts tab lists connected accounts with their source, status, token
+  expiry and missing permissions, and has Connect Meta.
+
+**Mocked, dry-run or not there yet (as of Phase 4).**
+
+- `PUBLISH_MODE=dry-run` is the default: jobs run the same payload validation and "publish" to
+  `https://dryrun.enmo.marketing/<platform>/<variantId>`. The Meta publisher and OAuth have only
+  run against the fake Graph server in `apps/api/test/fakes/meta-graph.ts`, which records the call
+  sequence the tests assert. There is no Meta app yet. Without `META_APP_ID` and
+  `META_APP_SECRET`, Connect Meta is disabled and `/v1/oauth/meta/start` answers 503.
+- The Publisher agent runs on MockLlm, which picks each variant's top candidate. The best-time
+  priors are industry heuristics until Phase 6's metrics fill `SlotScore`; weekends have no peaks.
+- Live publishing needs public HTTPS media URLs (R2). Local storage only works with a Graph on the
+  same machine, which is what the tests use.
+- Every variant still publishes the 9:16 master (the Adapter's native crops arrive in Phase 5),
+  and a reel publishes its first clip until the VideoAssembler lands (MockProvider's video is a
+  poster PNG anyway). TikTok jobs stay dry runs until Phase 5.
+- A job a teammate cancels stays cancelled: the calendar shows its platform as a ghost again, and
+  it is scheduled again only through a new approval round.
+- Metrics pull-back, scoring and the Analyst arrive in Phase 6; `publishedAt` and `externalId` are
+  already stored for them.
 
 ## Architecture
 
@@ -511,17 +596,24 @@ combination stops the process at boot with a list of the problems, for example
 
 **Publishing**
 
-| Variable               | Default                       | Purpose                                                                                                 |
-| ---------------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------- |
-| `PUBLISH_MODE`         | `dry-run`                     | `dry-run` validates payloads and returns `https://dryrun.enmo.marketing/...` URLs. `live` really posts. |
-| `META_APP_ID`          | none                          | Meta app id (OAuth, Graph API).                                                                         |
-| `META_APP_SECRET`      | none                          | Meta app secret.                                                                                        |
-| `META_GRAPH_VERSION`   | `v26.0`                       | Graph API version.                                                                                      |
-| `META_GRAPH_BASE_URL`  | `https://graph.facebook.com`  | Graph base URL. Tests point it at a fake Graph server.                                                  |
-| `TIKTOK_CLIENT_KEY`    | none                          | TikTok app client key.                                                                                  |
-| `TIKTOK_CLIENT_SECRET` | none                          | TikTok app client secret.                                                                               |
-| `TIKTOK_API_BASE_URL`  | `https://open.tiktokapis.com` | TikTok API base URL.                                                                                    |
-| `TIKTOK_APP_AUDITED`   | `false`                       | Unaudited TikTok apps may only post `SELF_ONLY`. Set `true` once the audit passes.                      |
+| Variable                    | Default                                  | Purpose                                                                                                                                                                                                                                                   |
+| --------------------------- | ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PUBLISH_MODE`              | `dry-run`                                | `dry-run` validates payloads and returns `https://dryrun.enmo.marketing/...` URLs. `live` really posts, but only on platforms whose app credentials are set and for clients with an account there. `live` with no platform credentials at all is refused. |
+| `APP_PUBLIC_URL`            | the first `APP_ORIGINS` entry            | The web app URL the OAuth callback sends the browser back to.                                                                                                                                                                                             |
+| `META_APP_ID`               | none                                     | Meta app id (OAuth, Graph API). Set it together with `META_APP_SECRET`.                                                                                                                                                                                   |
+| `META_APP_SECRET`           | none                                     | Meta app secret.                                                                                                                                                                                                                                          |
+| `META_GRAPH_VERSION`        | `v26.0`                                  | Graph API version.                                                                                                                                                                                                                                        |
+| `META_GRAPH_BASE_URL`       | `https://graph.facebook.com`             | Graph base URL. Tests point it at a fake Graph server.                                                                                                                                                                                                    |
+| `META_RUPLOAD_BASE_URL`     | `https://rupload.facebook.com`           | Facebook Reels upload host. Tests point it at the fake Graph server too.                                                                                                                                                                                  |
+| `META_OAUTH_DIALOG_URL`     | `https://www.facebook.com`               | Host of the OAuth consent dialog.                                                                                                                                                                                                                         |
+| `META_REDIRECT_URI`         | `$API_PUBLIC_URL/v1/oauth/meta/callback` | The OAuth redirect URI. It must match the one registered with the Meta app exactly.                                                                                                                                                                       |
+| `PUBLISH_POLL_INTERVAL_SEC` | `10`                                     | Seconds between checks of media the platform is still processing (1–300).                                                                                                                                                                                 |
+| `PUBLISH_POLL_MAX_MIN`      | `10`                                     | Minutes a publish may wait on that processing before it fails (1–1440).                                                                                                                                                                                   |
+| `PUBLISH_MAX_ATTEMPTS`      | `3`                                      | Publish attempts per job, the first included, before it fails for good (1–10).                                                                                                                                                                            |
+| `TIKTOK_CLIENT_KEY`         | none                                     | TikTok app client key.                                                                                                                                                                                                                                    |
+| `TIKTOK_CLIENT_SECRET`      | none                                     | TikTok app client secret.                                                                                                                                                                                                                                 |
+| `TIKTOK_API_BASE_URL`       | `https://open.tiktokapis.com`            | TikTok API base URL.                                                                                                                                                                                                                                      |
+| `TIKTOK_APP_AUDITED`        | `false`                                  | Unaudited TikTok apps may only post `SELF_ONLY`. Set `true` once the audit passes.                                                                                                                                                                        |
 
 **Secrets and seed**
 

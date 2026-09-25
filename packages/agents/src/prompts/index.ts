@@ -28,4 +28,9 @@ export {
   VISUAL_DIRECTOR_REVIEW_SYSTEM_PROMPT,
   renderVisualReviewUserMessage,
 } from "./visual-director-review";
+export {
+  PUBLISHER_PROMPT_VERSION,
+  PUBLISHER_SYSTEM_PROMPT,
+  renderPublisherUserMessage,
+} from "./publisher";
 export { renderBrandBlock } from "./shared";

@@ -54,18 +54,43 @@ export function optimisticallyApproved(post: PostDto): PostDto {
 interface PostSnapshot {
   detail: PostDto | undefined;
   lists: Array<[readonly unknown[], PostListResponse | undefined]>;
+  /** The Approvals Queue carries its own copy of each post. */
+  approvals: Array<[readonly unknown[], ApprovalListResponse | undefined]>;
 }
 
 function snapshotPost(queryClient: QueryClient, postId: string): PostSnapshot {
   return {
     detail: queryClient.getQueryData<PostDto>(queryKeys.posts.detail(postId)),
     lists: queryClient.getQueriesData<PostListResponse>({ queryKey: queryKeys.posts.lists() }),
+    approvals: queryClient.getQueriesData<ApprovalListResponse>({
+      queryKey: queryKeys.approvals.lists(),
+    }),
   };
 }
 
 function restorePost(queryClient: QueryClient, postId: string, snapshot: PostSnapshot): void {
   queryClient.setQueryData(queryKeys.posts.detail(postId), snapshot.detail);
   for (const [queryKey, data] of snapshot.lists) queryClient.setQueryData(queryKey, data);
+  for (const [queryKey, data] of snapshot.approvals) queryClient.setQueryData(queryKey, data);
+}
+
+/** The queue's round for the post as it looks once the viewer's approval is recorded. */
+export function optimisticallyApprovedRequest(request: ApprovalRequestDto): ApprovalRequestDto {
+  return { ...request, canDecide: false, post: optimisticallyApproved(request.post) };
+}
+
+function approveInQueue(queryClient: QueryClient, postId: string): void {
+  queryClient.setQueriesData<ApprovalListResponse>(
+    { queryKey: queryKeys.approvals.lists() },
+    (current) =>
+      current && {
+        items: current.items.map((request) =>
+          request.postId === postId && request.status === "PENDING" && request.canDecide
+            ? optimisticallyApprovedRequest(request)
+            : request,
+        ),
+      },
+  );
 }
 
 function findCachedPost(queryClient: QueryClient, postId: string): PostDto | undefined {
@@ -97,10 +122,14 @@ export function useDecide() {
       }),
     onMutate: async ({ postId, decision }) => {
       if (decision !== "APPROVE") return undefined;
-      await queryClient.cancelQueries({ queryKey: queryKeys.posts.all });
+      await Promise.all([
+        queryClient.cancelQueries({ queryKey: queryKeys.posts.all }),
+        queryClient.cancelQueries({ queryKey: queryKeys.approvals.all }),
+      ]);
       const snapshot = snapshotPost(queryClient, postId);
       const current = findCachedPost(queryClient, postId);
       if (current) storePost(queryClient, optimisticallyApproved(current));
+      approveInQueue(queryClient, postId);
       return snapshot;
     },
     onError: (_error, { postId }, snapshot) => {

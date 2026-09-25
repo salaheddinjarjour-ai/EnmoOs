@@ -23,6 +23,7 @@ import { routeHumanFeedback } from "../orchestrator/feedback";
 import { advanceOrRecount } from "../orchestrator/graph";
 import { lockApprovalRequests } from "../orchestrator/locks";
 import { postUpdated, requireTransition } from "../orchestrator/post-status";
+import { onPostApproved, type ApprovedPost } from "../orchestrator/publishing";
 import type { ServiceUser } from "./actor";
 import { recordAudit } from "./audit";
 import { POST_INCLUDE, toPostDto } from "./posts";
@@ -148,13 +149,16 @@ interface RoundUpdate {
   outcome: ChainOutcome;
 }
 
-/** Stores the new chain position; an APPROVED round approves the post. */
+/**
+ * Stores the new chain position; an APPROVED round approves the post, which is returned so the
+ * caller hands it to the Publisher once the transaction commits.
+ */
 async function applyApproval(
   deps: Deps,
   tx: DbTransaction,
   { request, post, outcome }: RoundUpdate,
   events: EventBatch,
-): Promise<void> {
+): Promise<ApprovedPost | null> {
   const now = deps.clock.now();
   const resolved = outcome.status !== "PENDING";
   await tx.approvalRequest.update({
@@ -170,12 +174,20 @@ async function applyApproval(
     if (outcome.stepCompleted) {
       postUpdated(events, await tx.post.findUniqueOrThrow({ where: { id: request.postId } }));
     }
-    return;
+    return null;
   }
-  if (outcome.status !== "APPROVED") return;
+  if (outcome.status !== "APPROVED") return null;
   const approved = await requireTransition(tx, request.postId, "APPROVED", { approvedAt: now });
   postUpdated(events, approved);
   approvalResolved(events, { ...request, status: "APPROVED" }, post);
+  return { postId: request.postId, round: request.round };
+}
+
+/** Hands each approved post to the Publisher; a queue outage never undoes the approval. */
+async function scheduleApproved(deps: Deps, approved: readonly ApprovedPost[]): Promise<void> {
+  for (const post of approved) {
+    await afterCommit(deps, "scheduling the approved post", () => onPostApproved(deps, post));
+  }
 }
 
 /**
@@ -198,7 +210,7 @@ export async function decide(
     throw badRequest("Requesting changes needs the feedback and a target (copy, visual or both)");
   }
   const events = new EventBatch();
-  const revisedGraph = await deps.prisma.$transaction(async (tx) => {
+  const { revisedGraph, approved } = await deps.prisma.$transaction(async (tx) => {
     await lockApprovalRequests(tx, [requestId]);
     const request = await tx.approvalRequest.findUnique({
       where: { id: requestId },
@@ -225,8 +237,8 @@ export async function decide(
     });
 
     if (outcome.status !== "CHANGES_REQUESTED") {
-      await applyApproval(deps, tx, { request, post: request.post, outcome }, events);
-      return null;
+      const post = await applyApproval(deps, tx, { request, post: request.post, outcome }, events);
+      return { revisedGraph: null, approved: post };
     }
 
     await tx.approvalRequest.update({
@@ -243,7 +255,7 @@ export async function decide(
     });
     postUpdated(events, routed.post);
     approvalResolved(events, { ...request, status: "CHANGES_REQUESTED" }, request.post);
-    return routed.graphId;
+    return { revisedGraph: routed.graphId, approved: null };
   });
 
   // The decision stands once committed; the sweeper queues a revision this couldn't.
@@ -251,6 +263,7 @@ export async function decide(
   if (revisedGraph) {
     await afterCommit(deps, "starting the revision", () => advanceOrRecount(deps, revisedGraph));
   }
+  if (approved) await scheduleApproved(deps, [approved]);
   return getApprovalRequest(deps, user, requestId);
 }
 
@@ -279,6 +292,7 @@ export async function approveAll(
 ): Promise<ApproveAllResponse> {
   const ids = [...new Set(requestIds)];
   const events = new EventBatch();
+  const approvedPosts: ApprovedPost[] = [];
   const response = await deps.prisma.$transaction(
     async (tx) => {
       await lockApprovalRequests(tx, ids);
@@ -333,7 +347,13 @@ export async function approveAll(
               auditLogId,
             },
           });
-          await applyApproval(deps, tx, { request, post: request.post, outcome }, events);
+          const approved = await applyApproval(
+            deps,
+            tx,
+            { request, post: request.post, outcome },
+            events,
+          );
+          if (approved) approvedPosts.push(approved);
         }
       }
 
@@ -371,5 +391,6 @@ export async function approveAll(
     { timeout: 30_000, maxWait: 10_000 },
   );
   await events.publish(deps);
+  await scheduleApproved(deps, approvedPosts);
   return response;
 }

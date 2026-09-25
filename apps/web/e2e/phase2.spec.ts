@@ -314,7 +314,14 @@ test("the Command Center boards the approved posts, with the budget and live sta
     await expect(
       panel.getByRole("region", { name: "Approval column" }).getByRole("article"),
     ).toHaveCount(0);
-    await expect(panel.getByRole("region", { name: "Alerts" })).toContainText("All clear");
+    // With visuals the Publisher schedules every approved post as a dry run. Copy alone
+    // (E2E_PIPELINE_ACTIONS=write,qa) is nothing a platform takes: each post is flagged instead.
+    const alerts = panel.getByRole("region", { name: "Alerts" });
+    if (PIPELINE_ACTIONS.split(",").includes("direct")) {
+      await expect(alerts).toContainText("All clear");
+    } else {
+      await expect(alerts).toContainText("The Publisher couldn't schedule");
+    }
 
     // A card opens its details, with the way back to the thread.
     await scheduled.getByRole("button", { name: "Open p3 details" }).click();

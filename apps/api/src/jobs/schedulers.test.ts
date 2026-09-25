@@ -1,18 +1,23 @@
 import { describe, expect, it, vi } from "vitest";
-import { DAY_MS, MINUTE_MS } from "../lib/clock";
+import { DAY_MS, HOUR_MS, MINUTE_MS } from "../lib/clock";
 import { createLogger } from "../lib/logger";
 import type { JobQueues } from "./queues";
 import { registerSchedulers, TICK_SCHEDULES } from "./schedulers";
 
 describe("registerSchedulers", () => {
-  it("upserts tick.sweeper every 5 minutes and tick.prune daily on the ops queue", async () => {
+  it("upserts every tick on the ops queue at its DESIGN §D interval", async () => {
     const upsertJobScheduler = vi.fn(() => Promise.resolve({}));
     const queue = vi.fn(() => ({ upsertJobScheduler }));
     const queues = { queue } as unknown as JobQueues;
 
     await registerSchedulers(queues, createLogger({ level: "silent", name: "schedulers-test" }));
 
-    expect(queue.mock.calls.map((call) => call as unknown[])).toEqual([["ops"], ["ops"]]);
+    expect(queue.mock.calls.map((call) => call as unknown[])).toEqual([
+      ["ops"],
+      ["ops"],
+      ["ops"],
+      ["ops"],
+    ]);
     expect(upsertJobScheduler.mock.calls).toEqual([
       [
         "tick.sweeper",
@@ -20,7 +25,18 @@ describe("registerSchedulers", () => {
         { name: "tick.sweeper", data: {}, opts: { attempts: 1 } },
       ],
       ["tick.prune", { every: DAY_MS }, { name: "tick.prune", data: {}, opts: { attempts: 1 } }],
+      [
+        "tick.publish",
+        { every: MINUTE_MS },
+        { name: "tick.publish", data: {}, opts: { attempts: 1 } },
+      ],
+      ["tick.tokens", { every: HOUR_MS }, { name: "tick.tokens", data: {}, opts: { attempts: 1 } }],
     ]);
-    expect(TICK_SCHEDULES.map((schedule) => schedule.name)).toEqual(["tick.sweeper", "tick.prune"]);
+    expect(TICK_SCHEDULES.map((schedule) => schedule.name)).toEqual([
+      "tick.sweeper",
+      "tick.prune",
+      "tick.publish",
+      "tick.tokens",
+    ]);
   });
 });

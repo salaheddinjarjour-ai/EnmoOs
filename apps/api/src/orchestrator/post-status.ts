@@ -28,9 +28,12 @@ export const POST_TRANSITIONS: Readonly<Record<PostStatus, readonly PostStatus[]
   // QA opened a round, or a human edit reopened approval (a new round replaces the old one).
   PENDING_APPROVAL: ["QA", "PENDING_APPROVAL", "APPROVED", "SCHEDULED"],
   CHANGES_REQUESTED: ["PENDING_APPROVAL"],
-  APPROVED: ["PENDING_APPROVAL"],
-  SCHEDULED: ["APPROVED", "SCHEDULED"],
-  PUBLISHING: ["SCHEDULED", "PUBLISHING"],
+  // Final approval, or every publish job called off (orchestrator/publishing.ts postStatusForJobs).
+  APPROVED: ["PENDING_APPROVAL", "SCHEDULED", "PUBLISHING", "FAILED"],
+  // Publish jobs waiting for their slots: scheduled, a retry queued, or a retryable error waiting.
+  SCHEDULED: ["APPROVED", "SCHEDULED", "PUBLISHING", "FAILED"],
+  // A variant is going out (or is out while another still waits); a retry while one is out.
+  PUBLISHING: ["SCHEDULED", "PUBLISHING", "FAILED"],
   LIVE: ["PUBLISHING"],
   SCORED: ["LIVE", "SCORED"],
   FAILED: [

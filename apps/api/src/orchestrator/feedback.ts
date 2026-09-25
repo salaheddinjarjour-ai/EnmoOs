@@ -8,7 +8,9 @@ import {
   type QaIssue,
 } from "@enmo/shared";
 import { cancelOpenRounds } from "./approval-round";
+import type { EventBatch } from "./events";
 import { requireTransition } from "./post-status";
+import { cancelScheduledForPost, type PublishCancelReason } from "./publishing";
 
 /*
  * Routing feedback back to the agents (DESIGN §D "Request Changes"). A human's REQUEST_CHANGES or
@@ -166,6 +168,10 @@ export interface VisualRevisionRequest {
   feedback: Feedback | null;
   enabledActions: readonly PipelineAction[];
   now: Date;
+  /** Collects the publish.updated of each PublishJob the revision cancels. */
+  events: EventBatch;
+  /** Why its scheduled publishing is called off. */
+  cancelReason: PublishCancelReason;
 }
 
 export interface VisualRevision {
@@ -191,10 +197,7 @@ export async function routeVisualRevision(
   request: VisualRevisionRequest,
 ): Promise<VisualRevision> {
   const cancelled = await cancelOpenRounds(tx, request.postId, request.now);
-  await tx.publishJob.updateMany({
-    where: { variant: { postId: request.postId }, status: { in: ["SCHEDULED", "QUEUED"] } },
-    data: { status: "CANCELLED" },
-  });
+  await cancelScheduledForPost(tx, request.events, request.postId, request.cancelReason);
   const { status } = await tx.post.findUniqueOrThrow({
     where: { id: request.postId },
     select: { status: true },

@@ -23,6 +23,8 @@ export const AUDIT_ACTIONS = {
   planApprove: "plan.approve",
   approvalApproveAll: "approval.approve_all",
   publishReschedule: "publish.reschedule",
+  publishCancel: "publish.cancel",
+  publishRetry: "publish.retry",
 } as const;
 export type KnownAuditAction = (typeof AUDIT_ACTIONS)[keyof typeof AUDIT_ACTIONS];
 

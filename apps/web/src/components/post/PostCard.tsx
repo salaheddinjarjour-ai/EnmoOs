@@ -2,6 +2,7 @@
 
 import type { PostDto } from "@enmo/shared";
 import { useState } from "react";
+import { viewerTimeZone } from "@/components/calendar/zoned-time";
 import { Badge } from "@/components/ui/Badge";
 import { cx } from "@/components/ui/cx";
 import { useClient } from "@/hooks/useClients";
@@ -10,11 +11,13 @@ import { PlatformChips, PostTypeChip } from "./PlatformChips";
 import { PostActions } from "./PostActions";
 import { PostDetailDrawer, type DrawerMode } from "./PostDetailDrawer";
 import { PostPreview } from "./PostPreview";
+import { PublishStatusList } from "./PublishStatus";
 import { StatusPill } from "./StatusPill";
 
 /*
  * The atomic unit (MASTER_PLAN §04): 9:16 preview, caption excerpt, platform chips, status pill,
- * Approve / Edit / Request Changes, reused in chat, the approvals queue and the kanban.
+ * Approve / Edit / Request Changes, reused in chat, the approvals queue and the kanban. Once the
+ * Publisher has it, the full card also shows each platform's publish state and live link.
  *   full     chat and queue: everything, with the actions
  *   compact  kanban: small preview, ref, the caption's first lines and the format; opens the drawer
  *   thumb    batch views: just the frame and the ref
@@ -142,6 +145,10 @@ export function PostCard({ post, variant = "full", onOpen, className }: PostCard
             </span>
           ) : null}
         </div>
+        <PublishStatusList
+          publishing={post.publishing}
+          timeZone={client.data?.timezone ?? viewerTimeZone()}
+        />
         {post.copy ? (
           <p className="line-clamp-4 text-sm leading-relaxed whitespace-pre-line text-paper/85">
             {post.copy.caption}

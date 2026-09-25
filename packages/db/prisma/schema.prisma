@@ -648,7 +648,10 @@ model PublishJob {
   createdAt       DateTime       @default(now())
   updatedAt       DateTime       @updatedAt
 
+  /// tick.publish: due SCHEDULED jobs.
   @@index([status, scheduledFor])
+  /// The calendar: every job on a range of days, whatever its status.
+  @@index([scheduledFor])
 }
 
 /// Learned slot quality per client-local day of week (0–6) and 3-hour bucket (0–7).

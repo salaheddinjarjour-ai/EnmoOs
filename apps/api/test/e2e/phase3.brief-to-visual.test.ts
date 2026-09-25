@@ -36,6 +36,7 @@ import sharp from "sharp";
 import { afterEach, describe, expect, it } from "vitest";
 import { FakeClock } from "../../src/lib/clock";
 import { currentContentHash } from "../../src/orchestrator/approval-round";
+import { PUBLISH_CANCEL_REASONS } from "../../src/orchestrator/publishing";
 import { browserHeaders } from "../helpers/app";
 import { sessionCookieFor } from "../helpers/auth";
 import { testDb } from "../helpers/db";
@@ -573,9 +574,11 @@ describe("phase3.brief-to-visual", () => {
     await api<ApprovalRequestDto>("POST", `/v1/approvals/${roundOne.id}/decision`, {
       decision: "APPROVE",
     });
-    expect(await db.post.findUniqueOrThrow({ where: { id: postId } })).toMatchObject({
-      status: "APPROVED",
-    });
+    // Approved, then (Phase 4) scheduled by the Publisher once the decision commits.
+    const scheduled = await waitForPostStatus(h, postId, "SCHEDULED");
+    expect(scheduled.approvedAt).not.toBeNull();
+    const [job] = await db.publishJob.findMany({ where: { variant: { postId } } });
+    expect(job?.status).toBe("SCHEDULED");
     const [v1] = (await api<PostDto>("GET", `/v1/posts/${postId}`)).body.currentAssets;
     const shot = AssetParams.parse(
       (await db.asset.findUniqueOrThrow({ where: { id: v1!.id } })).params,
@@ -593,6 +596,11 @@ describe("phase3.brief-to-visual", () => {
     expect(
       (await db.approvalRequest.findUniqueOrThrow({ where: { id: roundOne.id } })).status,
     ).toBe("CANCELLED");
+    // Nothing the old approval covered goes out: the scheduled job is called off.
+    expect(await db.publishJob.findUniqueOrThrow({ where: { id: job!.id } })).toMatchObject({
+      status: "CANCELLED",
+      lastError: PUBLISH_CANCEL_REASONS.visualRevision,
+    });
 
     const roundTwo = await h.waitFor(() =>
       db.approvalRequest.findFirst({ where: { postId, round: 2 } }),

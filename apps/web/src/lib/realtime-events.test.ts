@@ -47,6 +47,7 @@ function post(overrides: Partial<PostDto> = {}): PostDto {
     qaNotes: null,
     approvedAt: null,
     liveAt: null,
+    publishing: [],
     currentApproval: null,
     createdAt: AT,
     updatedAt: AT,
@@ -107,6 +108,7 @@ describe("effectsOf", () => {
     expect(effectsOf({ type: "post.updated", payload })).toEqual([
       { kind: "patchPost", post: payload },
       { kind: "invalidate", queryKey: queryKeys.posts.all },
+      { kind: "invalidate", queryKey: queryKeys.calendar.all },
     ]);
   });
 
@@ -154,7 +156,7 @@ describe("effectsOf", () => {
     ).toEqual([queryKeyId(queryKeys.campaigns.tasks("c1"))]);
   });
 
-  it("refreshes post cards and the Vault when a take changes", () => {
+  it("refreshes post cards, the Vault and the calendar when a take changes", () => {
     expect(
       invalidated({
         type: "asset.updated",
@@ -168,7 +170,28 @@ describe("effectsOf", () => {
           isCurrent: true,
         },
       }),
-    ).toEqual([queryKeyId(queryKeys.posts.all), queryKeyId(queryKeys.assets.all)]);
+    ).toEqual([
+      queryKeyId(queryKeys.posts.all),
+      queryKeyId(queryKeys.assets.all),
+      queryKeyId(queryKeys.calendar.all),
+    ]);
+  });
+
+  it("refreshes post cards and the calendar when a publish job changes", () => {
+    expect(
+      invalidated({
+        type: "publish.updated",
+        payload: {
+          jobId: "j1",
+          variantId: "v1",
+          postId: "post1",
+          platform: "INSTAGRAM",
+          status: "SCHEDULED",
+          scheduledFor: "2027-02-10T09:00:00.000Z",
+          liveUrl: null,
+        },
+      }),
+    ).toEqual([queryKeyId(queryKeys.posts.all), queryKeyId(queryKeys.calendar.all)]);
   });
 });
 

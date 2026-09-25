@@ -16,6 +16,7 @@ import { errorMessage } from "@/lib/api";
 import { useCan } from "@/lib/auth";
 import { ClientCard } from "./ClientCard";
 import { CreateClientDialog } from "./CreateClientDialog";
+import { OAuthResultNotice } from "./OAuthResultNotice";
 
 function matches(client: ClientListItem, query: string): boolean {
   const needle = query.trim().toLocaleLowerCase();
@@ -39,6 +40,8 @@ export function ClientsScreen() {
 
   return (
     <>
+      {/* An OAuth sign-in that lost track of its client comes back here with its error. */}
+      <OAuthResultNotice />
       <PageHeader
         eyebrow="Clients"
         title="Every client, one brain."

@@ -24,7 +24,7 @@ import {
   type ManagerPlanJob,
 } from "../../src/jobs/queues";
 import { startWorkers } from "../../src/jobs/runtime";
-import { DAY_MS, FakeClock, MINUTE_MS } from "../../src/lib/clock";
+import { DAY_MS, FakeClock, HOUR_MS, MINUTE_MS } from "../../src/lib/clock";
 import {
   INTAKE_UNAVAILABLE_REPLY,
   PLAN_UNAVAILABLE_REPLY,
@@ -562,7 +562,9 @@ describe("phase2 faults", () => {
       const schedulers = await h.deps.queues.queue("ops").getJobSchedulers();
       expect(schedulers.map((scheduler) => [scheduler.key, scheduler.every]).sort()).toEqual([
         ["tick.prune", DAY_MS],
+        ["tick.publish", MINUTE_MS],
         ["tick.sweeper", 5 * MINUTE_MS],
+        ["tick.tokens", HOUR_MS],
       ]);
     } finally {
       await runtime.close();
