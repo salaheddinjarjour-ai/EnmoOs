@@ -489,13 +489,12 @@ test("the calendar shows each job at its client's time; a drag moves it, a refus
       name: `${CLIENT} · Instagram · planned · ${ghost.title}`,
       exact: true,
     });
-    if (!(await ghostChip.isVisible())) {
-      await page
-        .getByRole("button", {
-          name: new RegExp(`^Show all \\d+ on ${formatShortDay(ghost.date)}$`),
-        })
-        .click();
-    }
+    const showAll = page.getByRole("button", {
+      name: new RegExp(`^Show all \\d+ on ${formatShortDay(ghost.date)}$`),
+    });
+    // The day renders before its items arrive: wait for one of the two before choosing.
+    await expect(ghostChip.or(showAll).first()).toBeVisible();
+    if (!(await ghostChip.isVisible())) await showAll.click();
     await ghostChip.click();
     const ghostDetails = page.getByRole("dialog", { name: `${CLIENT} · Instagram` });
     await expect(ghostDetails).toContainText("Put it on a day");
