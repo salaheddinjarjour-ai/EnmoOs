@@ -144,7 +144,10 @@ describe("preparePayload", () => {
       path: "media",
       message: `Take ${rendering.shotId} isn't ready to publish (RENDERING).`,
     });
-    expect(preparePayload({ ...base, postType: "STATIC", takes: [] })).toMatchObject({ ok: false });
+    expect(preparePayload({ ...base, postType: "STATIC", takes: [] })).toEqual({
+      ok: false,
+      issues: [{ path: "media", message: "The post has no visuals to publish." }],
+    });
     const oneSlide = preparePayload({
       ...base,
       postType: "CAROUSEL",

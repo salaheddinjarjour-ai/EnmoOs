@@ -118,6 +118,9 @@ export function preparePayload(source: PayloadSource): PreparedPayload {
       });
     }
   }
+  if (usable.length === 0) {
+    issues.push({ path: "media", message: "The post has no visuals to publish." });
+  }
   const ready = usable.filter((take) => take.status === "READY" && take.url);
   const cover = ready[0];
   const coverUrl =
@@ -138,7 +141,9 @@ export function preparePayload(source: PayloadSource): PreparedPayload {
     media: ready.map((take) => mediaOf(take, source)),
     ...(coverUrl ? { coverUrl } : {}),
   };
-  issues.push(...validatePublishPayload(draft));
+  const rules = validatePublishPayload(draft);
+  // With no ready take, the schema's own complaint about an empty media list adds nothing.
+  issues.push(...(ready.length === 0 ? rules.filter((issue) => issue.path !== "media") : rules));
   if (issues.length > 0) return { ok: false, issues };
   return { ok: true, payload: PublishPayload.parse(draft) };
 }

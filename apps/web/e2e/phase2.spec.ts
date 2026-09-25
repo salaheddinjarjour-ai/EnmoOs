@@ -320,7 +320,8 @@ test("the Command Center boards the approved posts, with the budget and live sta
     if (PIPELINE_ACTIONS.split(",").includes("direct")) {
       await expect(alerts).toContainText("All clear");
     } else {
-      await expect(alerts).toContainText("The Publisher couldn't schedule");
+      await expect(alerts).toContainText("Not scheduled on");
+      await expect(alerts).toContainText("The post has no visuals to publish");
     }
 
     // A card opens its details, with the way back to the thread.

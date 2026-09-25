@@ -121,9 +121,8 @@ describe("publisher.schedule", () => {
       return row.needsAttention ? row : null;
     });
     expect(flagged.status).toBe("APPROVED");
-    expect(flagged.attentionReason).toMatch(
-      /^Not scheduled on Instagram: the post breaks its publishing rules: .*; Facebook: /,
-    );
+    const why = "the post breaks its publishing rules: The post has no visuals to publish";
+    expect(flagged.attentionReason).toBe(`Not scheduled on Instagram: ${why}; Facebook: ${why}`);
     expect(await testDb().publishJob.count()).toBe(0);
     expect(
       (await alertsAfter(h, 1)).map((alert) => [alert.kind, alert.entityType, alert.entityId]),

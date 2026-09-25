@@ -264,13 +264,13 @@ test("the Approvals Queue approves one post from its thumbnail, then the rest in
     await expect(tiles).toHaveCount(3);
     await expect(page.getByText("3 waiting · 3 on you")).toBeVisible();
     // By platform: none of the posts is for TikTok; Instagram brings all three back.
-    await page.getByLabel("Platform").selectOption({ label: "TikTok" });
+    await page.getByLabel("Platform", { exact: true }).selectOption({ label: "TikTok" });
     await expect(page).toHaveURL(/[?&]platform=TIKTOK/);
     await expect(tiles).toHaveCount(0);
     await expect(
       page.getByText("Nothing waiting for approval matches these filters."),
     ).toBeVisible();
-    await page.getByLabel("Platform").selectOption({ label: "Instagram" });
+    await page.getByLabel("Platform", { exact: true }).selectOption({ label: "Instagram" });
     await expect(page).toHaveURL(/[?&]platform=INSTAGRAM/);
     await expect(tiles).toHaveCount(3);
     // Thumbnails: each tile carries the post's 9:16 card, which opens its details.
