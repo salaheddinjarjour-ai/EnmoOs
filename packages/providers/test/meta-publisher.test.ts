@@ -359,6 +359,7 @@ describe("progress in PublishJob.containerId", () => {
       items: ["17890000000000001", "17890000000000002"],
       parent: "17890000000000003",
       finished: false,
+      posting: false,
       result: "17900000000000001",
     };
     const text = formatProgress(progress);
@@ -372,6 +373,11 @@ describe("progress in PublishJob.containerId", () => {
       finished: true,
     });
     expect(parseProgress("FB_PHOTO;result=1001_7001")).toMatchObject({ result: "1001_7001" });
+    // A Facebook post whose publishing call went out unanswered.
+    const posting = { ...progress, flow: "FB_MULTI_PHOTO" as const, parent: null, result: null };
+    const marked = formatProgress({ ...posting, posting: true });
+    expect(marked).toBe("FB_MULTI_PHOTO;items=17890000000000001,17890000000000002;posting");
+    expect(parseProgress(marked)).toEqual({ ...posting, posting: true });
   });
 
   it("rejects anything that isn't one of ours", () => {
@@ -383,6 +389,7 @@ describe("progress in PublishJob.containerId", () => {
       "IG_IMAGE;items=1;items=2",
       "IG_IMAGE;parent",
       "IG_IMAGE;finished=yes",
+      "FB_PHOTO;posting=1",
       "IG_IMAGE;items=1 2",
       "IG_IMAGE;owner=1",
     ]) {

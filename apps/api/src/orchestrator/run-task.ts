@@ -5,6 +5,7 @@ import {
   BudgetExceeded,
   COPY_BANNED_SCAN_IGNORE,
   InvalidAgentInput,
+  publishLimitIssues,
   shotCoverageIssues,
 } from "@enmo/agents";
 import type { DbTransaction } from "@enmo/db";
@@ -257,15 +258,24 @@ async function runWrite(deps: Deps, task: TaskWithContext): Promise<void> {
 
 /* ─── qa (Manager) ───────────────────────────────────────────────────────────────────────────── */
 
+/** What gates approval: no round opens while any of these is non-empty. */
+export interface QaGates {
+  bannedWords: BannedWordHit[];
+  /** The post's current takes don't fill exactly its scenes or slides (with visuals only). */
+  shotGaps: Issue[];
+  /** A platform's caption with its hashtags appended breaks that platform's publishing limits. */
+  publishLimits: Issue[];
+}
+
 /**
- * Code-run checks the Manager reviews alongside the copy. Two also gate approval: banned words,
- * and the post's current takes filling exactly its scenes or slides (with visuals only).
+ * Code-run checks the Manager reviews alongside the copy. Three also gate approval (QaGates):
+ * banned words, copy a platform won't publish, and takes that don't fill the scenes or slides.
  */
 export function automatedChecks(
   copy: CopywriterOutput,
   context: Pick<CopywriterInput, "post" | "brand">,
   visuals: readonly QaVisual[] | null,
-): { checks: AutomatedCheck[]; bannedWords: BannedWordHit[]; shotGaps: Issue[] } {
+): { checks: AutomatedCheck[] } & QaGates {
   const gaps =
     visuals === null ? [] : shotCoverageIssues(context.post, visualCopyOf(copy), visuals);
   return {
@@ -277,14 +287,22 @@ export function automatedChecks(
       ignoreKeys: COPY_BANNED_SCAN_IGNORE,
     }),
     shotGaps: gaps,
+    publishLimits: publishLimitIssues(copy, context.post),
   };
 }
 
 /** The gates' findings as QA issues for the specialist that fixes each. */
-function gateIssues(bannedWords: readonly BannedWordHit[], gaps: readonly Issue[]): QaIssue[] {
+function gateIssues({ bannedWords, shotGaps, publishLimits }: QaGates): QaIssue[] {
   return [
     ...bannedWordIssues(bannedWords),
-    ...gaps.map((gap) => ({
+    ...publishLimits.map((issue) => ({
+      target: "COPYWRITER" as const,
+      field: issue.path || "caption",
+      problem: issue.message,
+      instruction:
+        "Shorten the caption or drop hashtags until each platform's caption, with the hashtags appended, fits that platform.",
+    })),
+    ...shotGaps.map((gap) => ({
       target: "VISUAL_DIRECTOR" as const,
       field: gap.path || "shots",
       problem: gap.message,
@@ -305,11 +323,7 @@ async function runQa(deps: Deps, task: TaskWithContext): Promise<void> {
     return;
   }
   const visuals = await qaVisualsOf(deps, post.id);
-  const {
-    checks,
-    bannedWords,
-    shotGaps: gaps,
-  } = automatedChecks(copy, { brand, post: postContext }, visuals);
+  const { checks, ...gates } = automatedChecks(copy, { brand, post: postContext }, visuals);
   const input: ManagerQaInput = {
     brief,
     brand,
@@ -330,39 +344,45 @@ async function runQa(deps: Deps, task: TaskWithContext): Promise<void> {
     await reviseAfterQa(deps, task, qa, qa.issues);
     return;
   }
-  const issues = gateIssues(bannedWords, gaps);
+  const issues = gateIssues(gates);
   if (issues.length > 0) {
-    // The gates: no approval round opens while the copy still breaks the banned-words list, or on
-    // takes that don't fill exactly the post's scenes or slides.
+    // The gates: no approval round opens while the copy still breaks the banned-words list or a
+    // platform's publishing limits, or on takes that don't fill exactly the scenes or slides.
     if (canRevise) {
       await reviseAfterQa(deps, task, qa, issues);
       return;
     }
     await deps.prisma.agentTask.update({ where: { id: task.id }, data: { output: qa } });
-    await escalateTask(deps, task.id, gateHandOff(post.ref, bannedWords, gaps));
+    await escalateTask(deps, task.id, gateHandOff(post.ref, gates));
     return;
   }
   await sendForApproval(deps, task, qa, client.id);
 }
 
+function gateReason({ bannedWords, publishLimits }: QaGates): string {
+  if (bannedWords.length > 0) return "BANNED_WORDS";
+  return publishLimits.length > 0 ? "PUBLISH_LIMITS" : "SHOTS_OUT_OF_STEP";
+}
+
 /** Why QA can't send the post for approval, out of revisions. */
-function gateHandOff(
-  ref: string,
-  bannedWords: readonly BannedWordHit[],
-  gaps: readonly Issue[],
-): HandOff {
+function gateHandOff(ref: string, gates: QaGates): HandOff {
+  const { bannedWords, shotGaps: gaps, publishLimits } = gates;
   const reasons: string[] = [];
   if (bannedWords.length > 0) {
     const terms = [...new Set(bannedWords.map((hit) => hit.term))].join(", ");
     reasons.push(`the copy still uses banned words (${terms})`);
   }
+  if (publishLimits.length > 0) {
+    reasons.push(`a platform won't publish its caption (${publishLimits[0]!.message})`);
+  }
   if (gaps.length > 0) {
     reasons.push(`its takes don't match the copy's scenes or slides (${gaps[0]!.message})`);
   }
   return {
-    reason: bannedWords.length > 0 ? "BANNED_WORDS" : "SHOTS_OUT_OF_STEP",
+    reason: gateReason(gates),
     issues: [
       ...bannedWords.map((hit) => ({ path: hit.path, message: `Banned term "${hit.term}"` })),
+      ...publishLimits,
       ...gaps,
     ],
     message: `can't send ${ref} for approval: ${reasons.join(", and ")}.`,

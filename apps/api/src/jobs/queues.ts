@@ -247,8 +247,12 @@ export const jobIds = {
   /** A requeue token lets the sweeper schedule a post whose job was lost. */
   publisherSchedule: ({ postId, round }: PublisherScheduleJob, requeue?: RequeueToken | null) =>
     `schedule-${postId}-r${round}${requeueSuffix(requeue)}`,
-  /** DESIGN's publish:<id>:run, one per attempt. */
-  publishRun: ({ publishJobId, attempt }: PublishRunJob) => `publish-${publishJobId}-run${attempt}`,
+  /**
+   * DESIGN's publish:<id>:run, one per attempt; a requeue token lets tick.publish run an attempt
+   * again whose run BullMQ gave up on (kept as failed, so the plain id can't be added again).
+   */
+  publishRun: ({ publishJobId, attempt }: PublishRunJob, requeue?: RequeueToken | null) =>
+    `publish-${publishJobId}-run${attempt}${requeueSuffix(requeue)}`,
   /** DESIGN's publish:<id>:poll:<n>, scoped to the attempt that created the container. */
   publishPoll: ({ publishJobId, attempt, poll }: PublishPollJob) =>
     `publish-${publishJobId}-run${attempt}-poll${poll}`,
@@ -524,10 +528,10 @@ export function enqueuePublisherSchedule(
 export function enqueuePublishRun(
   queues: JobQueues,
   data: PublishRunJob,
-  { delayMs }: { delayMs?: number } = {},
+  { delayMs, requeue }: { delayMs?: number; requeue?: RequeueToken | null } = {},
 ): Promise<string> {
   return queues.add(JOB.publishRun, data, {
-    jobId: jobIds.publishRun(data),
+    jobId: jobIds.publishRun(data, requeue),
     ...(delayMs ? { delayMs } : {}),
   });
 }

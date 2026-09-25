@@ -9,6 +9,8 @@ import type { Issue } from "@enmo/shared";
  * - UNAVAILABLE: transport errors and 5xx; retry
  * - REJECTED: any other refusal by the platform
  * - NOT_CONFIGURED: a live publisher without app credentials or an account
+ * - UNCONFIRMED: an earlier attempt sent the call that makes the post public and never recorded
+ *   the answer (a crash, a failed save), so the post may be live already; a person checks first
  */
 export type PublishErrorCode =
   | "INVALID_PAYLOAD"
@@ -17,7 +19,8 @@ export type PublishErrorCode =
   | "MEDIA_FAILED"
   | "UNAVAILABLE"
   | "REJECTED"
-  | "NOT_CONFIGURED";
+  | "NOT_CONFIGURED"
+  | "UNCONFIRMED";
 
 const RETRYABLE: ReadonlySet<PublishErrorCode> = new Set(["RATE_LIMITED", "UNAVAILABLE"]);
 

@@ -14,14 +14,20 @@ import {
   type AlertPayload,
   type ApproveAllResponse,
   type Platform,
+  type PublishJobDto,
 } from "@enmo/shared";
-import { afterEach, describe, expect, it } from "vitest";
+import { UnrecoverableError, Worker } from "bullmq";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it, onTestFinished } from "vitest";
+import { closeRedis, createWorkerConnection } from "../../src/jobs/connection";
 import { enqueuePublishRun, jobIds, publishPollMaxPolls } from "../../src/jobs/queues";
 import { DAY_MS, FakeClock, HOUR_MS, MINUTE_MS } from "../../src/lib/clock";
 import { currentContentHash } from "../../src/orchestrator/approval-round";
 import { EventBatch } from "../../src/orchestrator/events";
 import { PUBLISH_CANCEL_REASONS, syncPostPublishStatus } from "../../src/orchestrator/publishing";
-import { pollPublish } from "../../src/publishing/publish-service";
+import { pollPublish, runPublish } from "../../src/publishing/publish-service";
 import { testDb } from "../helpers/db";
 import { createClient, createUser } from "../helpers/factories";
 import { startHarness, type Harness, type HarnessOptions } from "../helpers/harness";
@@ -39,6 +45,7 @@ import {
   publisherNotes,
   runToApproval,
   seedMetaPlan,
+  THURSDAY,
   tickAt,
   waitForJobs,
   waitForPostStatus,
@@ -145,6 +152,59 @@ describe("publisher.schedule", () => {
     // Flagged posts are not re-driven by the tick.
     await tickAt(h, new Date(Date.parse(NOW) + 10 * MINUTE_MS).toISOString());
     expect(await testDb().publishJob.count()).toBe(0);
+  }, 90_000);
+
+  it("keeps to the campaign window: a post approved after it ended waits for a teammate's day", async () => {
+    const h = await start();
+    const seeded = await seedMetaPlan(h, { platforms: ["INSTAGRAM"] });
+    const [post] = await runToApproval(h, seeded);
+    const postId = post!.id;
+    // The window closed before the approval came in (a Ramadan post approved after Eid).
+    const campaign = await testDb().campaign.findUniqueOrThrow({
+      where: { id: seeded.campaignId },
+    });
+    await testDb().campaign.update({
+      where: { id: seeded.campaignId },
+      data: {
+        brief: {
+          ...(campaign.brief as Record<string, unknown>),
+          window: { start: "2027-02-20", end: "2027-02-28" },
+        },
+      },
+    });
+    await approvePost(h, seeded, postId);
+
+    const flagged = await h.waitFor(async () => {
+      const row = await testDb().post.findUniqueOrThrow({ where: { id: postId } });
+      return row.needsAttention ? row : null;
+    });
+    expect(flagged).toMatchObject({
+      status: "APPROVED",
+      attentionReason:
+        "Not scheduled on Instagram: the campaign window ended on 2027-02-28; put it on a day on the calendar",
+    });
+    // Nothing went on a day nobody chose.
+    expect(await testDb().publishJob.count()).toBe(0);
+    expect(
+      (await alertsAfter(h, 1)).map((alert) => [alert.kind, alert.entityType, alert.entityId]),
+    ).toEqual([["failed", "Post", postId]]);
+
+    // A teammate picks Thursday; the optimizer picks its best Instagram hour.
+    const job = await apiFor(h, seeded.cookie)<PublishJobDto>("POST", "/v1/publish-jobs", {
+      postId,
+      platform: "INSTAGRAM",
+      date: THURSDAY,
+    });
+    expect(job).toMatchObject({
+      status: "SCHEDULED",
+      slotSource: "manual",
+      date: THURSDAY,
+      scheduledFor: "2027-03-04T08:00:00.000Z",
+    });
+    const scheduled = await waitForPostStatus(h, postId, "SCHEDULED");
+    expect(scheduled).toMatchObject({ needsAttention: false, attentionReason: null });
+    await tickAt(h, job.scheduledFor);
+    await waitForPostStatus(h, postId, "LIVE");
   }, 90_000);
 
   it("falls back to the optimizer's top candidates when the Publisher can't answer", async () => {
@@ -441,7 +501,10 @@ describe("the publish guard", () => {
 
 describe("dry run or live, settled at the slot", () => {
   it("publishes a job scheduled live as a dry run once publishing is switched off, and says so", async () => {
-    const live = await startLive();
+    // Both processes share the storage the takes were rendered into, as a deploy would.
+    const storage = { STORAGE_LOCAL_DIR: await mkdtemp(path.join(tmpdir(), "enmo-kill-switch-")) };
+    onTestFinished(() => rm(storage.STORAGE_LOCAL_DIR, { recursive: true, force: true }));
+    const live = await startLive(storage);
     const { seeded, postId } = await scheduledPost(live, ["INSTAGRAM"], (client) =>
       connectMetaAccounts(live, client),
     );
@@ -449,7 +512,7 @@ describe("dry run or live, settled at the slot", () => {
     // The kill switch: the next process runs with PUBLISH_MODE=dry-run.
     await live.stop();
     harness = undefined;
-    const h = await start();
+    const h = await start({ env: storage });
 
     await tickAt(h, IG_TUESDAY_1100);
     await waitForPostStatus(h, postId, "LIVE");
@@ -645,39 +708,81 @@ describe("the live publisher's failures", () => {
   }, 90_000);
 });
 
+/** A post with one job in `status`, written straight to the database (no worker involved). */
+async function seedJobRow(
+  h: Harness,
+  input: {
+    status: "QUEUED" | "PUBLISHING";
+    platform?: Platform;
+    attempts?: number;
+    containerId?: string | null;
+  },
+) {
+  const platform = input.platform ?? "INSTAGRAM";
+  const admin = await createUser({ role: "ADMIN" });
+  const client = await createClient({ name: "Qahwa Co" });
+  const campaign = await testDb().campaign.create({
+    data: { clientId: client.id, name: "Iced", status: "ACTIVE", createdById: admin.id },
+  });
+  const post = await testDb().post.create({
+    data: {
+      campaignId: campaign.id,
+      clientId: client.id,
+      ref: "p1",
+      type: "STATIC",
+      platforms: [platform],
+      status: input.status === "QUEUED" ? "SCHEDULED" : "PUBLISHING",
+      approvedAt: h.clock.now(),
+    },
+  });
+  const variant = await testDb().postVariant.create({
+    data: {
+      postId: post.id,
+      platform,
+      format: platform === "FACEBOOK" ? "SQUARE_1_1" : "PORTRAIT_4_5",
+      caption: "Iced.",
+    },
+  });
+  const job = await testDb().publishJob.create({
+    data: {
+      variantId: variant.id,
+      platform,
+      status: input.status,
+      scheduledFor: h.clock.now(),
+      slotSource: "optimizer",
+      dryRun: true,
+      attempts: input.attempts ?? 1,
+      containerId: input.containerId ?? null,
+    },
+  });
+  return { post, job };
+}
+
+/**
+ * Takes the waiting ops job `jobId` as a worker would and fails it for good, as BullMQ keeps a run
+ * whose last attempt threw (e.g. the database was down for longer than its backoff).
+ */
+async function failRun(h: Harness, jobId: string, reason: string): Promise<void> {
+  const connection = createWorkerConnection(h.deps.config.REDIS_URL, h.deps.logger);
+  const worker = new Worker("ops", null, { connection, prefix: h.deps.queues.prefix });
+  try {
+    const token = `test-${jobId}`;
+    const job = await worker.getNextJob(token, { block: false });
+    expect(job?.id).toBe(jobId);
+    await job!.moveToFailed(new UnrecoverableError(reason), token);
+    expect(await job!.getState()).toBe("failed");
+  } finally {
+    await worker.close();
+    await closeRedis(connection);
+  }
+}
+
 describe("tick.publish", () => {
   it("fails a PUBLISHING job nothing is working on any more, as stuck", async () => {
     const h = await start({ workers: false });
-    const admin = await createUser({ role: "ADMIN" });
-    const client = await createClient({ name: "Qahwa Co" });
-    const campaign = await testDb().campaign.create({
-      data: { clientId: client.id, name: "Iced", status: "ACTIVE", createdById: admin.id },
-    });
-    const post = await testDb().post.create({
-      data: {
-        campaignId: campaign.id,
-        clientId: client.id,
-        ref: "p1",
-        type: "STATIC",
-        platforms: ["INSTAGRAM"],
-        status: "PUBLISHING",
-        approvedAt: h.clock.now(),
-      },
-    });
-    const variant = await testDb().postVariant.create({
-      data: { postId: post.id, platform: "INSTAGRAM", format: "PORTRAIT_4_5", caption: "Iced." },
-    });
-    const job = await testDb().publishJob.create({
-      data: {
-        variantId: variant.id,
-        platform: "INSTAGRAM",
-        status: "PUBLISHING",
-        scheduledFor: h.clock.now(),
-        slotSource: "optimizer",
-        dryRun: true,
-        attempts: 1,
-        containerId: "IG_IMAGE;items=1",
-      },
+    const { post, job } = await seedJobRow(h, {
+      status: "PUBLISHING",
+      containerId: "IG_IMAGE;items=1",
     });
 
     await h.runTick("tick.publish");
@@ -692,6 +797,166 @@ describe("tick.publish", () => {
     expect((await alerts()).map((alert) => [alert.kind, alert.entityId])).toEqual([
       ["stuck", job.id],
     ]);
+  });
+
+  it("tells people to check the Page before retrying a Facebook post that stalled mid-publish", async () => {
+    const h = await start({ workers: false });
+    const { job } = await seedJobRow(h, {
+      status: "PUBLISHING",
+      platform: "FACEBOOK",
+      containerId: "FB_PHOTO;posting",
+    });
+    await h.runTick("tick.publish");
+    expect(await testDb().publishJob.findUniqueOrThrow({ where: { id: job.id } })).toMatchObject({
+      status: "FAILED",
+      lastError:
+        "publishing stalled right after Facebook was sent the post, so it may be live already: check Facebook, then retry to post it again, or cancel the job",
+    });
+  });
+
+  it("re-drives a QUEUED job whose run gave up once, and fails it with an alert when that gives up too", async () => {
+    const h = await start({ workers: false });
+    const { post, job } = await seedJobRow(h, { status: "QUEUED", attempts: 0 });
+    const ops = h.deps.queues.queue("ops");
+    const run = { publishJobId: job.id, attempt: 1 };
+    await enqueuePublishRun(h.deps.queues, run);
+    await failRun(h, jobIds.publishRun(run), "Can't reach database server at 127.0.0.1:54329");
+
+    // The failed run keeps its id for a week, so a plain re-add would do nothing: a new id.
+    await h.runTick("tick.publish");
+    const sweep = jobIds.publishRun(run, "sweep");
+    expect(await (await ops.getJob(sweep))?.getState()).toBe("waiting");
+    expect(await testDb().publishJob.findUniqueOrThrow({ where: { id: job.id } })).toMatchObject({
+      status: "QUEUED",
+      attempts: 0,
+    });
+    // While it waits, later ticks leave it be.
+    await h.runTick("tick.publish");
+    expect(await ops.getJobCountByTypes("waiting", "failed")).toBe(2);
+
+    await failRun(h, sweep, "Can't reach database server at 127.0.0.1:54329");
+    await h.runTick("tick.publish");
+    expect(await testDb().publishJob.findUniqueOrThrow({ where: { id: job.id } })).toMatchObject({
+      status: "FAILED",
+      attempts: 1,
+      lastError:
+        "publishing couldn't start (Can't reach database server at 127.0.0.1:54329); retry it",
+    });
+    expect((await testDb().post.findUniqueOrThrow({ where: { id: post.id } })).status).toBe(
+      "FAILED",
+    );
+    expect((await alerts()).map((alert) => [alert.kind, alert.entityId])).toEqual([
+      ["stuck", job.id],
+    ]);
+    // Settled: nothing more is queued for it.
+    await h.runTick("tick.publish");
+    expect(await ops.getJobCountByTypes("waiting", "delayed")).toBe(0);
+  });
+
+  it("fails a QUEUED job whose run can't claim it on BullMQ's last attempt", async () => {
+    const h = await start({ workers: false });
+    const { job } = await seedJobRow(h, { status: "QUEUED", attempts: 0 });
+    // The claim's transaction fails (a timeout, an outage); what comes after it works again.
+    const prisma = h.deps.prisma;
+    let broken = 0;
+    const flaky = new Proxy(prisma, {
+      get(target, property) {
+        if (property === "$transaction" && broken > 0) {
+          broken -= 1;
+          return () => Promise.reject(new Error("Transaction API error: Transaction already closed"));
+        }
+        const value: unknown = Reflect.get(target, property, target);
+        return typeof value === "function" ? (value as () => unknown).bind(target) : value;
+      },
+    });
+    const deps = { ...h.deps, prisma: flaky };
+    const data = { publishJobId: job.id, attempt: 1 };
+
+    broken = 1;
+    await expect(runPublish(deps, data, { isLast: false })).rejects.toThrow(/Transaction/);
+    expect((await testDb().publishJob.findUniqueOrThrow({ where: { id: job.id } })).status).toBe(
+      "QUEUED",
+    );
+
+    broken = 1;
+    await expect(runPublish(deps, data, { isLast: true })).rejects.toThrow(/Transaction/);
+    expect(await testDb().publishJob.findUniqueOrThrow({ where: { id: job.id } })).toMatchObject({
+      status: "FAILED",
+      attempts: 1,
+      lastError:
+        "publishing couldn't start (Transaction API error: Transaction already closed); retry it",
+    });
+    expect((await alerts()).map((alert) => [alert.kind, alert.entityId])).toEqual([
+      ["stuck", job.id],
+    ]);
+  });
+
+  it("flags an approved post whose re-driven publisher.schedule gave up too, and stops re-driving it", async () => {
+    const h = await start({ workers: false });
+    const seeded = await seedMetaPlan(h, { platforms: ["INSTAGRAM"] });
+    const post = await testDb().post.create({
+      data: {
+        campaignId: seeded.campaignId,
+        clientId: seeded.client.id,
+        ref: "p9",
+        type: "STATIC",
+        platforms: ["INSTAGRAM"],
+        status: "APPROVED",
+        approvedAt: h.clock.now(),
+      },
+    });
+    await testDb().approvalRequest.create({
+      data: {
+        postId: post.id,
+        round: 1,
+        status: "APPROVED",
+        chain: [],
+        currentStep: 0,
+        contentHash: "fixture",
+        resolvedAt: h.clock.now(),
+      },
+    });
+    const agents = h.deps.queues.queue("agents");
+    const failSchedule = async (id: string) => {
+      const connection = createWorkerConnection(h.deps.config.REDIS_URL, h.deps.logger);
+      const worker = new Worker("agents", null, { connection, prefix: h.deps.queues.prefix });
+      try {
+        const token = `test-${id}`;
+        const job = await worker.getNextJob(token, { block: false });
+        expect(job?.id).toBe(id);
+        await job!.moveToFailed(new UnrecoverableError("LLM budget store unreachable"), token);
+      } finally {
+        await worker.close();
+        await closeRedis(connection);
+      }
+    };
+    const later = (minutes: number) =>
+      new Date(Date.parse(NOW) + minutes * MINUTE_MS).toISOString();
+
+    await tickAt(h, later(6));
+    const sweep = jobIds.publisherSchedule({ postId: post.id, round: 1 }, "sweep");
+    expect(await (await agents.getJob(sweep))?.getState()).toBe("waiting");
+    await failSchedule(sweep);
+
+    await tickAt(h, later(7));
+    const flagged = await testDb().post.findUniqueOrThrow({ where: { id: post.id } });
+    expect(flagged).toMatchObject({
+      status: "APPROVED",
+      needsAttention: true,
+      attentionReason: "The Publisher couldn't schedule it: LLM budget store unreachable",
+    });
+    expect(await alerts()).toEqual([
+      expect.objectContaining({
+        kind: "failed",
+        entityType: "Post",
+        entityId: post.id,
+        message:
+          "The Publisher couldn't schedule p9: LLM budget store unreachable. Pick its days on the calendar.",
+      }),
+    ]);
+    await tickAt(h, later(8));
+    expect(await agents.getJobCountByTypes("waiting", "delayed")).toBe(0);
+    expect(await alerts()).toHaveLength(1);
   });
 
   it("re-drives an approved post whose publisher.schedule never ran", async () => {

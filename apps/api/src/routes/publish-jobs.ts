@@ -4,14 +4,19 @@ import {
   ReschedulePublishJobBody,
   ReschedulePublishJobResponse,
   RetryPublishJobResponse,
+  SchedulePublishJobBody,
+  SchedulePublishJobResponse,
 } from "@enmo/shared";
 import { requireCap } from "../plugins/rbac";
-import { cancel, reschedule, retry } from "../services/publishing";
+import { cancel, reschedule, retry, schedule } from "../services/publishing";
 import type { RouteModule } from "../types";
 import { serviceUserOf } from "./context";
 
 /*
  * Publish jobs (DESIGN §E "calendar"):
+ *   POST  /publish-jobs {postId,       publish.reschedule  a platform the Publisher couldn't place
+ *         platform, date}                                  (or whose job was cancelled), at the
+ *                                                          best free hour of that client-local day
  *   PATCH /publish-jobs/:id {date}     publish.reschedule  the best free hour of that client-local
  *                                                          day (a calendar drag)
  *   POST  /publish-jobs/:id/retry      publish.retry       a FAILED job, queued again
@@ -19,6 +24,18 @@ import { serviceUserOf } from "./context";
  */
 export const publishJobsRoutes: RouteModule = (app) => {
   const { deps } = app;
+
+  app.post(
+    "/publish-jobs",
+    {
+      onRequest: requireCap("publish.reschedule"),
+      schema: { body: SchedulePublishJobBody, response: { 201: SchedulePublishJobResponse } },
+    },
+    async (request, reply) => {
+      const job = await schedule(deps, serviceUserOf(request), request.body);
+      return reply.status(201).send(job);
+    },
+  );
 
   app.patch(
     "/publish-jobs/:id",

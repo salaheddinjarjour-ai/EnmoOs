@@ -21,6 +21,7 @@ export {
   type MetaPlatform,
   type MetaPublisherOptions,
 } from "./meta";
+export { hasUnconfirmedPost, withoutPostingMarker } from "./meta-progress";
 export { isPublicHttpsUrl } from "./public-url";
 export {
   assertPublishable,

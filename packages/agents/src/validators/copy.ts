@@ -3,7 +3,10 @@ import {
   COPY_SHAPE_BY_POST_TYPE,
   PLATFORM_LABEL,
   compileBannedWords,
+  platformSupportsPostType,
+  publishedTextFit,
   scanForBannedWords,
+  variantTextOf,
   type AutomatedCheck,
   type BannedWordMatcher,
   type CopyRevision,
@@ -27,6 +30,7 @@ export const COPY_RULES = [
   "captions",
   "platform_captions",
   "hashtags",
+  "publish_limits",
   "banned_words",
 ] as const;
 export type CopyRule = (typeof COPY_RULES)[number];
@@ -267,6 +271,43 @@ function hashtagIssues(hashtags: readonly string[]): Issue[] {
   return issues;
 }
 
+/**
+ * What each platform's variant goes out with: its caption, then a blank line and the hashtags
+ * (publishedCaption). That text, not the caption alone, has to fit the platform's limits
+ * (PLATFORM_LIMITS: Instagram takes 2200 characters and 30 hashtags, inline ones included), or
+ * the Publisher can't schedule the post once it is approved.
+ */
+export function publishLimitIssues(copy: CopywriterOutput, post: PostContext): Issue[] {
+  const issues: Issue[] = [];
+  for (const platform of new Set(post.platforms)) {
+    if (!platformSupportsPostType(platform, post.type)) continue;
+    const label = PLATFORM_LABEL[platform];
+    const own = copy.platformCaptions.findIndex((entry) => entry.platform === platform);
+    const path = own === -1 ? "caption" : `platformCaptions[${own}].caption`;
+    const text = variantTextOf(copy, platform);
+    const fit = publishedTextFit(platform, text.caption, text.hashtags);
+    // A caption or hashtag list already over the Copywriter's own limits has its issue under
+    // "captions", "platform_captions" or "hashtags"; these are about what only publishing adds.
+    if (fit.length > fit.maxChars && text.caption.length <= COPY_LIMITS.captionMaxChars) {
+      issues.push({
+        path,
+        message: `On ${label} the caption goes out with the hashtags appended after a blank line: ${fit.length} characters, and ${label} takes ${fit.maxChars}. Cut ${fit.length - fit.maxChars} characters from the caption or the hashtags.`,
+      });
+    }
+    if (
+      fit.maxHashtags !== null &&
+      fit.hashtags > fit.maxHashtags &&
+      text.hashtags.length <= COPY_LIMITS.hashtagsMax
+    ) {
+      issues.push({
+        path: "hashtags",
+        message: `On ${label} the caption goes out with ${fit.hashtags} hashtags (those written in the caption plus the appended ones), and ${label} takes ${fit.maxHashtags}. Drop ${fit.hashtags - fit.maxHashtags}.`,
+      });
+    }
+  }
+  return issues;
+}
+
 function bannedWordIssues(copy: CopywriterOutput, matcher: BannedWordMatcher): Issue[] {
   return scanForBannedWords(copy, matcher, { ignoreKeys: COPY_BANNED_SCAN_IGNORE }).map((hit) => ({
     path: hit.path,
@@ -296,6 +337,7 @@ function contentIssuesByRule(
     captions: captionIssues(copy),
     platform_captions: platformCaptionIssues(copy, post),
     hashtags: hashtagIssues(copy.hashtags),
+    publish_limits: publishLimitIssues(copy, post),
   };
 }
 

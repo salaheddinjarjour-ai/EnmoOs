@@ -58,7 +58,10 @@ export function copyOf(post: { copy: unknown }): CopywriterOutput | null {
 }
 
 /** The job's payload from the variant and the post's current takes. */
-export function payloadOf(deps: Pick<Deps, "config">, job: PublishJobWithContext): PreparedPayload {
+export function payloadOf(
+  deps: Pick<Deps, "config" | "storage">,
+  job: PublishJobWithContext,
+): PreparedPayload {
   const { variant } = job;
   return preparePayload({
     platform: variant.platform,
@@ -69,6 +72,7 @@ export function payloadOf(deps: Pick<Deps, "config">, job: PublishJobWithContext
     copy: copyOf(variant.post),
     takes: job.takes,
     publicBaseUrl: deps.config.PUBLIC_ASSET_BASE_URL,
+    storageUrl: (key) => deps.storage.publicUrl(key),
   });
 }
 

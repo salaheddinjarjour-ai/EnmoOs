@@ -29,6 +29,7 @@ export interface SeedJobInput {
   slotSource?: SlotSource;
   publishedAt?: Date | null;
   liveUrl?: string | null;
+  containerId?: string | null;
 }
 
 export interface SeedPublishedPostInput {
@@ -133,6 +134,7 @@ export async function seedPublishPost(input: SeedPublishedPostInput): Promise<Se
         socialAccountId: job.socialAccountId ?? null,
         publishedAt: job.publishedAt ?? null,
         liveUrl: job.liveUrl ?? null,
+        containerId: job.containerId ?? null,
       },
     });
   }

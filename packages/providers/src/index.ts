@@ -7,6 +7,7 @@ export * from "./storage/index";
 
 export * from "./imaging/fonts";
 export * from "./imaging/placeholder";
+export * from "./imaging/publish-frame";
 export * from "./imaging/review-image";
 
 export * from "./meta/config";

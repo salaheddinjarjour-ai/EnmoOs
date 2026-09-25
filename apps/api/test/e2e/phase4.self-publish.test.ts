@@ -10,6 +10,7 @@ import {
   type PublishJobDto,
   type PublishUpdatedPayload,
 } from "@enmo/shared";
+import sharp from "sharp";
 import { afterEach, describe, expect, it } from "vitest";
 import { DAY_MS, FakeClock } from "../../src/lib/clock";
 import { currentContentHash } from "../../src/orchestrator/approval-round";
@@ -67,6 +68,22 @@ afterEach(async () => {
 async function start(options: HarnessOptions = {}): Promise<Harness> {
   harness = await startHarness({ clock: new FakeClock(NOW), ...options });
   return harness;
+}
+
+/**
+ * The JPEG Instagram fetches instead of a 9:16 PNG master (publishing/renditions.ts): 4:5 for the
+ * feed, whole for a story. Checks the file is in storage as that, and answers its public URL.
+ */
+async function instagramFrame(
+  h: Harness,
+  masterKey: string | null,
+  size: { width: number; height: number } = { width: 1080, height: 1350 },
+): Promise<string> {
+  const key = masterKey!.replace(/\.png$/, `-instagram-${size.width}x${size.height}.jpg`);
+  const stored = await h.deps.storage.get(key);
+  expect(stored, key).not.toBeNull();
+  expect(await sharp(stored!.body).metadata()).toMatchObject({ format: "jpeg", ...size });
+  return h.deps.storage.publicUrl(key);
 }
 
 describe("phase4.self-publish", () => {
@@ -180,6 +197,9 @@ describe("phase4.self-publish", () => {
     expectSameInstant(published.INSTAGRAM!.publishedAt, IG_TUESDAY_1100);
     expectSameInstant(live.liveAt, IG_TUESDAY_1100);
     expect(live.needsAttention).toBe(false);
+    // The dry run wrote the JPEG a live Instagram publish would hand Meta.
+    const [master] = await db.asset.findMany({ where: { postId, isCurrent: true } });
+    await instagramFrame(h, master!.storageKey);
 
     // Events go out just after the commit the wait above saw: wait for the last of them.
     const postStatuses = await h.waitFor(async () => {
@@ -274,8 +294,9 @@ describe("phase4.self-publish", () => {
       `GET /v26.0/${media!.id}`,
     ]);
     const instagram = variantOf("INSTAGRAM");
+    // Not the 9:16 PNG master: Instagram fetches a 4:5 JPEG cut from it.
     expect(container!.params).toMatchObject({
-      image_url: take!.url,
+      image_url: await instagramFrame(h, take!.storageKey),
       caption: publishedCaption(instagram.caption, instagram.hashtags),
     });
     const published = await jobsOf(postId);
@@ -320,6 +341,7 @@ describe("phase4.self-publish", () => {
         const { shot } = AssetParams.parse(take.params);
         return {
           url: take.url,
+          storageKey: take.storageKey,
           at: {
             shotId: take.shotId,
             sceneIndex: shot?.sceneIndex ?? take.sceneIndex,
@@ -327,7 +349,7 @@ describe("phase4.self-publish", () => {
           },
         };
       });
-      return placed.sort((a, b) => compareShotPosition(a.at, b.at)).map((take) => take.url);
+      return placed.sort((a, b) => compareShotPosition(a.at, b.at));
     };
     // Each post goes out on its plan's day, Facebook at 09:00 and Instagram at 11:00 in Riyadh.
     const slot = (day: string, hour: "09" | "11") =>
@@ -343,7 +365,7 @@ describe("phase4.self-publish", () => {
       `POST ${V}/${page.id}/video_reels`,
       `GET ${V}/${fbReel!.id}`,
     ]);
-    const [reelTake] = await takesOf(reel!);
+    const reelTake = (await takesOf(reel!))[0]!.url;
     expect(graph.calls[1]!.headers.file_url).toBe(reelTake);
     expect(graph.calls[2]!.body).toMatchObject({
       upload_phase: "finish",
@@ -419,8 +441,10 @@ describe("phase4.self-publish", () => {
       `POST ${V}/${ig}/media_publish`,
       `GET ${V}/${carouselMedia!.id}`,
     ]);
+    const frames: string[] = [];
+    for (const slide of slides) frames.push(await instagramFrame(h, slide.storageKey));
     expect(children.map((child) => child.params)).toEqual(
-      slides.map((url) => ({ image_url: url, is_carousel_item: true })),
+      frames.map((url) => ({ image_url: url, is_carousel_item: true })),
     );
     expect(parent.children).toEqual(children.map((child) => child.id));
 
@@ -450,7 +474,10 @@ describe("phase4.self-publish", () => {
       `POST ${V}/${ig}/media_publish`,
       `GET ${V}/${storyMedia!.id}`,
     ]);
-    expect(storyContainer!.params).toEqual({ media_type: "STORIES", image_url: storyTake });
+    expect(storyContainer!.params).toEqual({
+      media_type: "STORIES",
+      image_url: await instagramFrame(h, storyTake!.storageKey, { width: 1080, height: 1920 }),
+    });
   }, 90_000);
 
   it("(c) an edit after approval cancels the scheduled jobs; re-approval reschedules the same rows", async () => {

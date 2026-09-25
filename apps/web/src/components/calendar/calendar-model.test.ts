@@ -18,6 +18,7 @@ import {
   formatTimeIn,
   ghostNote,
   isCancellable,
+  isGhostSchedulable,
   isReschedulable,
   isRetryable,
   liveUrlOf,
@@ -213,12 +214,21 @@ describe("items", () => {
   it("explains a ghost by where its post stands", () => {
     expect(ghostNote(ghost())).toMatch(/^The campaign plan puts this post here; .*approved/);
     expect(ghostNote(ghost({ postStatus: "SCHEDULED" }))).toMatch(
-      /^The post is approved, but nothing is scheduled on Facebook: .*approve it again/,
+      /^The post is approved, but nothing is scheduled on Facebook: .*campaign window.*Put it on a day/,
     );
     expect(ghostNote(ghost({ postStatus: "FAILED" }))).toMatch(/Retry or cancel that one first/);
     expect(ghostNote(ghost({ postStatus: "LIVE" }))).toBe(
       "The post went out without Facebook: nothing is scheduled there, and a post that is out can't be scheduled again.",
     );
+  });
+
+  it("lets a teammate schedule only an approved post's ghosts, nothing of it out yet", () => {
+    expect(isGhostSchedulable(ghost({ postStatus: "APPROVED" }))).toBe(true);
+    expect(isGhostSchedulable(ghost({ postStatus: "SCHEDULED" }))).toBe(true);
+    for (const postStatus of ["PENDING_APPROVAL", "FAILED", "LIVE"] as const) {
+      expect(isGhostSchedulable(ghost({ postStatus }))).toBe(false);
+    }
+    expect(isGhostSchedulable(job())).toBe(false);
   });
 
   it("links only published jobs to their live post", () => {

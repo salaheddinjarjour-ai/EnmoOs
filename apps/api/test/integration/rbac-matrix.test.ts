@@ -310,6 +310,12 @@ const ROUTES: readonly RouteCase[] = [
     url: `/v1/calendar?from=2026-10-01&to=2026-10-31&clientId=${MISSING}`,
   },
   {
+    method: "POST",
+    route: "/v1/publish-jobs",
+    access: "publish.reschedule",
+    payload: () => ({ postId: MISSING, platform: "INSTAGRAM", date: "2027-03-02" }),
+  },
+  {
     method: "PATCH",
     route: "/v1/publish-jobs/:id",
     access: "publish.reschedule",

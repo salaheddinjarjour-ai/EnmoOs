@@ -106,10 +106,10 @@ export function platformSupportsPostType(platform: Platform, postType: PostType)
 
 /**
  * Whether the variant's native frame is a crop of the master rather than the master itself
- * (STATIC and CAROUSEL on Instagram and Facebook). Phase 4 publishes these as the uncropped 9:16
- * master: Facebook accepts any photo ratio, but Instagram's feed only takes 4:5 to 1.91:1
- * (PLATFORM_LIMITS.INSTAGRAM.feedImageAspect), so live Instagram feed posts need the Adapter's
- * crops (Phase 5). Payload validation therefore doesn't enforce the feed ratio yet.
+ * (STATIC and CAROUSEL on Instagram and Facebook). The Adapter (Phase 5) cuts these around the
+ * focus point. Until then Facebook publishes the 9:16 master as is (it takes any photo ratio),
+ * while Instagram, whose feed only takes 4:5 to 1.91:1 (PLATFORM_LIMITS.INSTAGRAM.feedImageAspect)
+ * and only JPEG, gets a centre-cropped JPEG rendition of the master (apps/api publishing/renditions).
  */
 export function variantNeedsCrop(postType: PostType, platform: Platform): boolean {
   const format = platformVariantFormat(postType, platform);
@@ -143,6 +143,8 @@ export interface PlatformPublishLimits {
   storyVideoMaxSec: number | null;
   /** Feed image ratios the platform takes; null when it takes any. */
   feedImageAspect: AspectRange | null;
+  /** The image formats the platform fetches; null when it takes any common one (PNG, JPEG…). */
+  imageMimeTypes: readonly string[] | null;
   /** API-published posts per account in a rolling 24-hour window; null when there's no fixed cap. */
   postsPer24h: number | null;
   /** A separate cap on API-published reels per 24 hours; null when reels share postsPer24h. */
@@ -153,8 +155,8 @@ export interface PlatformPublishLimits {
  * What each platform's publishing API accepts, as Meta and TikTok document it (Instagram Content
  * Publishing, Facebook Pages/Reels/Stories publishing, TikTok Content Posting API). Re-check them
  * on every Graph version upgrade. Instagram's cap is the one `content_publishing_limit` reports
- * (a carousel counts once). Not modelled here: Instagram fetches images as JPEG only, while the
- * Phase 3 masters are PNG, so a live Instagram publish needs a JPEG rendition of each image.
+ * (a carousel counts once). Instagram fetches images as JPEG only, while the Phase 3 masters are
+ * PNG, so an Instagram image publishes as a JPEG rendition of its master.
  */
 export const PLATFORM_LIMITS: Readonly<Record<Platform, Readonly<PlatformPublishLimits>>> =
   deepFreeze({
@@ -169,6 +171,7 @@ export const PLATFORM_LIMITS: Readonly<Record<Platform, Readonly<PlatformPublish
       videoMaxSec: 900,
       storyVideoMaxSec: 60,
       feedImageAspect: { min: 4 / 5, max: 1.91 },
+      imageMimeTypes: ["image/jpeg"],
       postsPer24h: 100,
       reelsPer24h: null,
     },
@@ -184,6 +187,7 @@ export const PLATFORM_LIMITS: Readonly<Record<Platform, Readonly<PlatformPublish
       videoMaxSec: 90,
       storyVideoMaxSec: 60,
       feedImageAspect: null,
+      imageMimeTypes: null,
       postsPer24h: null,
       reelsPer24h: 30,
     },
@@ -200,6 +204,8 @@ export const PLATFORM_LIMITS: Readonly<Record<Platform, Readonly<PlatformPublish
       videoMaxSec: 600,
       storyVideoMaxSec: null,
       feedImageAspect: null,
+      // Photo mode's own formats (JPEG, WebP) come with TikTok's publisher in Phase 5.
+      imageMimeTypes: null,
       // Approximate and shared by every app posting for the creator.
       postsPer24h: 15,
       reelsPer24h: null,
@@ -263,6 +269,49 @@ export function publishedCaption(caption: string, hashtags: readonly string[]): 
   }
   if (appended.length === 0) return body;
   return body ? `${body}\n\n${appended.join(" ")}` : appended.join(" ");
+}
+
+/** A variant's text before publishedCaption joins it: its caption and the copy's hashtags. */
+export interface VariantText {
+  caption: string;
+  hashtags: string[];
+}
+
+/** The copy fields a variant's text comes from (CopywriterOutput has them all). */
+export interface VariantTextSource {
+  caption: string;
+  hashtags: readonly string[];
+  platformCaptions: readonly { platform: Platform; caption: string }[];
+}
+
+/** What a variant publishes on `platform`: the copy's caption for it (the main one without). */
+export function variantTextOf(copy: VariantTextSource, platform: Platform): VariantText {
+  const own = copy.platformCaptions.find((entry) => entry.platform === platform);
+  return { caption: own?.caption ?? copy.caption, hashtags: [...copy.hashtags] };
+}
+
+/** How the text a variant goes out with (publishedCaption) measures against its platform. */
+export interface PublishedTextFit {
+  length: number;
+  maxChars: number;
+  /** Hashtags in the published text: the caption's own plus the appended ones. */
+  hashtags: number;
+  maxHashtags: number | null;
+}
+
+export function publishedTextFit(
+  platform: Platform,
+  caption: string,
+  hashtags: readonly string[],
+): PublishedTextFit {
+  const limits = PLATFORM_LIMITS[platform];
+  const text = publishedCaption(caption, hashtags);
+  return {
+    length: text.length,
+    maxChars: limits.captionMaxChars,
+    hashtags: hashtagsIn(text).length,
+    maxHashtags: limits.hashtagsMax,
+  };
 }
 
 /* ─── Best-time priors and slot rules (DESIGN §F "Slot optimizer") ─────────────────────────── */
