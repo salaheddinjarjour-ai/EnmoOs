@@ -63,7 +63,11 @@ export type TakeFrame =
  * What `platform` fetches for a take in a `postType` post: the master as it is (any video,
  * Facebook, a JPEG already in range) or a rendition of it.
  */
-export function takeFrameOf(platform: Platform, postType: PostType, take: RenditionTake): TakeFrame {
+export function takeFrameOf(
+  platform: Platform,
+  postType: PostType,
+  take: RenditionTake,
+): TakeFrame {
   const limits = PLATFORM_LIMITS[platform];
   if (take.kind !== "IMAGE") return { kind: "master" };
   const aspect = FEED_POST_TYPES.has(postType) ? limits.feedImageAspect : null;
@@ -73,7 +77,10 @@ export function takeFrameOf(platform: Platform, postType: PostType, take: Rendit
   const sizeOk = size.width === master.width && size.height === master.height;
   if (formatOk && sizeOk) return { kind: "master" };
   if (!take.storageKey) {
-    return { kind: "unavailable", reason: "it has no stored file to cut the platform's frame from" };
+    return {
+      kind: "unavailable",
+      reason: "it has no stored file to cut the platform's frame from",
+    };
   }
   const stem = take.storageKey.replace(/\.[^./]*$/, "");
   return {

@@ -1,6 +1,11 @@
 "use client";
 
-import { type AccountStatus, type ClientDto, type SocialAccountDto } from "@enmo/shared";
+import {
+  PLATFORM_LABEL,
+  type AccountStatus,
+  type ClientDto,
+  type SocialAccountDto,
+} from "@enmo/shared";
 import { useState } from "react";
 import { Badge, type BadgeTone } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
@@ -13,22 +18,33 @@ import { useToast } from "@/components/ui/Toast";
 import {
   useCheckSocialAccount,
   useDisconnectSocialAccount,
+  useMakePrimarySocialAccount,
   useSocialAccounts,
 } from "@/hooks/useSocialAccounts";
 import { errorMessage } from "@/lib/api";
-import { accountNames, accountSource, scopeCheck, tokenExpiry } from "./accounts-model";
+import {
+  accountNames,
+  accountSource,
+  canBecomePrimary,
+  scopeCheck,
+  tokenExpiry,
+  unchosenPlatforms,
+} from "./accounts-model";
 import { ConnectAccountForm } from "./ConnectAccountForm";
 import { ConnectMetaButton } from "./ConnectMetaButton";
 import { EditorSection } from "./EditorFrame";
+import { MetaAccountPicker } from "./MetaAccountPicker";
 import { OAuthResultNotice } from "./OAuthResultNotice";
 import { PLATFORM_DOT } from "./platforms";
 
 /*
  * Accounts tab: where the Publisher posts for this client. Everyone sees the list: each account's
- * platform, name, status, token expiry, last check and whether its token may publish. Only ADMINs
- * (socialAccounts.manage) connect (Meta sign-in, or a pasted token), check and disconnect. Tokens
- * are never displayed: the DTO has no token fields. Meta's sign-in comes back here with its result
- * in the address (OAuthResultNotice).
+ * platform, name, status, token expiry, last check, whether its token may publish, and which
+ * account each platform publishes through ("Publishes"). Only ADMINs (socialAccounts.manage)
+ * connect (Meta sign-in, or a pasted token), choose the publishing account where a platform has
+ * several, check and disconnect. Tokens are never displayed: the DTO has no token fields. Meta's
+ * sign-in comes back here with its result in the address: a pick list (MetaAccountPicker), or an
+ * outcome to announce (OAuthResultNotice).
  */
 
 const STATUS: Readonly<Record<AccountStatus, { tone: BadgeTone; label: string }>> = {
@@ -52,9 +68,18 @@ export function ConnectedAccounts({
   // Bumped after each connect so the form remounts empty (and the token fields are cleared).
   const [formGeneration, setFormGeneration] = useState(0);
 
+  const unchosen = accounts.data ? unchosenPlatforms(accounts.data) : [];
+  // Where a platform has several accounts, rows say which one publishes and offer the switch.
+  const shared = new Set(
+    (accounts.data ?? [])
+      .map((account) => account.platform)
+      .filter((platform, index, all) => all.indexOf(platform) !== index),
+  );
+
   return (
     <div className="flex flex-col gap-12">
       <OAuthResultNotice />
+      {canManage ? <MetaAccountPicker clientId={client.id} /> : null}
       <EditorSection
         title="Connected accounts"
         description="Pages and profiles the Publisher posts to. Tokens are encrypted at rest and never leave the API."
@@ -79,16 +104,27 @@ export function ConnectedAccounts({
             {canManage ? "Connect Meta, or paste a token below." : "An admin connects them."}
           </p>
         ) : (
-          <ul aria-label="Connected accounts" className="flex flex-col gap-2">
-            {accounts.data.map((account) => (
-              <AccountRow
-                key={account.id}
-                account={account}
-                clientId={client.id}
-                canManage={canManage}
-              />
-            ))}
-          </ul>
+          <div className="flex flex-col gap-3">
+            {unchosen.length > 0 ? (
+              <FormAlert>
+                {unchosen.map((platform) => PLATFORM_LABEL[platform]).join(" and ")}: several
+                accounts are connected and none is chosen to publish through, so nothing goes out
+                there for real.{" "}
+                {canManage ? "Choose one with “Publish through this”." : "An admin chooses one."}
+              </FormAlert>
+            ) : null}
+            <ul aria-label="Connected accounts" className="flex flex-col gap-2">
+              {accounts.data.map((account) => (
+                <AccountRow
+                  key={account.id}
+                  account={account}
+                  clientId={client.id}
+                  canManage={canManage}
+                  showPublishing={shared.has(account.platform)}
+                />
+              ))}
+            </ul>
+          </div>
         )}
       </EditorSection>
 
@@ -96,7 +132,7 @@ export function ConnectedAccounts({
         <>
           <EditorSection
             title="Connect with Meta"
-            description="Sign in with Facebook and tick this client's Pages. Each Page, and the Instagram business account linked to it, is connected with a long-lived token."
+            description="Sign in with Facebook, then pick this client's Pages and the Instagram business accounts linked to them from what Meta returns. Each is connected with a long-lived token; Pages another client has can't be picked."
           >
             <ConnectMetaButton clientId={client.id} />
           </EditorSection>
@@ -157,14 +193,18 @@ function AccountRow({
   account,
   clientId,
   canManage,
+  showPublishing,
 }: {
   account: SocialAccountDto;
   clientId: string;
   canManage: boolean;
+  /** The client has other accounts on this platform: say which one publishes. */
+  showPublishing: boolean;
 }) {
   const toast = useToast();
   const check = useCheckSocialAccount(clientId);
   const disconnect = useDisconnectSocialAccount(clientId);
+  const makePrimary = useMakePrimarySocialAccount(clientId);
   const [confirming, setConfirming] = useState(false);
   const status = STATUS[account.status];
   const names = accountNames(account);
@@ -187,6 +227,14 @@ function AccountRow({
       <Badge tone={status.tone} dot>
         {status.label}
       </Badge>
+      {account.isPrimary && showPublishing ? (
+        <Badge
+          tone="neutral"
+          title={`The Publisher posts this client's ${PLATFORM_LABEL[account.platform]} posts here`}
+        >
+          Publishes
+        </Badge>
+      ) : null}
       <dl className="flex flex-col font-mono text-[11px] text-steel sm:ml-auto sm:items-end">
         <div className="flex gap-1.5">
           <dt>Token</dt>
@@ -199,6 +247,26 @@ function AccountRow({
       </dl>
       {canManage ? (
         <div className="flex items-center gap-2">
+          {showPublishing && canBecomePrimary(account) ? (
+            <Button
+              size="sm"
+              aria-label={`Publish through ${name}`}
+              loading={makePrimary.isPending}
+              onClick={() =>
+                makePrimary.mutate(account.id, {
+                  onSuccess: () =>
+                    toast.success(
+                      `${PLATFORM_LABEL[account.platform]} posts go to ${name} now`,
+                      "Posts waiting to go out there moved with it.",
+                    ),
+                  onError: (error) =>
+                    toast.error(`Couldn't publish through ${name}`, errorMessage(error)),
+                })
+              }
+            >
+              Publish through this
+            </Button>
+          ) : null}
           <Button
             size="sm"
             aria-label={`Check ${name}`}

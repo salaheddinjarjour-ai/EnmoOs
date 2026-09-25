@@ -381,7 +381,9 @@ describe("the account a client publishes through", () => {
     // Again: nothing changes.
     const again = await send("POST", `/v1/social-accounts/${second.id}/primary`, cookies.admin);
     expect(again.json<SocialAccountDto>().isPrimary).toBe(true);
-    expect(await testDb().auditLog.count({ where: { action: AUDIT_ACTIONS.socialAccountPrimary } })).toBe(1);
+    expect(
+      await testDb().auditLog.count({ where: { action: AUDIT_ACTIONS.socialAccountPrimary } }),
+    ).toBe(1);
   });
 
   it("refuses an account that can't publish", async () => {

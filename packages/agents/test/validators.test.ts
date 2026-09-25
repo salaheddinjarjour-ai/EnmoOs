@@ -241,14 +241,23 @@ describe("validateCopy", () => {
     const issues = validateCopy(long, reel);
     expect(paths(issues)).toEqual(["platformCaptions[0].caption"]);
     expect(issues[0]!.message).toContain(`${COPY_LIMITS.captionMaxChars + 1} characters`);
-    const fits = { ...long, platformCaptions: [{ ...long.platformCaptions[0]!, caption: "Short." }, long.platformCaptions[1]!] };
+    const fits = {
+      ...long,
+      platformCaptions: [
+        { ...long.platformCaptions[0]!, caption: "Short." },
+        long.platformCaptions[1]!,
+      ],
+    };
     expect(validateCopy(fits, reel)).toEqual([]);
 
     // Hashtags written into the caption count with the appended ones: 25 + 10 is over 30.
     const inline = Array.from({ length: 25 }, (_, i) => `#inline${i}`).join(" ");
     const crowded = {
       ...fits,
-      platformCaptions: [{ platform: "INSTAGRAM" as const, caption: `Iced. ${inline}` }, fits.platformCaptions[1]!],
+      platformCaptions: [
+        { platform: "INSTAGRAM" as const, caption: `Iced. ${inline}` },
+        fits.platformCaptions[1]!,
+      ],
     };
     const tagIssues = validateCopy(crowded, reel);
     expect(paths(tagIssues)).toEqual(["hashtags"]);

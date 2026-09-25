@@ -60,7 +60,9 @@ export const UNSCHEDULED_ATTENTION_PREFIXES = [
 ] as const;
 
 export function isUnscheduledAttention(reason: string | null): boolean {
-  return reason !== null && UNSCHEDULED_ATTENTION_PREFIXES.some((prefix) => reason.startsWith(prefix));
+  return (
+    reason !== null && UNSCHEDULED_ATTENTION_PREFIXES.some((prefix) => reason.startsWith(prefix))
+  );
 }
 
 /** Why a variant has no candidate slot: its window is full, or over. */

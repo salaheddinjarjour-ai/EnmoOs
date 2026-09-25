@@ -228,6 +228,7 @@ describe("response schemas are encodable", () => {
             handle: "qahwa.co",
             displayName: null,
             status: "ACTIVE",
+            isPrimary: true,
             scopes: ["instagram_basic"],
             meta: { igUserId: "1784", extra: "kept" },
             tokenExpiresAt: null,

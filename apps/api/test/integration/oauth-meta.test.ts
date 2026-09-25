@@ -262,7 +262,10 @@ describe("GET /v1/oauth/meta/callback", () => {
         key: KEYS.instagram,
         platform: "INSTAGRAM",
         handle: QAHWA.instagram!.username,
-        meta: expect.objectContaining({ pageId: QAHWA.id, username: QAHWA.instagram!.username }) as unknown,
+        meta: expect.objectContaining({
+          pageId: QAHWA.id,
+          username: QAHWA.instagram!.username,
+        }) as unknown,
         status: "available",
       }),
       expect.objectContaining({ key: KEYS.events, platform: "FACEBOOK", status: "available" }),
@@ -276,10 +279,12 @@ describe("GET /v1/oauth/meta/callback", () => {
     expect(response.body).not.toContain("fake-page-token");
     const connected = response.json<ConnectOAuthSelectionResponse>();
     expect(connected.connected).toBe(2);
-    expect(connected.items.map((item) => [item.platform, item.externalId, item.isPrimary])).toEqual([
-      ["INSTAGRAM", QAHWA.instagram!.id, true],
-      ["FACEBOOK", QAHWA.id, true],
-    ]);
+    expect(connected.items.map((item) => [item.platform, item.externalId, item.isPrimary])).toEqual(
+      [
+        ["INSTAGRAM", QAHWA.instagram!.id, true],
+        ["FACEBOOK", QAHWA.id, true],
+      ],
+    );
 
     const accounts = await accountsOf();
     expect(accounts).toEqual([

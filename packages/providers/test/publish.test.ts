@@ -211,7 +211,9 @@ describe("validatePublishPayload", () => {
     ).toEqual(["media[1]"]);
     expect(paths(payload({ media: [{ ...image(), width: 1910, height: 1000 }] }))).toEqual([]);
     // A story is full-screen: 9:16 is fine, PNG isn't.
-    expect(paths(payload({ postType: "STORY", media: [{ ...master, mimeType: "image/jpeg" }] }))).toEqual([]);
+    expect(
+      paths(payload({ postType: "STORY", media: [{ ...master, mimeType: "image/jpeg" }] })),
+    ).toEqual([]);
     expect(paths(payload({ postType: "STORY", media: [master] }))).toEqual(["media[0].mimeType"]);
     // Undeclared, the type follows the URL's extension.
     const { mimeType: _, ...undeclared } = master;

@@ -1,5 +1,6 @@
 import {
   CheckSocialAccountResponse,
+  MakePrimarySocialAccountResponse,
   SocialAccountDto,
   SocialAccountListResponse,
   type CreateSocialAccountInput,
@@ -64,6 +65,19 @@ export function useCheckSocialAccount(clientId: string) {
       api(apiPath("social-accounts", accountId, "check"), {
         method: "POST",
         schema: CheckSocialAccountResponse,
+      }),
+    onSuccess: refresh,
+  });
+}
+
+/** POST /social-accounts/:id/primary: the account the client's posts there publish through. */
+export function useMakePrimarySocialAccount(clientId: string) {
+  const refresh = useRefreshAccounts(clientId);
+  return useMutation({
+    mutationFn: (accountId: string) =>
+      api(apiPath("social-accounts", accountId, "primary"), {
+        method: "POST",
+        schema: MakePrimarySocialAccountResponse,
       }),
     onSuccess: refresh,
   });

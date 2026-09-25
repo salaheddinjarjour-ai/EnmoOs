@@ -465,7 +465,9 @@ describe("Facebook", () => {
     graph.calls.length = 0;
     const again = await failure(publisher.publish(photo, facebook, resumable("FB_PHOTO;posting")));
     expect(again).toMatchObject({ code: "UNCONFIRMED", retryable: false });
-    expect(again.message).toContain("check the Page, then retry to post it again, or cancel the job");
+    expect(again.message).toContain(
+      "check the Page, then retry to post it again, or cancel the job",
+    );
     expect(graph.calls).toEqual([]);
     expect(hasUnconfirmedPost("FB_PHOTO;posting")).toBe(true);
 
@@ -480,19 +482,29 @@ describe("Facebook", () => {
 
   it("holds a multi-photo post or a story whose publishing call went unanswered, before any call", async () => {
     const publisher = publisherFor("FACEBOOK");
-    const carousel = payload({ platform: "FACEBOOK", postType: "CAROUSEL", media: [image(1), image(2)] });
+    const carousel = payload({
+      platform: "FACEBOOK",
+      postType: "CAROUSEL",
+      media: [image(1), image(2)],
+    });
     const story = payload({ platform: "FACEBOOK", postType: "STORY" });
     for (const [post, containerId] of [
       [carousel, "FB_MULTI_PHOTO;items=301,302;posting"],
       [story, "FB_PHOTO_STORY;items=303;posting"],
     ] as const) {
-      await expect(publisher.publish(post, facebook, resumable(containerId))).rejects.toMatchObject({
-        code: "UNCONFIRMED",
-      });
+      await expect(publisher.publish(post, facebook, resumable(containerId))).rejects.toMatchObject(
+        {
+          code: "UNCONFIRMED",
+        },
+      );
     }
     expect(graph.calls).toEqual([]);
     // Recorded answers still resume as published, without posting.
-    const done = await publisher.publish(carousel, facebook, resumable("FB_MULTI_PHOTO;items=301,302;result=100_1"));
+    const done = await publisher.publish(
+      carousel,
+      facebook,
+      resumable("FB_MULTI_PHOTO;items=301,302;result=100_1"),
+    );
     expect(published(done).externalId).toBe("100_1");
     expect(graph.sequence()).toEqual([`GET ${V}/100_1`]);
   });
@@ -736,14 +748,20 @@ describe("failures", () => {
   it("refuses an Instagram image that isn't a JPEG, or a feed image outside 4:5 to 1.91:1, before any call", async () => {
     const publisher = publisherFor("INSTAGRAM");
     const png = await failure(
-      publisher.publish(payload({ media: [{ ...image(), mimeType: "image/png" }] }), instagram, resumable()),
+      publisher.publish(
+        payload({ media: [{ ...image(), mimeType: "image/png" }] }),
+        instagram,
+        resumable(),
+      ),
     );
     expect(png).toMatchObject({ code: "INVALID_PAYLOAD", retryable: false });
     expect(png.issues).toEqual([
       { path: "media[0].mimeType", message: expect.stringContaining("image/jpeg only") as string },
     ]);
     // The 9:16 PNG master itself breaks both rules in the feed; a story takes 9:16, not PNG.
-    const raw = await failure(publisher.publish(payload({ media: [master()] }), instagram, resumable()));
+    const raw = await failure(
+      publisher.publish(payload({ media: [master()] }), instagram, resumable()),
+    );
     expect(raw.issues.map((issue) => issue.path)).toEqual(["media[0].mimeType", "media[0]"]);
     expect(raw.issues[1]!.message).toContain("0.56:1");
     const story = await failure(
@@ -753,7 +771,11 @@ describe("failures", () => {
     // An image whose type isn't declared goes by its extension.
     const { mimeType: _, ...undeclared } = master();
     const guessed = await failure(
-      publisher.publish(payload({ postType: "STORY", media: [undeclared] }), instagram, resumable()),
+      publisher.publish(
+        payload({ postType: "STORY", media: [undeclared] }),
+        instagram,
+        resumable(),
+      ),
     );
     expect(guessed.issues[0]!.message).toContain("not image/png");
     expect(graph.calls).toEqual([]);

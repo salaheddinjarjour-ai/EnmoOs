@@ -218,7 +218,9 @@ export function waitForJobs(
 export async function connectMetaAccounts(
   h: Harness,
   client: Client,
-  overrides: Partial<Pick<SocialAccount, "tokenExpiresAt" | "status" | "scopes" | "isPrimary">> = {},
+  overrides: Partial<
+    Pick<SocialAccount, "tokenExpiresAt" | "status" | "scopes" | "isPrimary">
+  > = {},
 ): Promise<{ instagram: SocialAccount; facebook: SocialAccount; token: string }> {
   const page = FAKE_META_PAGES[0]!;
   const ig = page.instagram!;

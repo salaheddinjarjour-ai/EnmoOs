@@ -305,7 +305,8 @@ Models, fields and relations (every model has `id String @id @default(cuid())`, 
   - `clientId`, `platform`, `externalId`, `handle`, `displayName?`
   - `accessTokenEnc` and `refreshTokenEnc?`, both in the format `v1:<iv>:<tag>:<ct>` (AES-256-GCM with `TOKEN_ENC_KEY`)
   - `tokenExpiresAt?`, `refreshExpiresAt?`, `scopes[]`, `meta Json` (pageId, igUserId, username), `status AccountStatus`, `lastCheckedAt?`, `connectedById?`
-  - `@@unique([platform, externalId])`
+  - `isPrimary Boolean?`: the account the client's posts on that platform publish through, `true` on at most one per client and platform and null on the others (migration `0004_social_account_primary`). A client's only account on a platform is it; with several, an admin chooses (`POST /social-accounts/:id/primary`). Publishing never falls back to "the newest account".
+  - `@@unique([platform, externalId])`, `@@unique([clientId, platform, isPrimary])`
 
 **Campaigns and chat**
 - **Campaign**:
@@ -632,14 +633,14 @@ Models, fields and relations (every model has `id String @id @default(cuid())`, 
 - **system:** `GET /capabilities` (LLM/visual/publish modes, which integrations are configured) · `GET /budget` · `GET /audit` · `GET /healthz` · `GET /readyz`
 - **clients:**
   - `GET /clients` · `GET /clients/:id` · `POST /clients` · `PATCH /clients/:id` · `PUT /clients/:id/approval-chain` · `POST /clients/:id/archive`
-  - social accounts: `GET /clients/:id/social-accounts` (never returns tokens) · `POST /clients/:id/social-accounts` (manual token) · `DELETE /social-accounts/:id` · `POST /social-accounts/:id/check`
-  - OAuth: `GET /oauth/{meta,tiktok}/start?clientId` · `GET /oauth/{meta,tiktok}/callback`. The state and PKCE verifier are kept in Redis for 10 minutes, bound to the admin's session.
+  - social accounts: `GET /clients/:id/social-accounts` (never returns tokens) · `POST /clients/:id/social-accounts` (manual token) · `DELETE /social-accounts/:id` · `POST /social-accounts/:id/check` · `POST /social-accounts/:id/primary`
+  - OAuth: `GET /oauth/{meta,tiktok}/start?clientId` · `GET /oauth/{meta,tiktok}/callback` · `GET /oauth/meta/selections/:id` · `POST /oauth/meta/selections/:id {keys}`. The state and PKCE verifier are kept in Redis for 10 minutes, bound to the admin's session; so is the selection the Meta callback makes (see §F "Meta").
 - **campaigns and chat:** `GET /campaigns?clientId&status` · `POST /campaigns {clientId?, message}` · `GET /campaigns/:id` · `POST /campaigns/:id/archive` · `GET /threads/:id/messages?after` · `POST /threads/:id/messages {content}`
 - **plans and tasks:** `GET /task-graphs/:id` · `POST /task-graphs/:id/approve` · `POST /task-graphs/:id/request-changes {feedback}` · `GET /campaigns/:id/tasks` · `POST /agent-tasks/:id/resolve {action: retry|accept_best}`
 - **posts:** `GET /posts?clientId&campaignId&status&platform` · `GET /posts/:id` · `PATCH /posts/:id/copy` (increments `humanEditCount`; returns 422 on banned words; after approval it reopens approval; an edit that adds or drops a scene or slide goes back through the Visual Director and QA instead)
 - **approvals:** `GET /approvals?clientId&platform&campaignId` (pending, newest first, with a `canDecide` flag) · `POST /approvals/:id/decision {decision, feedback?, target?}` · `POST /approvals/approve-all {requestIds[]}`
 - **vault:** `GET /assets?q&clientId&campaignId&sceneIndex&slideIndex&kind&allVersions&cursor` (the Vault's scene/slide filter sends one of the two indexes) · `GET /assets/:id` (includes lineage) · `POST /assets/:id/regenerate {instruction?}`
-- **calendar:** `GET /calendar?from&to&clientId` (publish jobs plus ghost slots) · `PATCH /publish-jobs/:id {date}` · `POST /publish-jobs/:id/retry` · `POST /publish-jobs/:id/cancel`
+- **calendar:** `GET /calendar?from&to&clientId` (publish jobs plus ghost slots) · `POST /publish-jobs {postId, platform, date}` (a platform of an approved post with nothing scheduled, on the day's best free hour) · `PATCH /publish-jobs/:id {date}` · `POST /publish-jobs/:id/retry` · `POST /publish-jobs/:id/cancel`
 - **dashboard:** `GET /dashboard/{pipeline,alerts,learnings,growth}?clientId` · `POST /clients/:id/analyze`
 - **realtime and files:** `GET /events` (SSE) · `GET /files/*` (only when `STORAGE_DRIVER=local`)
 
@@ -677,7 +678,8 @@ Models, fields and relations (every model has `id String @id @default(cuid())`, 
 - **OAuth:**
   - scopes: `pages_show_list, pages_read_engagement, pages_manage_posts, instagram_basic, instagram_content_publish, instagram_manage_insights, read_insights, business_management`
   - flow: exchange the code, swap for a long-lived token (`fb_exchange_token`), then read `/me/accounts?fields=id,name,access_token,instagram_business_account{id,username}`
-  - store one SocialAccount per FB page and one per linked IG account
+  - `/me/accounts` lists every Page the admin ever granted the app (an agency admin's other clients included), so the callback keeps the list as a selection (Redis, 10 minutes, tokens encrypted, bound to the session) and the accounts tab asks which Pages and linked IG accounts belong to this client; Pages another client has are shown but can't be picked
+  - store one SocialAccount per picked FB page and one per picked linked IG account; each platform publishes through the client's `isPrimary` account
   - `tick.tokens` runs `debug_token` daily and marks accounts EXPIRED with an alert when needed
 - **IG posting** (each container type below, then poll `status_code` until it's FINISHED, then `POST media_publish`, then read `permalink`):
   - image: `POST /{ig}/media {image_url, caption, alt_text}`
@@ -686,11 +688,13 @@ Models, fields and relations (every model has `id String @id @default(cuid())`, 
   - CAROUSEL: up to 10 children with `is_carousel_item`, then the parent container
   - check `content_publishing_limit` first
   - persist `containerId` right away, so a retry resumes the existing container instead of creating a new one
+  - images go as JPEG (Instagram fetches nothing else) and feed images at 4:5 to 1.91:1: until the Adapter cuts frames, the Publisher stores a JPEG rendition of each 9:16 master next to it (centre-cropped to 4:5 for STATIC and CAROUSEL, whole for stories), and payload validation enforces both rules, dry run included
 - **FB posting:**
   - photo: `POST /{page}/photos`
   - reel: `video_reels` start → upload to `rupload` with the `file_url` header → finish with `PUBLISHED`
   - carousel: upload photos unpublished, then `POST /{page}/feed {attached_media}`
   - story: `photo_stories` / `video_stories`
+  - the photo, feed and story POSTs aren't idempotent: the progress is saved as `posting` before each goes out, and a resume that finds it unanswered stops (`UNCONFIRMED`) for a person to check the Page; their retry clears the mark
 
 **TikTok** (base `https://open.tiktokapis.com`):
 - **OAuth:** `/v2/auth/authorize/`, then `POST /v2/oauth/token/`. The access token lasts 24h and the refresh token 365 days. Tokens get refreshed within 2h of expiry.
@@ -708,7 +712,7 @@ Models, fields and relations (every model has `id String @id @default(cuid())`, 
 - Priors are per-platform hour-of-week weights in the client's local time: IG weekdays 11–13 and 19–21, FB 9–13, TikTok 18–22 with Tue/Thu peaks.
 - The prior is blended with the learned `SlotScore`: `(prior·5 + mean·n)/(5+n)`.
 - Constraints:
-  - inside the campaign window, and at least 30 minutes from now
+  - inside the campaign window, and at least 30 minutes from now. A variant with no free slot left in the window (or whose window has passed) is not scheduled: the post is flagged, and a teammate puts that platform on a day of their choosing from the calendar (`POST /publish-jobs`, slotSource `manual`), which may lie outside the window
   - at least 4h between posts and at most 2 per day for each client+platform
   - no collisions with existing jobs
 - `candidates()` returns the top 5. `bestSlotOn(date)` is used for calendar drags.

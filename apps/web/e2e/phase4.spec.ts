@@ -5,6 +5,7 @@ import {
   type CalendarJobItem,
   type CalendarResponse,
   type ClientListResponse,
+  type OAuthSelectionDto,
   type PostDto,
   type PostListResponse,
 } from "@enmo/shared";
@@ -30,7 +31,8 @@ import { primaryNav, signIn, toast } from "./helpers";
  * and "Move to date" does the same from the keyboard. Then the clock reaches the slots (the
  * ENMO_E2E tick hook runs tick.publish at the last one): every job publishes in dry run, each post
  * goes LIVE, and the calendar and the post card link the dryrun.enmo.marketing URL. Last, the
- * accounts tab: Connect Meta, and the OAuth result the callback redirects back with.
+ * accounts tab: Connect Meta, the pick list the callback redirects back with (only what the admin
+ * ticks is connected), and the other results it can come back with.
  *
  * The tests share one database and build on each other, so they run in order. The admin signs in
  * once (the API allows five sign-ins per email per minute, and earlier specs may have used some).
@@ -51,6 +53,53 @@ const DRY_RUN_URL = /^https:\/\/dryrun\.enmo\.marketing\//;
 /** PATCH /v1/publish-jobs/:id (a reschedule), for holding or refusing one. */
 const PUBLISH_JOB_URL = /\/v1\/publish-jobs\/[^/?]+$/;
 const CANCELLED_MESSAGE = "The Meta sign-in was cancelled, so nothing was connected.";
+/** A Meta sign-in's pick list, as the API's callback names it. */
+const PICK = "pick-list-for-the-e2e-client-000000000000";
+
+/** What Meta returned for the admin to pick from: one free Page and its Instagram account, and a
+ * Page another client already has. */
+function metaSelection(clientId: string): OAuthSelectionDto {
+  const page = { pageId: "200000000000001", pageName: CLIENT, source: "oauth" as const };
+  return {
+    id: PICK,
+    provider: "meta",
+    clientId,
+    clientName: CLIENT,
+    expiresAt: new Date(Date.now() + 600_000).toISOString(),
+    accounts: [
+      {
+        key: "FACEBOOK:200000000000001",
+        platform: "FACEBOOK",
+        externalId: "200000000000001",
+        handle: CLIENT,
+        displayName: CLIENT,
+        meta: page,
+        status: "available",
+        takenBy: null,
+      },
+      {
+        key: "INSTAGRAM:17841400000000077",
+        platform: "INSTAGRAM",
+        externalId: "17841400000000077",
+        handle: "sahar.juice",
+        displayName: null,
+        meta: { ...page, igUserId: "17841400000000077", username: "sahar.juice" },
+        status: "available",
+        takenBy: null,
+      },
+      {
+        key: "FACEBOOK:200000000000002",
+        platform: "FACEBOOK",
+        externalId: "200000000000002",
+        handle: "Other Brand",
+        displayName: "Other Brand",
+        meta: { pageId: "200000000000002", pageName: "Other Brand", source: "oauth" },
+        status: "taken",
+        takenBy: { clientId: "other-client", clientName: "Other Co" },
+      },
+    ],
+  };
+}
 
 const shared: { state?: StorageState; clientId?: string; campaignId?: string } = {};
 
@@ -179,8 +228,11 @@ test("a brief becomes posts waiting for approval, planned on the calendar as gho
   shared.clientId = client!.id;
 
   await primaryNav(page).getByRole("link", { name: "The Brief" }).click();
-  await page.getByLabel("Client").selectOption({ label: CLIENT });
+  // The client list's own search field ("Search clients") answers to "Client" until it's gone.
+  await expect(page).toHaveURL(/\/brief$/);
   const composer = page.getByLabel("Brief the Manager");
+  await expect(composer).toBeVisible();
+  await page.getByLabel("Client").selectOption({ label: CLIENT });
   await composer.fill(BRIEF);
   await composer.press("Enter");
   await expect(page).toHaveURL(/\/brief\/[^/]+$/);
@@ -417,6 +469,48 @@ test("the calendar shows each job at its client's time; a drag moves it, a refus
     await expect
       .poll(async () => (await clientJobs(page)).find((job) => job.id === keyed.id)?.date)
       .toBe(keyedTarget);
+
+    // A platform left with nothing scheduled (its publish called off here; the Publisher also
+    // leaves one when the campaign window has no free slot) goes on a day from its ghost.
+    const dropped = (await clientJobs(page)).find(
+      (job) => job.platform === "INSTAGRAM" && job.id !== moved.id,
+    )!;
+    const cancelled = await page.request.post(`${API_URL}/v1/publish-jobs/${dropped.id}/cancel`, {
+      headers: { origin: WEB_URL },
+    });
+    expect(cancelled.ok(), `cancel → ${cancelled.status()}`).toBe(true);
+    const ghost = (await clientCalendar(page)).items.find(
+      (item): item is CalendarGhostItem =>
+        item.kind === "ghost" && item.postId === dropped.postId && item.platform === "INSTAGRAM",
+    )!;
+    await page.goto(calendarPath(monthOf(ghost.date)));
+    await expect(dayList(page, ghost.date)).toBeVisible();
+    const ghostChip = page.getByRole("button", {
+      name: `${CLIENT} · Instagram · planned · ${ghost.title}`,
+      exact: true,
+    });
+    if (!(await ghostChip.isVisible())) {
+      await page
+        .getByRole("button", {
+          name: new RegExp(`^Show all \\d+ on ${formatShortDay(ghost.date)}$`),
+        })
+        .click();
+    }
+    await ghostChip.click();
+    const ghostDetails = page.getByRole("dialog", { name: `${CLIENT} · Instagram` });
+    await expect(ghostDetails).toContainText("Put it on a day");
+    await ghostDetails.getByLabel("Schedule on date").fill(ghost.date);
+    await ghostDetails.getByRole("button", { name: "Schedule", exact: true }).click();
+    await expect(ghostDetails).toBeHidden();
+    await expect(toast(page, "Scheduled on Instagram")).toBeVisible();
+    await expect
+      .poll(async () => {
+        const job = (await clientJobs(page)).find(
+          (candidate) => candidate.postId === dropped.postId && candidate.platform === "INSTAGRAM",
+        );
+        return job && [job.status, job.date, job.slotSource];
+      })
+      .toEqual(["SCHEDULED", ghost.date, "manual"]);
   } finally {
     await context.close();
   }
@@ -515,8 +609,7 @@ test("Connect Meta sends an admin to Meta's consent screen, and its result comes
 
     // With a Meta app, /start answers with the consent URL and the browser goes there; the consent
     // screen and the API's callback (covered by the API's own tests) are stood in for by sending
-    // the browser straight to where the callback redirects after connecting a Page and its
-    // Instagram account.
+    // the browser straight to where the callback redirects: the pick list of what Meta returned.
     await page.route(/\/v1\/capabilities$/, async (route) => {
       const response = await route.fetch();
       const body = (await response.json()) as { integrations: Record<string, boolean> };
@@ -528,15 +621,39 @@ test("Connect Meta sends an admin to Meta's consent screen, and its result comes
     await page.route(/\/v1\/oauth\/meta\/start\?/, (route) =>
       route.fulfill({
         json: {
-          authorizeUrl: `${WEB_URL}${accountsPath}?tab=accounts&oauth=meta&outcome=connected&connected=2`,
+          authorizeUrl: `${WEB_URL}${accountsPath}?tab=accounts&oauth=meta&outcome=choose&pick=${PICK}`,
         },
       }),
     );
+    const listed = metaSelection(shared.clientId!);
+    let picked: string[] = [];
+    await page.route(new RegExp(`/v1/oauth/meta/selections/${PICK}$`), async (route) => {
+      if (route.request().method() === "GET") return route.fulfill({ json: listed });
+      picked = (route.request().postDataJSON() as { keys: string[] }).keys;
+      return route.fulfill({ json: { connected: picked.length, items: [] } });
+    });
     await page.reload();
     await panel.getByRole("button", { name: "Connect Meta" }).click();
-    await expect(toast(page, "2 Meta accounts connected")).toBeVisible();
+    const picker = page.getByRole("dialog", { name: "Choose what to connect" });
+    await expect(picker).toBeVisible();
+    // A lone free Page comes ticked with its Instagram account; another client's can't be picked.
+    await expect(picker.getByRole("checkbox", { name: "Facebook: Sahar Juice Bar" })).toBeChecked();
+    await expect(picker.getByRole("checkbox", { name: "Instagram: @sahar.juice" })).toBeChecked();
+    const taken = picker.getByRole("checkbox", { name: "Facebook: Other Brand" });
+    await expect(taken).toBeDisabled();
+    await expect(picker).toContainText("Already connected to Other Co. Disconnect it there first.");
+    await picker.getByRole("checkbox", { name: "Instagram: @sahar.juice" }).uncheck();
+    await picker.getByRole("button", { name: "Connect 1 account" }).click();
+    await expect(toast(page, "1 Meta account connected")).toBeVisible();
+    expect(picked).toEqual(["FACEBOOK:200000000000001"]);
+    await expect(picker).toBeHidden();
     await expect(page).toHaveURL(new RegExp(`${accountsPath}\\?tab=accounts$`));
     await expect(page.getByRole("tabpanel", { name: "Accounts" })).toBeVisible();
+
+    // A connect that came back without a pick list says how many it connected.
+    await page.goto(`${accountsPath}?tab=accounts&oauth=meta&outcome=connected&connected=2`);
+    await expect(toast(page, "2 Meta accounts connected")).toBeVisible();
+    await expect(page).toHaveURL(new RegExp(`${accountsPath}\\?tab=accounts$`));
 
     // A declined consent comes back as an error on the same tab.
     await page.goto(

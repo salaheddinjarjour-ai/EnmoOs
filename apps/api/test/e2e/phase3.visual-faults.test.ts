@@ -227,6 +227,17 @@ function alertsFor(entityId: string): Promise<AlertPayload[]> {
     .then((rows) => rows.map((row) => row.payload as AlertPayload));
 }
 
+/**
+ * The entity's alerts once one has landed: a worker publishes its events just after the commit a
+ * test waited on, so reading them straight after would race it.
+ */
+function alertsLanded(h: Harness, entityId: string): Promise<AlertPayload[]> {
+  return h.waitFor(async () => {
+    const alerts = await alertsFor(entityId);
+    return alerts.length > 0 ? alerts : null;
+  });
+}
+
 /** Runs a job's processor as BullMQ's last attempt would (nothing retries it after this). */
 function runLastAttempt(h: Harness, name: JobName, data: object): Promise<unknown> {
   const processor = processorFor(processors, JOB_QUEUE[name], name);
@@ -653,7 +664,7 @@ describe("phase3: the Visual Director's contract failures", () => {
     // Rendered, never judged: still the post's take, with no review.
     expect(take).toMatchObject({ status: "READY", isCurrent: true, review: null });
     expect((await db.post.findUniqueOrThrow({ where: { id: postId } })).needsAttention).toBe(true);
-    expect((await alertsFor(direct.id)).map((alert) => alert.kind)).toEqual(["escalated"]);
+    expect((await alertsLanded(h, direct.id)).map((alert) => alert.kind)).toEqual(["escalated"]);
 
     await api<AgentTaskDto>("POST", `/v1/agent-tasks/${direct.id}/resolve`, {
       action: "accept_best",
@@ -763,7 +774,7 @@ describe("phase3: asset jobs out of retries, and renders with nothing to review"
     );
     const direct = await waitForDirect(h, postId, "FAILED");
     expect(direct.error).toContain("couldn't review take 1 of s1: socket hang up");
-    expect((await alertsFor(direct.id)).map((alert) => alert.kind)).toEqual(["failed"]);
+    expect((await alertsLanded(h, direct.id)).map((alert) => alert.kind)).toEqual(["failed"]);
     expect(await db.asset.findUniqueOrThrow({ where: { id: take.id } })).toMatchObject({
       status: "READY",
       review: null,
@@ -785,7 +796,7 @@ describe("phase3: asset jobs out of retries, and renders with nothing to review"
     expect(direct.error).toContain(
       "couldn't get take 1 of s1 rendered by the mock provider (submitting it failed after every retry: 503 from the provider)",
     );
-    expect((await alertsFor(direct.id)).map((alert) => alert.kind)).toEqual(["failed"]);
+    expect((await alertsLanded(h, direct.id)).map((alert) => alert.kind)).toEqual(["failed"]);
     expect((await db.post.findUniqueOrThrow({ where: { id: postId } })).needsAttention).toBe(true);
   }, 60_000);
 
@@ -806,7 +817,7 @@ describe("phase3: asset jobs out of retries, and renders with nothing to review"
     expect(direct.error).toContain(
       `the render didn't finish after ${RENDER_POLL_MAX_ATTEMPTS} polls`,
     );
-    expect((await alertsFor(direct.id)).map((alert) => alert.kind)).toEqual(["failed"]);
+    expect((await alertsLanded(h, direct.id)).map((alert) => alert.kind)).toEqual(["failed"]);
   }, 60_000);
 
   it("fails the take and its task when storing a finished render keeps failing", async () => {
@@ -874,7 +885,7 @@ describe("phase3: asset jobs out of retries, and renders with nothing to review"
     });
     const direct = await waitForDirect(h, postId, "FAILED");
     expect(direct.error).toContain("its file can't be decoded");
-    expect((await alertsFor(direct.id)).map((alert) => alert.kind)).toEqual(["failed"]);
+    expect((await alertsLanded(h, direct.id)).map((alert) => alert.kind)).toEqual(["failed"]);
     const [take] = await takesOf(postId);
     expect(take).toMatchObject({ status: "FAILED", review: null });
   }, 60_000);
@@ -890,7 +901,7 @@ describe("phase3: asset jobs out of retries, and renders with nothing to review"
     );
     const direct = await waitForDirect(h, postId, "FAILED");
     expect(direct.error).toContain("couldn't review take 1 of s1: ECONNRESET");
-    expect((await alertsFor(direct.id)).map((alert) => alert.kind)).toEqual(["failed"]);
+    expect((await alertsLanded(h, direct.id)).map((alert) => alert.kind)).toEqual(["failed"]);
     expect(await db.asset.findUniqueOrThrow({ where: { id: take.id } })).toMatchObject({
       status: "READY",
       review: null,
@@ -1004,7 +1015,7 @@ describe("phase3: the sweeper and lost hand-offs", () => {
     const direct = await waitForDirect(h, postId, "FAILED");
     expect(direct.id).toBe(waiting.id);
     expect(direct.error).toContain("found by the sweeper after its hand-off was lost");
-    expect((await alertsFor(direct.id)).map((alert) => alert.kind)).toEqual(["failed"]);
+    expect((await alertsLanded(h, direct.id)).map((alert) => alert.kind)).toEqual(["failed"]);
     expect((await db.post.findUniqueOrThrow({ where: { id: postId } })).needsAttention).toBe(true);
   }, 60_000);
 

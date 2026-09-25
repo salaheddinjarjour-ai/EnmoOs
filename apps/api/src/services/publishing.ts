@@ -253,7 +253,10 @@ export async function schedule(
         `The ${post.client.archivedAt ? "client" : "campaign"} is archived, so nothing of it publishes any more`,
       );
     }
-    if (!SCHEDULABLE_POST_STATUSES.has(post.status) || post.approvalRequests[0]?.status !== "APPROVED") {
+    if (
+      !SCHEDULABLE_POST_STATUSES.has(post.status) ||
+      post.approvalRequests[0]?.status !== "APPROVED"
+    ) {
       throw conflict(
         `Only an approved post with nothing out yet can be scheduled; this one is ${post.status.toLowerCase().replace(/_/g, " ")}`,
         { postStatus: post.status },

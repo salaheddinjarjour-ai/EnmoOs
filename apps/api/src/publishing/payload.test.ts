@@ -84,7 +84,13 @@ function igRendition(image: PayloadTake, width = 1080, height = 1350) {
   const key = `${stem}-instagram-${width}x${height}.jpg`;
   return {
     rendition: { sourceKey: image.storageKey!, key, mimeType: "image/jpeg", width, height },
-    media: { kind: "IMAGE", url: `https://files.enmo.test/${key}`, width, height, mimeType: "image/jpeg" },
+    media: {
+      kind: "IMAGE",
+      url: `https://files.enmo.test/${key}`,
+      width,
+      height,
+      mimeType: "image/jpeg",
+    },
   };
 }
 
@@ -129,11 +135,19 @@ describe("preparePayload", () => {
     const image = take();
     const feed = preparePayload({ ...base, postType: "STATIC", takes: [image] });
     const cut = igRendition(image);
-    expect(feed).toMatchObject({ ok: true, payload: { media: [cut.media] }, renditions: [cut.rendition] });
+    expect(feed).toMatchObject({
+      ok: true,
+      payload: { media: [cut.media] },
+      renditions: [cut.rendition],
+    });
 
     const story = preparePayload({ ...base, postType: "STORY", takes: [image] });
     const whole = igRendition(image, 1080, 1920);
-    expect(story).toMatchObject({ ok: true, payload: { media: [whole.media] }, renditions: [whole.rendition] });
+    expect(story).toMatchObject({
+      ok: true,
+      payload: { media: [whole.media] },
+      renditions: [whole.rendition],
+    });
 
     // A JPEG already inside the feed's range goes out as it is.
     const jpeg = take({ mimeType: "image/jpeg", width: 1080, height: 1350 });

@@ -7,11 +7,7 @@ import { buildTestApp, type TestApp } from "../helpers/app";
 import { sessionCookieFor, type CookieHeader } from "../helpers/auth";
 import { testDb } from "../helpers/db";
 import { createAsset, createClient, createUser, type TestUser } from "../helpers/factories";
-import {
-  RIYADH,
-  seedPublishPost,
-  type SeedPublishedPostInput,
-} from "../helpers/publish-fixtures";
+import { RIYADH, seedPublishPost, type SeedPublishedPostInput } from "../helpers/publish-fixtures";
 import { obliterateQueues, queuedJobs, sender } from "../helpers/route-fixtures";
 
 /*
@@ -198,7 +194,10 @@ describe("POST /v1/publish-jobs (schedule)", () => {
     const notApproved = await schedule(pending.post.id);
     expect(notApproved.statusCode).toBe(409);
     expect(notApproved.json()).toMatchObject({
-      error: { message: "Only an approved post with nothing out yet can be scheduled; this one is pending approval" },
+      error: {
+        message:
+          "Only an approved post with nothing out yet can be scheduled; this one is pending approval",
+      },
     });
 
     // Checked as the Publisher checks it: no visuals, nothing to publish.

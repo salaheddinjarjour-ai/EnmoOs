@@ -99,8 +99,10 @@ test("a brief becomes approvable post cards, each with its placeholder visual", 
   // A brief with everything in it: the Manager plans without a question.
   await primaryNav(page).getByRole("link", { name: "The Brief" }).click();
   await expect(page).toHaveURL(/\/brief$/);
-  await page.getByLabel("Client").selectOption({ label: CLIENT });
+  // Until the Brief renders, the client list's "Search clients" field answers to "Client" too.
   const composer = page.getByLabel("Brief the Manager");
+  await expect(composer).toBeVisible();
+  await page.getByLabel("Client").selectOption({ label: CLIENT });
   await composer.fill(BRIEF);
   await composer.press("Enter");
   await expect(page).toHaveURL(/\/brief\/[^/]+$/);

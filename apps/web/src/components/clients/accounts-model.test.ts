@@ -1,12 +1,19 @@
-import type { SocialAccountDto } from "@enmo/shared";
+import type { OAuthSelectionAccount, SocialAccountDto } from "@enmo/shared";
 import { describe, expect, it } from "vitest";
 import {
   accountNames,
   accountSource,
+  canBecomePrimary,
+  initialPicks,
   oauthNotice,
   oauthResultFrom,
+  pendingSelection,
   scopeCheck,
+  selectionBlock,
+  selectionDetail,
+  selectionName,
   tokenExpiry,
+  unchosenPlatforms,
   withoutOAuthResult,
 } from "./accounts-model";
 
@@ -22,6 +29,7 @@ function account(overrides: Partial<SocialAccountDto> = {}): SocialAccountDto {
     handle: "qahwaco",
     displayName: null,
     status: "ACTIVE",
+    isPrimary: true,
     scopes: ["instagram_basic", "instagram_content_publish", "pages_read_engagement"],
     meta: {
       igUserId: "17841400000000001",
@@ -99,6 +107,81 @@ describe("tokenExpiry", () => {
   });
 });
 
+describe("the publishing account", () => {
+  it("names the platforms where several accounts wait for an admin's choice", () => {
+    const page = (id: string, isPrimary: boolean) =>
+      account({ id, platform: "FACEBOOK", externalId: id, isPrimary });
+    expect(unchosenPlatforms([account(), page("p1", false)])).toEqual([]);
+    expect(unchosenPlatforms([account(), page("p1", false), page("p2", false)])).toEqual([
+      "FACEBOOK",
+    ]);
+    expect(unchosenPlatforms([page("p1", true), page("p2", false)])).toEqual([]);
+  });
+
+  it("offers the switch on an active account that doesn't publish yet", () => {
+    expect(canBecomePrimary(account())).toBe(false);
+    expect(canBecomePrimary(account({ isPrimary: false }))).toBe(true);
+    expect(canBecomePrimary(account({ isPrimary: false, status: "EXPIRED" }))).toBe(false);
+  });
+});
+
+describe("a Meta sign-in's pick list", () => {
+  function listed(overrides: Partial<OAuthSelectionAccount> = {}): OAuthSelectionAccount {
+    return {
+      key: "FACEBOOK:1029",
+      platform: "FACEBOOK",
+      externalId: "1029",
+      handle: "Qahwa Co",
+      displayName: "Qahwa Co",
+      meta: { pageId: "1029", pageName: "Qahwa Co", source: "oauth" },
+      status: "available",
+      takenBy: null,
+      ...overrides,
+    };
+  }
+  const instagram = listed({
+    key: "INSTAGRAM:1784",
+    platform: "INSTAGRAM",
+    externalId: "1784",
+    handle: "qahwa.co",
+    meta: { pageId: "1029", pageName: "Qahwa Co", igUserId: "1784", username: "qahwa.co" },
+  });
+  const events = listed({
+    key: "FACEBOOK:2040",
+    externalId: "2040",
+    handle: "Qahwa Events",
+    meta: { pageId: "2040", pageName: "Qahwa Events" },
+  });
+
+  it("names each account and says why a taken one can't be picked", () => {
+    expect([selectionName(listed()), selectionDetail(listed())]).toEqual([
+      "Qahwa Co",
+      "Facebook Page · 1029",
+    ]);
+    expect([selectionName(instagram), selectionDetail(instagram)]).toEqual([
+      "@qahwa.co",
+      "Instagram · via Qahwa Co",
+    ]);
+    expect(selectionBlock(listed())).toBeNull();
+    expect(
+      selectionBlock(
+        listed({ status: "taken", takenBy: { clientId: "c2", clientName: "Other Co" } }),
+      ),
+    ).toBe("Already connected to Other Co. Disconnect it there first.");
+  });
+
+  it("ticks a lone free Page with its Instagram account, and nothing among several", () => {
+    expect(initialPicks([listed(), instagram])).toEqual(["FACEBOOK:1029", "INSTAGRAM:1784"]);
+    expect(initialPicks([listed(), instagram, events])).toEqual([]);
+    // What is already this client's is ticked, to refresh its token; nothing else is guessed.
+    expect(initialPicks([listed({ status: "connected" }), instagram, events])).toEqual([
+      "FACEBOOK:1029",
+    ]);
+    const taken = { status: "taken" as const, takenBy: { clientId: "c2", clientName: "Other Co" } };
+    expect(initialPicks([listed(taken), events])).toEqual(["FACEBOOK:2040"]);
+  });
+});
+
 describe("the OAuth result", () => {
   it("reads a connected result", () => {
     const params = new URLSearchParams("tab=accounts&oauth=meta&outcome=connected&connected=2");
@@ -137,6 +220,13 @@ describe("the OAuth result", () => {
 
   it("ignores an address without a result, or a malformed one", () => {
     expect(oauthResultFrom(new URLSearchParams("tab=accounts"))).toBeNull();
+    const pick = "p".repeat(43);
+    const choose = oauthResultFrom(
+      new URLSearchParams(`tab=accounts&oauth=meta&outcome=choose&pick=${pick}`),
+    );
+    expect(choose).toEqual({ oauth: "meta", outcome: "choose", pick });
+    expect(pendingSelection(choose)).toBe(pick);
+    expect(pendingSelection({ oauth: "meta", outcome: "connected" })).toBeNull();
     expect(oauthResultFrom(new URLSearchParams("oauth=myspace&outcome=connected"))).toBeNull();
     expect(oauthResultFrom(new URLSearchParams("oauth=meta&outcome=maybe"))).toBeNull();
   });
@@ -146,5 +236,8 @@ describe("the OAuth result", () => {
       "?tab=accounts",
     );
     expect(withoutOAuthResult("oauth=meta&outcome=error&message=Nope")).toBe("");
+    expect(withoutOAuthResult("tab=accounts&oauth=meta&outcome=choose&pick=abc")).toBe(
+      "?tab=accounts",
+    );
   });
 });

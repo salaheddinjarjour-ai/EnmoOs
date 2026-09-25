@@ -1,16 +1,20 @@
 import {
   missingPublishScopes,
   OAuthResultQuery,
+  PLATFORM_LABEL,
   type OAuthProviderName,
+  type OAuthSelectionAccount,
+  type Platform,
   type SocialAccountDto,
 } from "@enmo/shared";
 
 /*
  * The Accounts tab's view model (DESIGN §E "OAuth", §F "Meta"): how a connected account is named
  * (a Page by its name, an Instagram account by its @username and the Page it publishes through),
- * whether its token can publish, and the result the OAuth callback redirects back with
- * (`?tab=accounts&oauth=meta&outcome=connected&connected=2`), read once and then taken out of the
- * address. Pure, so it is unit-tested.
+ * whether its token can publish, which account each platform publishes through, the result the
+ * OAuth callback redirects back with (`?tab=accounts&oauth=meta&outcome=choose&pick=…`), read once
+ * and then taken out of the address, and the pick list a Meta sign-in comes back with. Pure, so
+ * it is unit-tested.
  */
 
 const DAY_MS = 86_400_000;
@@ -80,10 +84,68 @@ export function tokenExpiry(account: SocialAccountDto, now: number = Date.now())
   return left <= TOKEN_EXPIRY_WARNING_DAYS * DAY_MS ? { kind: "soon", at } : { kind: "valid", at };
 }
 
+/* ── The publishing account ─────────────────────────────────────────────────────────────── */
+
+/**
+ * Platforms where the client has several accounts and none it publishes through: nothing goes out
+ * live there until an admin chooses one.
+ */
+export function unchosenPlatforms(accounts: readonly SocialAccountDto[]): Platform[] {
+  const platforms = [...new Set(accounts.map((account) => account.platform))];
+  return platforms.filter(
+    (platform) =>
+      !accounts.some((account) => account.platform === platform && account.isPrimary) &&
+      accounts.filter((account) => account.platform === platform).length > 1,
+  );
+}
+
+/** Whether "Publish through this" applies: an active account its platform doesn't publish through. */
+export function canBecomePrimary(account: SocialAccountDto): boolean {
+  return !account.isPrimary && account.status === "ACTIVE";
+}
+
+/* ── A Meta sign-in's pick list ────────────────────────────────────────────────────────────── */
+
+/** "Qahwa Co" (a Page), "@qahwa.co" (an Instagram account). */
+export function selectionName(account: OAuthSelectionAccount): string {
+  if (account.platform === "FACEBOOK") return account.meta.pageName ?? account.handle;
+  return `@${account.meta.username ?? account.handle}`;
+}
+
+/** "Facebook Page · 1000…1", "Instagram · via Qahwa Co". */
+export function selectionDetail(account: OAuthSelectionAccount): string {
+  if (account.platform === "FACEBOOK") return `Facebook Page · ${account.externalId}`;
+  const via = account.meta.pageName ? `via ${account.meta.pageName}` : account.externalId;
+  return `${PLATFORM_LABEL[account.platform]} · ${via}`;
+}
+
+/** Why an account can't be picked, or null when it can. */
+export function selectionBlock(account: OAuthSelectionAccount): string | null {
+  if (account.status !== "taken") return null;
+  const owner = account.takenBy?.clientName ?? "another client";
+  return `Already connected to ${owner}. Disconnect it there first.`;
+}
+
+/**
+ * What starts ticked: the accounts already this client's (picking them again refreshes their
+ * tokens) and, when Meta listed a single Page anyone could take, that Page and its Instagram
+ * account. Several free Pages start unticked: the admin says which are this client's.
+ */
+export function initialPicks(accounts: readonly OAuthSelectionAccount[]): string[] {
+  const connected = accounts.filter((account) => account.status === "connected");
+  const available = accounts.filter((account) => account.status === "available");
+  const pages = available.filter((account) => account.platform === "FACEBOOK");
+  if (connected.length > 0 || pages.length !== 1) return connected.map((account) => account.key);
+  const pageId = pages[0]!.externalId;
+  return available
+    .filter((account) => account.externalId === pageId || account.meta.pageId === pageId)
+    .map((account) => account.key);
+}
+
 /* ── The OAuth callback's result ───────────────────────────────────────────────────────────── */
 
 /** The query keys the callback's redirect adds (next to `tab=accounts`). */
-export const OAUTH_RESULT_KEYS = ["oauth", "outcome", "connected", "message"] as const;
+export const OAUTH_RESULT_KEYS = ["oauth", "outcome", "connected", "pick", "message"] as const;
 
 const MESSAGE_MAX = 500;
 
@@ -96,9 +158,15 @@ export function oauthResultFrom(params: {
     oauth: params.get("oauth"),
     outcome: params.get("outcome"),
     connected: params.get("connected") ?? undefined,
+    pick: params.get("pick") ?? undefined,
     message: params.get("message")?.slice(0, MESSAGE_MAX) ?? undefined,
   });
   return parsed.success ? parsed.data : null;
+}
+
+/** The pick list a sign-in came back with, when the admin still has to choose. */
+export function pendingSelection(result: OAuthResultQuery | null): string | null {
+  return result?.outcome === "choose" && result.pick ? result.pick : null;
 }
 
 /** The same address without the result, so a reload doesn't announce it again. */
@@ -115,7 +183,7 @@ const PROVIDER_LABEL: Readonly<Record<OAuthProviderName, string>> = {
 };
 
 const CONNECTED_DETAIL: Readonly<Record<OAuthProviderName, string>> = {
-  meta: "Each Facebook Page, and the Instagram account linked to it, can publish now. Tokens are encrypted at rest.",
+  meta: "Each account you picked is connected with an encrypted long-lived token. Where several share a platform, choose the one the Publisher posts through.",
   tiktok: "The account can publish now. Its tokens are encrypted at rest.",
 };
 
@@ -127,6 +195,13 @@ export interface OAuthNotice {
 
 export function oauthNotice(result: OAuthResultQuery): OAuthNotice {
   const provider = PROVIDER_LABEL[result.oauth];
+  if (result.outcome === "choose") {
+    return {
+      tone: "success",
+      title: `Choose the ${provider} accounts to connect`,
+      description: "Pick this client's Pages and Instagram accounts from what Meta returned.",
+    };
+  }
   if (result.outcome === "error") {
     return {
       tone: "error",

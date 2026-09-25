@@ -12,11 +12,13 @@ import type { PixelSize } from "@enmo/shared";
 export const PUBLISH_FRAME_JPEG_QUALITY = 90;
 
 export async function renderJpegFrame(input: Uint8Array, size: PixelSize): Promise<Buffer> {
-  return sharp(input, { failOn: "error" })
-    .rotate()
-    .resize({ width: size.width, height: size.height, fit: "cover", position: "centre" })
-    // JPEG has no alpha: a transparent pixel would otherwise come out black by accident.
-    .flatten({ background: "#000000" })
-    .jpeg({ quality: PUBLISH_FRAME_JPEG_QUALITY, mozjpeg: true })
-    .toBuffer();
+  return (
+    sharp(input, { failOn: "error" })
+      .rotate()
+      .resize({ width: size.width, height: size.height, fit: "cover", position: "centre" })
+      // JPEG has no alpha: transparent pixels land on the dark ENMO ground, as review images do.
+      .flatten({ background: "#000000" })
+      .jpeg({ quality: PUBLISH_FRAME_JPEG_QUALITY, mozjpeg: true })
+      .toBuffer()
+  );
 }

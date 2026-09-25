@@ -105,7 +105,10 @@ function mediaOf(take: PayloadTake, source: PayloadSource): MediaOf {
   });
   if (frame.kind === "unavailable") {
     return {
-      issue: { path: "media", message: `Take ${take.shotId ?? take.id} can't go out: ${frame.reason}.` },
+      issue: {
+        path: "media",
+        message: `Take ${take.shotId ?? take.id} can't go out: ${frame.reason}.`,
+      },
     };
   }
   if (frame.kind === "rendition") {

@@ -16,13 +16,18 @@ import {
   type Platform,
   type PublishJobDto,
 } from "@enmo/shared";
-import { UnrecoverableError, Worker } from "bullmq";
+import { UnrecoverableError, Worker, type Job } from "bullmq";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, onTestFinished } from "vitest";
 import { closeRedis, createWorkerConnection } from "../../src/jobs/connection";
-import { enqueuePublishRun, jobIds, publishPollMaxPolls } from "../../src/jobs/queues";
+import {
+  enqueuePublishRun,
+  jobIds,
+  publishPollMaxPolls,
+  type QueueName,
+} from "../../src/jobs/queues";
 import { DAY_MS, FakeClock, HOUR_MS, MINUTE_MS } from "../../src/lib/clock";
 import { currentContentHash } from "../../src/orchestrator/approval-round";
 import { EventBatch } from "../../src/orchestrator/events";
@@ -31,12 +36,7 @@ import { pollPublish, runPublish } from "../../src/publishing/publish-service";
 import { testDb } from "../helpers/db";
 import { createClient, createUser } from "../helpers/factories";
 import { startHarness, type Harness, type HarnessOptions } from "../helpers/harness";
-import {
-  FAKE_META_PAGES,
-  GRAPH_ERRORS,
-  startFakeGraph,
-  type FakeGraph,
-} from "../fakes/meta-graph";
+import { FAKE_META_PAGES, GRAPH_ERRORS, startFakeGraph, type FakeGraph } from "../fakes/meta-graph";
 import {
   apiFor,
   approvePost,
@@ -808,18 +808,24 @@ async function seedJobRow(
 }
 
 /**
- * Takes the waiting ops job `jobId` as a worker would and fails it for good, as BullMQ keeps a run
- * whose last attempt threw (e.g. the database was down for longer than its backoff).
+ * Takes the waiting job `jobId` off `queue` as a worker would and fails it for good, as BullMQ
+ * keeps a run whose last attempt threw (e.g. the database was down for longer than its backoff).
  */
-async function failRun(h: Harness, jobId: string, reason: string): Promise<void> {
+async function failRun(
+  h: Harness,
+  jobId: string,
+  reason: string,
+  queue: QueueName = "ops",
+): Promise<void> {
   const connection = createWorkerConnection(h.deps.config.REDIS_URL, h.deps.logger);
-  const worker = new Worker("ops", null, { connection, prefix: h.deps.queues.prefix });
+  const worker = new Worker(queue, null, { connection, prefix: h.deps.queues.prefix });
   try {
     const token = `test-${jobId}`;
-    const job = await worker.getNextJob(token, { block: false });
-    expect(job?.id).toBe(jobId);
-    await job!.moveToFailed(new UnrecoverableError(reason), token);
-    expect(await job!.getState()).toBe("failed");
+    // Typed as always there, but a worker finds nothing when the queue is empty.
+    const job = (await worker.getNextJob(token, { block: false })) as Job | undefined;
+    if (job?.id !== jobId) throw new Error(`Expected ${jobId} waiting, got ${job?.id}`);
+    await job.moveToFailed(new UnrecoverableError(reason), token);
+    expect(await job.getState()).toBe("failed");
   } finally {
     await worker.close();
     await closeRedis(connection);
@@ -912,7 +918,8 @@ describe("tick.publish", () => {
       get(target, property) {
         if (property === "$transaction" && broken > 0) {
           broken -= 1;
-          return () => Promise.reject(new Error("Transaction API error: Transaction already closed"));
+          return () =>
+            Promise.reject(new Error("Transaction API error: Transaction already closed"));
         }
         const value: unknown = Reflect.get(target, property, target);
         return typeof value === "function" ? (value as () => unknown).bind(target) : value;
@@ -966,26 +973,13 @@ describe("tick.publish", () => {
       },
     });
     const agents = h.deps.queues.queue("agents");
-    const failSchedule = async (id: string) => {
-      const connection = createWorkerConnection(h.deps.config.REDIS_URL, h.deps.logger);
-      const worker = new Worker("agents", null, { connection, prefix: h.deps.queues.prefix });
-      try {
-        const token = `test-${id}`;
-        const job = await worker.getNextJob(token, { block: false });
-        expect(job?.id).toBe(id);
-        await job!.moveToFailed(new UnrecoverableError("LLM budget store unreachable"), token);
-      } finally {
-        await worker.close();
-        await closeRedis(connection);
-      }
-    };
     const later = (minutes: number) =>
       new Date(Date.parse(NOW) + minutes * MINUTE_MS).toISOString();
 
     await tickAt(h, later(6));
     const sweep = jobIds.publisherSchedule({ postId: post.id, round: 1 }, "sweep");
     expect(await (await agents.getJob(sweep))?.getState()).toBe("waiting");
-    await failSchedule(sweep);
+    await failRun(h, sweep, "LLM budget store unreachable", "agents");
 
     await tickAt(h, later(7));
     const flagged = await testDb().post.findUniqueOrThrow({ where: { id: post.id } });
