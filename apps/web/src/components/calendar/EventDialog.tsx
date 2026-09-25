@@ -25,6 +25,7 @@ import {
   eventTime,
   formatDayTimeIn,
   formatShortDay,
+  ghostNote,
   isCancellable,
   isReschedulable,
   isRetryable,
@@ -36,8 +37,8 @@ import { EventThumb } from "./CalendarEvent";
 /*
  * One calendar item in full: when it goes out (client time, and the viewer's), who picked the slot
  * and why, the live link or the last error, and what can be done with it: Move to date (the
- * keyboard's drag), retry a failed publish, cancel one that hasn't started, or open the post. A
- * ghost explains that the Publisher picks its slot once the post is approved.
+ * keyboard's drag), retry a failed publish, cancel one that hasn't started or that failed, or
+ * open the post. A ghost explains why nothing is scheduled there (ghostNote).
  */
 
 export function EventDialog({
@@ -123,10 +124,7 @@ function GhostDetails({ item }: { item: CalendarGhostItem }) {
           </span>
         </Fact>
       </dl>
-      <p className="text-sm leading-relaxed text-steel">
-        The campaign plan puts this post here; nothing is scheduled yet. Once the post is approved,
-        the Publisher picks its slot on {PLATFORM_LABEL[item.platform]}.
-      </p>
+      <p className="text-sm leading-relaxed text-steel">{ghostNote(item)}</p>
     </>
   );
 }
@@ -268,7 +266,7 @@ function JobDetails({
         open={confirmingCancel}
         onClose={() => setConfirmingCancel(false)}
         title={`Cancel publishing to ${platform}?`}
-        description={`${item.clientName}'s post won't go out on ${platform}. To publish it there later, edit the post and approve it again.`}
+        description={`${item.clientName}'s post won't go out on ${platform}. While none of the post is out, editing it and approving it again schedules it anew.`}
         confirmLabel="Cancel publish"
         pending={cancel.isPending}
         error={cancel.isError ? errorMessage(cancel.error) : null}

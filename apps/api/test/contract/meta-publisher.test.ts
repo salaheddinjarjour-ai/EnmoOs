@@ -625,8 +625,17 @@ describe("failures", () => {
     graph.failNext({ match: /photos$/, status: 400, error: GRAPH_ERRORS.pageRateLimited });
     expect(await attempt()).toMatchObject({ code: "RATE_LIMITED", retryable: true });
 
+    // An outage creating an Instagram container is retried: a container isn't public.
+    graph.failNext({ match: /\/media$/, status: 500, error: GRAPH_ERRORS.unavailable });
+    expect(
+      await failure(publisherFor("INSTAGRAM").publish(payload(), instagram, resumable())),
+    ).toMatchObject({ code: "UNAVAILABLE", retryable: true, status: 500 });
+
+    // One on the call that publishes the Facebook post isn't: Meta may have created it anyway.
     graph.failNext({ match: /photos$/, status: 500, error: GRAPH_ERRORS.unavailable });
-    expect(await attempt()).toMatchObject({ code: "UNAVAILABLE", retryable: true, status: 500 });
+    const ambiguous = await attempt();
+    expect(ambiguous).toMatchObject({ code: "UNAVAILABLE", retryable: false, status: 500 });
+    expect(ambiguous.message).toContain("check the Page, then retry or cancel the job");
 
     graph.failNext({
       match: /photos$/,

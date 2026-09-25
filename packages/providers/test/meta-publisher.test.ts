@@ -252,13 +252,64 @@ describe("Graph calls", () => {
     const timeout = Object.assign(new Error("The operation was aborted due to timeout"), {
       name: "TimeoutError",
     });
+    // A reel's first call only opens an upload session: nothing public, safe to repeat.
+    const reel = payload({
+      postType: "REEL",
+      media: [
+        { kind: "VIDEO", url: "https://assets.enmo.marketing/v.mp4", width: 1080, height: 1920 },
+      ],
+    });
     for (const failure of [new TypeError("fetch failed"), timeout]) {
       const { fetch } = scriptedFetch(failure);
       const error = await publishError(
-        facebookPublisher(fetch).publish(payload(), account, { containerId: null }),
+        facebookPublisher(fetch).publish(reel, account, { containerId: null }),
       );
       expect(error).toMatchObject({ code: "UNAVAILABLE", retryable: true, status: null });
     }
+  });
+
+  it("never retry an outage on the call that publishes a Facebook post, which may have gone out", async () => {
+    const timeout = Object.assign(new Error("The operation was aborted due to timeout"), {
+      name: "TimeoutError",
+    });
+    const unavailable = () => json({ error: { message: "Try later", code: 2 } }, 500);
+    const photos = (n: number) =>
+      Array.from({ length: n }, (_, i) => ({
+        kind: "IMAGE" as const,
+        url: `https://assets.enmo.marketing/clients/c1/assets/a${i + 1}.png`,
+        width: 1080,
+        height: 1920,
+      }));
+    const cases = [
+      { flow: payload(), responses: [new TypeError("fetch failed")], call: "photos" },
+      { flow: payload(), responses: [timeout], call: "photos" },
+      { flow: payload(), responses: [unavailable()], call: "photos" },
+      {
+        flow: payload({ postType: "CAROUSEL", media: photos(2) }),
+        responses: [json({ id: "301" }), json({ id: "302" }), unavailable()],
+        call: "feed",
+      },
+      {
+        flow: payload({ postType: "STORY" }),
+        responses: [json({ id: "301" }), timeout],
+        call: "photo_stories",
+      },
+    ];
+    for (const { flow, responses, call } of cases) {
+      const { fetch, calls } = scriptedFetch(...responses);
+      const error = await publishError(
+        facebookPublisher(fetch).publish(flow, account, { containerId: null }),
+      );
+      expect(calls.at(-1)?.url.pathname).toBe(`/v26.0/1001/${call}`);
+      expect(error).toMatchObject({ code: "UNAVAILABLE", retryable: false });
+      expect(error.message).toMatch(/may have published the .+ anyway.*check the Page/);
+    }
+
+    // A clear refusal means nothing was created: a rate limit is still retried.
+    const { fetch } = scriptedFetch(json({ error: { message: "Slow down", code: 32 } }, 400));
+    expect(
+      await publishError(facebookPublisher(fetch).publish(payload(), account, { containerId: null })),
+    ).toMatchObject({ code: "RATE_LIMITED", retryable: true });
   });
 });
 

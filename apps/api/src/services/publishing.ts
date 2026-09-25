@@ -20,6 +20,8 @@ import { afterCommit } from "../orchestrator/after-commit";
 import { EventBatch } from "../orchestrator/events";
 import { lockPost } from "../orchestrator/locks";
 import { publishUpdated, syncPostPublishStatus } from "../orchestrator/publishing";
+import { activeAccountOf } from "../publishing/context";
+import { announceLive } from "../publishing/outcomes";
 import { bestSlotOn } from "../publishing/slot-optimizer";
 import type { ServiceUser } from "./actor";
 import { recordAudit } from "./audit";
@@ -32,10 +34,12 @@ export { listCalendar } from "./calendar";
  *               bestSlotOn, no LLM call; slotSource "manual"), audited publish.reschedule
  *   retry       a FAILED job QUEUED again for its next attempt with a publish.run, going out now;
  *               publish.run re-runs the publish guard, audited publish.retry
- *   cancel      a job that hasn't started publishing CANCELLED, audited publish.cancel
+ *   cancel      a job that hasn't started publishing, or that failed, CANCELLED, audited
+ *               publish.cancel
  * Each runs under the post's lock (the one publish.run and every edit take), re-checks the job's
  * status in its conditional update, emits publish.updated and lets syncPostPublishStatus move the
- * post along (a cancel of its last job leaves it APPROVED, a retry takes it out of FAILED).
+ * post along (a cancel of its last job leaves it APPROVED, a retry takes it out of FAILED, and
+ * dropping a failed platform while the rest is out makes it LIVE).
  */
 
 const AUDITED_ENTITY = "PublishJob";
@@ -59,7 +63,8 @@ const JOB_DTO_INCLUDE = {
           clientId: true,
           type: true,
           status: true,
-          client: { select: { timezone: true } },
+          campaign: { select: { status: true } },
+          client: { select: { timezone: true, archivedAt: true } },
         },
       },
     },
@@ -147,7 +152,8 @@ async function changeJob(
     if (!job) throw notFound("Publish job");
     const { job: changed, audit } = await change(tx, job);
     publishUpdated(events, changed, postId);
-    await syncPostPublishStatus(tx, events, postId);
+    const moved = await syncPostPublishStatus(tx, events, postId);
+    if (moved?.status === "LIVE") await announceLive(tx, events, postId);
     await recordAudit(tx, {
       actorId: user.id,
       ip: user.ip,
@@ -252,14 +258,15 @@ export async function retry(deps: Deps, user: ServiceUser, jobId: string): Promi
         { postStatus: post.status },
       );
     }
+    if (post.campaign.status === "ARCHIVED" || post.client.archivedAt) {
+      throw conflict(
+        `The ${post.client.archivedAt ? "client" : "campaign"} is archived, so nothing of it publishes any more`,
+      );
+    }
     const now = deps.clock.now();
     const account =
       !job.dryRun && job.socialAccountId === null
-        ? await tx.socialAccount.findFirst({
-            where: { clientId: post.clientId, platform: job.platform, status: "ACTIVE" },
-            orderBy: { createdAt: "desc" },
-            select: { id: true },
-          })
+        ? await activeAccountOf(tx, post.clientId, job.platform)
         : null;
     const moved = job.scheduledFor.getTime() < now.getTime();
     const rows = await tx.publishJob.updateManyAndReturn({
@@ -295,7 +302,11 @@ export async function retry(deps: Deps, user: ServiceUser, jobId: string): Promi
   return dto;
 }
 
-/** POST /publish-jobs/:id/cancel. CONFLICT unless the job is CANCELLABLE; NOT_FOUND when missing. */
+/**
+ * POST /publish-jobs/:id/cancel: a waiting job called off, or a failed one dropped (a platform that
+ * keeps refusing the post), so the post settles on its other variants. CONFLICT unless the job is
+ * CANCELLABLE; NOT_FOUND when missing.
+ */
 export function cancel(deps: Deps, user: ServiceUser, jobId: string): Promise<PublishJobDto> {
   return changeJob(deps, user, jobId, async (tx, job) => {
     if (!CANCELLABLE_PUBLISH_STATUSES.includes(job.status)) throw wrongStatus(job, "cancelled");
@@ -308,7 +319,12 @@ export function cancel(deps: Deps, user: ServiceUser, jobId: string): Promise<Pu
       job: await expectUpdated(tx, rows, job, "cancelled"),
       audit: {
         action: AUDIT_ACTIONS.publishCancel,
-        data: { previousStatus: job.status, scheduledFor: job.scheduledFor.toISOString() },
+        data: {
+          previousStatus: job.status,
+          scheduledFor: job.scheduledFor.toISOString(),
+          // The cancel's own message replaces it on the job; the audit keeps why it failed.
+          ...(job.lastError ? { previousError: job.lastError } : {}),
+        },
       },
     };
   });

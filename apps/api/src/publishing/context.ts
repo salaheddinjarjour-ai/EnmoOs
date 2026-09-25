@@ -1,6 +1,6 @@
 import type { Asset, DbClient, DbTransaction, Prisma } from "@enmo/db";
 import { DryRunPublisher, type Publisher } from "@enmo/providers";
-import { CopywriterOutput, type AlertKind } from "@enmo/shared";
+import { CopywriterOutput, type AlertKind, type Platform } from "@enmo/shared";
 import type { Deps } from "../deps";
 import type { EventBatch } from "../orchestrator/events";
 import { createAgentMessage, messageCreated } from "../orchestrator/messages";
@@ -19,7 +19,9 @@ export const PUBLISH_JOB_CONTEXT = {
     include: {
       post: {
         include: {
-          client: { select: { id: true, name: true, timezone: true, bannedWords: true } },
+          client: {
+            select: { id: true, name: true, timezone: true, bannedWords: true, archivedAt: true },
+          },
           campaign: {
             select: { id: true, name: true, status: true, thread: { select: { id: true } } },
           },
@@ -70,15 +72,43 @@ export function payloadOf(deps: Pick<Deps, "config">, job: PublishJobWithContext
   });
 }
 
+/** The client's newest ACTIVE account on the platform, which its jobs publish through. */
+export function activeAccountOf(
+  db: Db,
+  clientId: string,
+  platform: Platform,
+): Promise<{ id: string } | null> {
+  return db.socialAccount.findFirst({
+    where: { clientId, platform, status: "ACTIVE" },
+    orderBy: { createdAt: "desc" },
+    select: { id: true },
+  });
+}
+
+/** Whether the platform's publisher calls the platform (PUBLISH_MODE live, with credentials). */
+export function publishesLive(deps: Pick<Deps, "publishers">, platform: Platform): boolean {
+  return deps.publishers[platform].mode === "live";
+}
+
 /**
- * A job stored as a dry run always runs through a DryRunPublisher, whatever PUBLISH_MODE says now;
- * a live one through the platform's publisher.
+ * The publisher for a job as its claim settled it (PublishJob.dryRun): a DryRunPublisher for a dry
+ * run, the platform's live publisher for a live one, or null when that one isn't live any more
+ * (PUBLISH_MODE switched to dry-run while the job was out): nothing simulated may stand in for a
+ * publish that already reached the platform.
  */
 export function publisherFor(
   deps: Pick<Deps, "publishers">,
   job: Pick<PublishJobWithContext, "dryRun" | "platform">,
-): Publisher {
-  return job.dryRun ? new DryRunPublisher(job.platform) : deps.publishers[job.platform];
+): Publisher | null {
+  if (job.dryRun) return new DryRunPublisher(job.platform);
+  return publishesLive(deps, job.platform) ? deps.publishers[job.platform] : null;
+}
+
+/** "campaign" or "client" when the job's post belongs to archived work, which never goes out. */
+export function archivedOf(job: PublishJobWithContext): "campaign" | "client" | null {
+  const { post } = job.variant;
+  if (post.campaign.status === "ARCHIVED") return "campaign";
+  return post.client.archivedAt ? "client" : null;
 }
 
 /** A TEXT message the Publisher signs in the campaign thread. */

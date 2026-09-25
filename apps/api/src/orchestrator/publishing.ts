@@ -1,8 +1,9 @@
-import type { DbTransaction, Post, PublishJob } from "@enmo/db";
-import { CANCELLABLE_PUBLISH_STATUSES, type PostStatus, type PublishStatus } from "@enmo/shared";
+import type { DbTransaction, Post, Prisma, PublishJob } from "@enmo/db";
+import { WAITING_PUBLISH_STATUSES, type PostStatus, type PublishStatus } from "@enmo/shared";
 import type { Deps } from "../deps";
 import { enqueuePublisherSchedule } from "../jobs/queues";
 import type { EventBatch } from "./events";
+import { lockPost } from "./locks";
 import { postUpdated, transitionPost, type PostTransitionData } from "./post-status";
 
 /*
@@ -22,12 +23,26 @@ export const PUBLISH_CANCEL_REASONS = {
   approvalWithdrawn: "Cancelled at publish time: the post's approval no longer stands",
   contentChanged: "Cancelled at publish time: the content changed after it was approved",
   bannedWords: "Cancelled at publish time: the content uses the client's banned words",
+  // Archived work never goes out (services/campaigns.ts, services/clients.ts, the publish guard).
+  campaignArchived: "Cancelled: the campaign was archived",
+  clientArchived: "Cancelled: the client was archived",
 } as const;
 export type PublishCancelReason = keyof typeof PUBLISH_CANCEL_REASONS;
 
-/** PublishJob.lastError values that mean "called off by the approval lifecycle", not by a person. */
+/** Reasons that stand until a person acts, like their own cancel: an archive. */
+const STANDING_CANCEL_REASONS: ReadonlySet<PublishCancelReason> = new Set([
+  "campaignArchived",
+  "clientArchived",
+]);
+
+/**
+ * PublishJob.lastError values that mean "called off by the approval lifecycle", so the next
+ * approval schedules the job again; not a person's cancel, nor an archive.
+ */
 export const LIFECYCLE_CANCEL_MESSAGES: ReadonlySet<string> = new Set(
-  Object.values(PUBLISH_CANCEL_REASONS),
+  Object.entries(PUBLISH_CANCEL_REASONS)
+    .filter(([reason]) => !STANDING_CANCEL_REASONS.has(reason as PublishCancelReason))
+    .map(([, message]) => message),
 );
 
 /** The approval that just ended APPROVED: its post and round. */
@@ -79,11 +94,41 @@ export async function cancelScheduledForPost(
   reason: PublishCancelReason,
 ): Promise<number> {
   const cancelled = await tx.publishJob.updateManyAndReturn({
-    where: { variant: { postId }, status: { in: [...CANCELLABLE_PUBLISH_STATUSES] } },
+    where: { variant: { postId }, status: { in: [...WAITING_PUBLISH_STATUSES] } },
     data: { status: "CANCELLED", lastError: PUBLISH_CANCEL_REASONS[reason] },
   });
   for (const job of cancelled) publishUpdated(events, job, postId);
   return cancelled.length;
+}
+
+/**
+ * Inside an archive's transaction, after the archived row was written: each post `where` selects
+ * that still has a job waiting to go out is locked, its waiting jobs CANCELLED with the reason
+ * and its status brought in line (a SCHEDULED post is APPROVED again). The publish guard refuses
+ * whatever this misses (a job it raced). Returns how many jobs were cancelled.
+ */
+export async function cancelScheduledWhere(
+  tx: DbTransaction,
+  events: EventBatch,
+  where: Prisma.PostWhereInput,
+  reason: Extract<PublishCancelReason, "campaignArchived" | "clientArchived">,
+): Promise<number> {
+  const posts = await tx.post.findMany({
+    where: {
+      ...where,
+      variants: { some: { publishJob: { status: { in: [...WAITING_PUBLISH_STATUSES] } } } },
+    },
+    select: { id: true },
+    // A stable order, so two archives touching the same posts can't deadlock.
+    orderBy: { id: "asc" },
+  });
+  let count = 0;
+  for (const { id } of posts) {
+    await lockPost(tx, id);
+    count += await cancelScheduledForPost(tx, events, id, reason);
+    await syncPostPublishStatus(tx, events, id);
+  }
+  return count;
 }
 
 /** Post statuses its publish jobs decide; earlier ones belong to the approval lifecycle. */

@@ -1,3 +1,4 @@
+import type { DbTransaction } from "@enmo/db";
 import {
   PublishError,
   type DecryptedAccount,
@@ -20,15 +21,25 @@ import {
 } from "../jobs/queues";
 import type { RunAttempt } from "../jobs/types";
 import { MINUTE_MS } from "../lib/clock";
+import { afterCommit } from "../orchestrator/after-commit";
 import { lockReopenableRounds } from "../orchestrator/approval-round";
 import { EventBatch } from "../orchestrator/events";
+import { advance } from "../orchestrator/graph";
 import { lockPost } from "../orchestrator/locks";
 import {
   LIFECYCLE_CANCEL_MESSAGES,
   publishUpdated,
   syncPostPublishStatus,
 } from "../orchestrator/publishing";
-import { loadPublishJob, payloadOf, publisherFor, type PublishJobWithContext } from "./context";
+import {
+  activeAccountOf,
+  archivedOf,
+  loadPublishJob,
+  payloadOf,
+  publisherFor,
+  publishesLive,
+  type PublishJobWithContext,
+} from "./context";
 import { checkPublishGuards, decryptAccount } from "./guards";
 import {
   failJob,
@@ -45,19 +56,23 @@ import { describeIssues } from "./payload";
  *   tick.publish  due SCHEDULED jobs → QUEUED + publish.run; also re-drives what a lost enqueue or
  *                 a dead worker left behind (QUEUED without a run, PUBLISHING without a run or poll,
  *                 an APPROVED post whose publisher.schedule never ran)
- *   publish.run   under the post's locks: the guard, the payload, QUEUED → PUBLISHING; then the
- *                 publisher (a DryRunPublisher for a dry-run job), resuming the job's container
+ *   publish.run   under the post's locks: dry run or live settled for good (the publish mode and
+ *                 account now), the guard, the payload, QUEUED → PUBLISHING; then the publisher
+ *                 (a DryRunPublisher for a dry run), resuming the job's container
  *   publish.poll  media the platform is still processing, until it is live or PUBLISH_POLL_MAX_MIN
- * Automatic retries are new publish.run jobs, one per attempt, up to PUBLISH_MAX_ATTEMPTS; a
- * manual retry (POST /publish-jobs/:id/retry) always gets its own attempt.
+ * Automatic retries are new publish.run jobs, one per attempt, up to PUBLISH_MAX_ATTEMPTS per chain;
+ * a manual retry (POST /publish-jobs/:id/retry) always gets its own attempt and starts a new chain.
  */
 
 export type PublishStepResult =
   "stale" | "refused" | "published" | "processing" | "retrying" | "failed";
 
-/** The wait before automatic attempt `failedAttempt + 1`: one poll interval, ×3 per attempt. */
-export function publishRetryDelayMs(config: Deps["config"], failedAttempt: number): number {
-  return publishPollDelayMs(config) * 3 ** Math.max(0, failedAttempt - 1);
+/**
+ * The wait after the `failedTry`-th attempt of a chain of automatic retries (1 for the attempt
+ * that began it): one poll interval, ×3 per try.
+ */
+export function publishRetryDelayMs(config: Deps["config"], failedTry: number): number {
+  return publishPollDelayMs(config) * 3 ** Math.max(0, failedTry - 1);
 }
 
 const ERROR_VERB: Readonly<Record<PublishErrorCode, string>> = {
@@ -88,7 +103,8 @@ async function saveContainer(deps: Deps, ref: AttemptRef, containerId: string): 
 
 /**
  * A PublishError decides the job's fate (AUTH also marks the account); anything else is an
- * infrastructure error BullMQ retries, and its last attempt fails the job.
+ * infrastructure error BullMQ retries, and its last attempt fails the job. `firstAttempt` began
+ * the chain of automatic retries this attempt belongs to.
  */
 async function handleFailure(
   deps: Deps,
@@ -96,6 +112,7 @@ async function handleFailure(
   platform: Platform,
   error: unknown,
   run: RunAttempt,
+  firstAttempt: number = ref.attempt,
 ): Promise<PublishStepResult> {
   if (error instanceof PublishError) {
     const message = describeError(error, platform);
@@ -103,11 +120,12 @@ async function handleFailure(
       await failJob(deps, ref, message, { accountStatus: "EXPIRED" });
       return "failed";
     }
-    if (error.retryable && ref.attempt < deps.config.PUBLISH_MAX_ATTEMPTS) {
-      await retryLater(deps, ref, message, publishRetryDelayMs(deps.config, ref.attempt));
+    const tries = ref.attempt - firstAttempt + 1;
+    if (error.retryable && tries < deps.config.PUBLISH_MAX_ATTEMPTS) {
+      await retryLater(deps, ref, message, publishRetryDelayMs(deps.config, tries), firstAttempt);
       return "retrying";
     }
-    const final = error.retryable ? `${message} (gave up after ${ref.attempt} attempts)` : message;
+    const final = error.retryable ? `${message} (gave up after ${tries} attempts)` : message;
     await failJob(deps, ref, final);
     return "failed";
   }
@@ -140,13 +158,42 @@ async function settle(
 
 type Claim =
   | { kind: "stale" }
-  | { kind: "settled" }
+  | { kind: "settled"; revisedGraph: string | null }
   | {
       kind: "claimed";
       job: PublishJobWithContext;
       payload: PublishPayload;
       account: DecryptedAccount | null;
     };
+
+/** How a job goes out: PublishJob.dryRun and socialAccountId as its claim stores them. */
+interface PublishMode {
+  dryRun: boolean;
+  socialAccountId: string | null;
+}
+
+/**
+ * Dry run or live, settled when the job starts publishing (DESIGN §F "Dry-run": dry unless
+ * PUBLISH_MODE is live, the platform has credentials and there is an account). Scheduling only
+ * forecast it, so a kill switch (PUBLISH_MODE=dry-run, credentials removed) never passes a
+ * simulated post off as live, and a post scheduled before its account was connected goes out for
+ * real. The account is the job's own, or else the client's current one. A job scheduled live
+ * whose account is gone stays live: the token guard fails it, so people reconnect rather than
+ * find a simulated post. A job already PUBLISHING (a BullMQ retry after a crash) keeps what its
+ * first claim settled: that attempt may have media at the platform already.
+ */
+async function publishModeOf(
+  tx: DbTransaction,
+  deps: Deps,
+  job: PublishJobWithContext,
+): Promise<PublishMode> {
+  const stored = { dryRun: job.dryRun, socialAccountId: job.socialAccountId };
+  if (job.status === "PUBLISHING") return stored;
+  if (!publishesLive(deps, job.platform)) return { ...stored, dryRun: true };
+  if (job.socialAccountId) return { ...stored, dryRun: false };
+  const account = await activeAccountOf(tx, job.variant.post.clientId, job.platform);
+  return account ? { dryRun: false, socialAccountId: account.id } : stored;
+}
 
 /** QUEUED for this attempt, or already PUBLISHING on it (a BullMQ retry after a crash). */
 function onThisAttempt(job: { status: string; attempts: number }, attempt: number): boolean {
@@ -175,9 +222,11 @@ async function claim(deps: Deps, data: PublishRunJob): Promise<Claim> {
     if (!job || !onThisAttempt(job, data.attempt)) return { kind: "stale" };
     const ref = refOf(job, data.attempt);
     const post = job.variant.post;
+    const mode = await publishModeOf(tx, deps, job);
 
     const guard = await checkPublishGuards(tx, deps.tokenCipher, {
       postId: post.id,
+      archived: archivedOf(job),
       copy: post.copy,
       bannedWords: post.client.bannedWords,
       variant: {
@@ -185,32 +234,43 @@ async function claim(deps: Deps, data: PublishRunJob): Promise<Claim> {
         caption: job.variant.caption,
         hashtags: job.variant.hashtags,
       },
-      job: { dryRun: job.dryRun, socialAccountId: job.socialAccountId },
+      job: mode,
       now: deps.clock.now(),
     });
     if (!guard.ok) {
-      await refuseIn(tx, deps, events, job, ref, guard.failure);
-      return { kind: "settled" };
+      const refusal = await refuseIn(tx, deps, events, job, ref, guard.failure);
+      return { kind: "settled", revisedGraph: refusal.revisedGraph };
     }
     const prepared = payloadOf(deps, job);
     if (!prepared.ok) {
       const message = `${PLATFORM_LABEL[job.platform]} ${ERROR_VERB.INVALID_PAYLOAD}: ${describeIssues(prepared.issues)}`;
       await failJobIn(tx, deps, events, job, ref, message);
-      return { kind: "settled" };
+      return { kind: "settled", revisedGraph: null };
     }
     const [claimed] = await tx.publishJob.updateManyAndReturn({
       where: { id: job.id, status: { in: ["QUEUED", "PUBLISHING"] } },
-      data: { status: "PUBLISHING", attempts: data.attempt },
+      data: { status: "PUBLISHING", attempts: data.attempt, ...mode },
     });
     if (!claimed) return { kind: "stale" };
     if (job.status === "QUEUED") {
       publishUpdated(events, claimed, post.id);
       await syncPostPublishStatus(tx, events, post.id);
     }
-    return { kind: "claimed", job, payload: prepared.payload, account: guard.account };
+    return {
+      kind: "claimed",
+      job: { ...job, ...mode },
+      payload: prepared.payload,
+      account: guard.account,
+    };
   });
   await events.publish(deps);
   return result;
+}
+
+/** The job is live, but its platform's publisher no longer is: nothing may fake the rest. */
+function switchedOff(platform: Platform): string {
+  const label = PLATFORM_LABEL[platform];
+  return `${label} publishing was switched to dry run (PUBLISH_MODE or its credentials) while this live publish was under way; check the ${label} account, then retry it`;
 }
 
 /** publish.run: one attempt at publishing a job. */
@@ -221,17 +281,29 @@ export async function runPublish(
 ): Promise<PublishStepResult> {
   const claimed = await claim(deps, data);
   if (claimed.kind === "stale") return "stale";
-  if (claimed.kind === "settled") return "refused";
+  if (claimed.kind === "settled") {
+    const graphId = claimed.revisedGraph;
+    if (graphId) {
+      // The sweeper queues the revision if this is lost.
+      await afterCommit(deps, "starting the copy revision", () => advance(deps, graphId));
+    }
+    return "refused";
+  }
   const { job, payload, account } = claimed;
   const ref = refOf(job, data.attempt);
+  const publisher = publisherFor(deps, job);
+  if (!publisher) {
+    await failJob(deps, ref, switchedOff(job.platform));
+    return "failed";
+  }
   let outcome: PublishOutcome;
   try {
-    outcome = await publisherFor(deps, job).publish(payload, account, {
+    outcome = await publisher.publish(payload, account, {
       containerId: job.containerId,
       onContainer: (containerId) => saveContainer(deps, ref, containerId),
     });
   } catch (error) {
-    return handleFailure(deps, ref, job.platform, error, run);
+    return handleFailure(deps, ref, job.platform, error, run, data.firstAttempt);
   }
   return settle(deps, ref, outcome, 0);
 }
@@ -269,6 +341,11 @@ export async function pollPublish(
     );
     return "failed";
   }
+  const publisher = publisherFor(deps, job);
+  if (!publisher) {
+    await failJob(deps, ref, switchedOff(job.platform));
+    return "failed";
+  }
   const account = await pollAccount(deps, job);
   if (account === "unusable") {
     await failJob(
@@ -284,7 +361,7 @@ export async function pollPublish(
 
   let outcome: PublishOutcome;
   try {
-    outcome = await publisherFor(deps, job).poll(job.containerId, account, prepared.payload);
+    outcome = await publisher.poll(job.containerId, account, prepared.payload);
   } catch (error) {
     // A transient error while checking just means another look later.
     if (!(error instanceof PublishError && error.retryable)) {
@@ -423,6 +500,7 @@ async function redriveLostSchedules(deps: Deps): Promise<number> {
       needsAttention: false,
       approvedAt: { lte: cutoff },
       campaign: { status: { not: "ARCHIVED" } },
+      client: { archivedAt: null },
     },
     select: {
       id: true,

@@ -24,6 +24,7 @@ import {
 import { enqueuePlanDraft, isPlanBeingDrafted } from "../orchestrator/plan";
 import { postUpdated } from "../orchestrator/post-status";
 import { reportProgress } from "../orchestrator/progress";
+import { cancelScheduledWhere } from "../orchestrator/publishing";
 import { UNFINISHED_STATUSES } from "../orchestrator/tasks";
 import type { ServiceUser } from "./actor";
 
@@ -254,9 +255,11 @@ export async function getCampaign(deps: Deps, campaignId: string): Promise<Campa
 /**
  * POST /campaigns/:id/archive. Moves the campaign to ARCHIVED and cancels its unfinished
  * AgentTasks so no further spend happens; a proposed plan is rejected and open approval rounds are
- * cancelled, so nothing of it waits on a human. Its posts keep their status (and stay readable in
- * the thread) but leave the pipeline: GET /posts drops them unless asked for the campaign, and
- * post.updated tells open boards to refetch. Idempotent. NOT_FOUND when missing.
+ * cancelled, so nothing of it waits on a human, and every PublishJob still waiting for its slot is
+ * cancelled, so nothing of it goes out (a SCHEDULED post is APPROVED again). Its posts otherwise
+ * keep their status (and stay readable in the thread) but leave the pipeline: GET /posts drops them
+ * unless asked for the campaign, and post.updated tells open boards to refetch. Idempotent.
+ * NOT_FOUND when missing.
  */
 export async function archiveCampaign(
   deps: Deps,
@@ -298,6 +301,7 @@ export async function archiveCampaign(
         clientId: round.post.clientId,
       });
     }
+    await cancelScheduledWhere(tx, events, { campaignId }, "campaignArchived");
     return [...new Set(cancelled.map((task) => task.graphId))];
   });
 

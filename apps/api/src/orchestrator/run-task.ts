@@ -40,6 +40,7 @@ import {
 import { EventBatch } from "./events";
 import {
   appendRevision,
+  bannedWordIssues,
   qaFeedbackText,
   qaRevisionCount,
   qaRevisionTarget,
@@ -282,12 +283,7 @@ export function automatedChecks(
 /** The gates' findings as QA issues for the specialist that fixes each. */
 function gateIssues(bannedWords: readonly BannedWordHit[], gaps: readonly Issue[]): QaIssue[] {
   return [
-    ...bannedWords.map((hit) => ({
-      target: "COPYWRITER" as const,
-      field: hit.path || "copy",
-      problem: `Uses the banned term "${hit.term}" ("${hit.match}").`,
-      instruction: `Rewrite ${hit.path || "the copy"} without "${hit.term}".`,
-    })),
+    ...bannedWordIssues(bannedWords),
     ...gaps.map((gap) => ({
       target: "VISUAL_DIRECTOR" as const,
       field: gap.path || "shots",

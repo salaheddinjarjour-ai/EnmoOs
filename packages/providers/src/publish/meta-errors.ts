@@ -9,9 +9,10 @@ import {
 /*
  * Graph failures as PublishErrors, so the publish service knows what to do next (errors.ts):
  * token and permission problems are AUTH (the account is marked, an alert raised), rate limits and
- * outages are retried, media Meta couldn't process is MEDIA_FAILED, anything else is a permanent
- * REJECTED. Codes as Meta documents them for the Graph API, Instagram content publishing and
- * Facebook video uploads.
+ * outages are retried (except an outage on a call that publishes and can't be repeated safely,
+ * which its flow makes final: meta-facebook.ts publishOnce), media Meta couldn't process is
+ * MEDIA_FAILED, anything else is a permanent REJECTED. Codes as Meta documents them for the Graph
+ * API, Instagram content publishing and Facebook video uploads.
  */
 
 /** 190 invalid or expired token, 102 session, 10 and 200–299 missing permission, 104/2500 no token. */

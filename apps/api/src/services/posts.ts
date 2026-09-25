@@ -125,7 +125,9 @@ interface EditState {
 function whyNotEditable(post: EditState): string | null {
   if (post.campaign.status === "ARCHIVED") return "The campaign is archived";
   if (PUBLISHED_STATUSES.has(post.status)) return "A published post can't be edited";
-  if (post.status === "FAILED") return "A failed post can't be edited";
+  if (post.status === "FAILED") {
+    return "A failed post can't be edited; retry its failed publish or cancel it from the calendar first";
+  }
   if (post._count.tasks > 0) {
     return "An agent is working on this post right now; edit it once it's done";
   }

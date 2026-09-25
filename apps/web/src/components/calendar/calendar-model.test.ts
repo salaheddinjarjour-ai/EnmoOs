@@ -16,6 +16,7 @@ import {
   formatMonth,
   formatShortDay,
   formatTimeIn,
+  ghostNote,
   isCancellable,
   isReschedulable,
   isRetryable,
@@ -201,9 +202,23 @@ describe("items", () => {
     expect(isReschedulable(job({ status: "QUEUED" }))).toBe(false);
     expect(isReschedulable(ghost())).toBe(false);
     expect(isCancellable(job({ status: "QUEUED" }))).toBe(true);
+    // A platform that keeps refusing the post can be dropped.
+    expect(isCancellable(job({ status: "FAILED" }))).toBe(true);
     expect(isCancellable(job({ status: "PUBLISHING" }))).toBe(false);
+    expect(isCancellable(job({ status: "PUBLISHED" }))).toBe(false);
     expect(isRetryable(job({ status: "FAILED" }))).toBe(true);
     expect(isRetryable(job())).toBe(false);
+  });
+
+  it("explains a ghost by where its post stands", () => {
+    expect(ghostNote(ghost())).toMatch(/^The campaign plan puts this post here; .*approved/);
+    expect(ghostNote(ghost({ postStatus: "SCHEDULED" }))).toMatch(
+      /^The post is approved, but nothing is scheduled on Facebook: .*approve it again/,
+    );
+    expect(ghostNote(ghost({ postStatus: "FAILED" }))).toMatch(/Retry or cancel that one first/);
+    expect(ghostNote(ghost({ postStatus: "LIVE" }))).toBe(
+      "The post went out without Facebook: nothing is scheduled there, and a post that is out can't be scheduled again.",
+    );
   });
 
   it("links only published jobs to their live post", () => {

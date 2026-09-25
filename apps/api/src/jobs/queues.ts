@@ -160,12 +160,19 @@ export type PublisherScheduleJob = z.infer<typeof PublisherScheduleJob>;
 
 /**
  * publish.run: one attempt at publishing a PublishJob. `attempt` is the PublishJob.attempts value
- * this run makes (1 for the first, +1 for each automatic or manual retry), so every retry is a new
- * BullMQ job while a duplicate trigger of the same attempt is not.
+ * this run makes (+1 for each run, automatic or manual retry, over the job's whole life: it never
+ * starts again at 1 when the job is scheduled anew), so every run is a new BullMQ job while a
+ * duplicate trigger of the same attempt is not.
  */
 export const PublishRunJob = z.object({
   publishJobId: Id,
   attempt: z.int().positive(),
+  /**
+   * The attempt that began this chain of automatic retries; left out, this run begins one (a due
+   * slot, a teammate's retry). PUBLISH_MAX_ATTEMPTS counts from it, so a job scheduled again after
+   * earlier runs still gets its full allowance.
+   */
+  firstAttempt: z.int().positive().optional(),
 });
 export type PublishRunJob = z.infer<typeof PublishRunJob>;
 

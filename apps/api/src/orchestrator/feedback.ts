@@ -1,6 +1,7 @@
 import type { AgentTask, ApprovalRequest, DbClient, DbTransaction, Post } from "@enmo/db";
 import {
   ACTION_AGENT,
+  type BannedWordHit,
   type Feedback,
   type FeedbackTarget,
   type PerPostAction,
@@ -55,6 +56,16 @@ export function qaRevisionTarget(issues: readonly QaIssue[]): FeedbackTarget {
   const visual = issues.some((issue) => issue.target === "VISUAL_DIRECTOR");
   if (copy && visual) return "BOTH";
   return visual ? "VISUAL" : "COPY";
+}
+
+/** Banned-word hits in the copy as QA issues for the Copywriter, one per hit. */
+export function bannedWordIssues(hits: readonly BannedWordHit[]): QaIssue[] {
+  return hits.map((hit) => ({
+    target: "COPYWRITER" as const,
+    field: hit.path || "copy",
+    problem: `Uses the banned term "${hit.term}" ("${hit.match}").`,
+    instruction: `Rewrite ${hit.path || "the copy"} without "${hit.term}".`,
+  }));
 }
 
 /** QA's instructions as the revision feedback the specialist reads. */
@@ -161,11 +172,9 @@ export async function spliceDirectAfter(
   return direct;
 }
 
-export interface VisualRevisionRequest {
+interface RevisionReopen {
   postId: string;
   graphId: string;
-  /** For the Visual Director, verbatim: a Vault instruction; null when there is none. */
-  feedback: Feedback | null;
   enabledActions: readonly PipelineAction[];
   now: Date;
   /** Collects the publish.updated of each PublishJob the revision cancels. */
@@ -174,28 +183,36 @@ export interface VisualRevisionRequest {
   cancelReason: PublishCancelReason;
 }
 
-export interface VisualRevision {
+export interface VisualRevisionRequest extends RevisionReopen {
+  /** For the Visual Director, verbatim: a Vault instruction; null when there is none. */
+  feedback: Feedback | null;
+}
+
+export interface Revision {
   post: Post;
   /** The rounds it cancelled (open, or approved and not yet published). */
   cancelled: ApprovalRequest[];
+  /** The revision chain, first task first. */
+  tasks: AgentTask[];
+}
+
+export interface VisualRevision extends Revision {
   /** The revision chain's direct task. */
   direct: AgentTask;
 }
 
 /**
- * Sends a planned post that waits on (or is past) its approval back through the Visual Director:
- * its open or approved rounds and scheduled PublishJobs are cancelled, the post goes to
- * CHANGES_REQUESTED with revision + 1, and a VISUAL chain (direct.rN → [adapt] → qa.rN) is
- * appended whose direct carries `feedback`, with the Visual Director in it even when the pipeline
- * has dropped it since; QA opens the next round. For a Vault regenerate, and for a copy edit that
- * changed the scenes or slides the post's takes fill. The caller holds the campaign, round and post
- * locks (locks.ts) and has checked the post waits on or is past its approval
- * (PENDING_APPROVAL, APPROVED or SCHEDULED); advance() queues the chain once committed.
+ * Sends a planned post that waits on (or is past) its approval back to the agents: its open or
+ * approved rounds and scheduled PublishJobs are cancelled, the post goes to CHANGES_REQUESTED with
+ * revision + 1, and the `target` chain is appended with `feedback` on its first task; QA opens the
+ * next round. The caller holds the campaign, round and post locks (locks.ts) and has checked the
+ * post waits on or is past its approval (PENDING_APPROVAL, APPROVED or SCHEDULED); advance()
+ * queues the chain once committed.
  */
-export async function routeVisualRevision(
+async function reopenForRevision(
   tx: DbTransaction,
-  request: VisualRevisionRequest,
-): Promise<VisualRevision> {
+  request: RevisionReopen & { target: FeedbackTarget; feedback: Feedback | null },
+): Promise<Revision> {
   const cancelled = await cancelOpenRounds(tx, request.postId, request.now);
   await cancelScheduledForPost(tx, request.events, request.postId, request.cancelReason);
   const { status } = await tx.post.findUniqueOrThrow({
@@ -212,20 +229,65 @@ export async function routeVisualRevision(
     attentionReason: null,
     qaNotes: null,
   });
-  const actions: PipelineAction[] = request.enabledActions.includes("direct")
-    ? [...request.enabledActions]
-    : [...request.enabledActions, "direct"];
-  const chain = await appendRevision(tx, {
+  const tasks = await appendRevision(tx, {
     graphId: request.graphId,
     post,
     revision: post.revision,
-    target: "VISUAL",
+    target: request.target,
     feedback: request.feedback,
+    enabledActions: request.enabledActions,
+  });
+  return { post, cancelled, tasks };
+}
+
+/**
+ * reopenForRevision through the Visual Director: a VISUAL chain (direct.rN → [adapt] → qa.rN)
+ * whose direct carries `feedback`, with the Visual Director in it even when the pipeline has
+ * dropped it since. For a Vault regenerate, and for a copy edit that changed the scenes or slides
+ * the post's takes fill.
+ */
+export async function routeVisualRevision(
+  tx: DbTransaction,
+  request: VisualRevisionRequest,
+): Promise<VisualRevision> {
+  const actions: PipelineAction[] = request.enabledActions.includes("direct")
+    ? [...request.enabledActions]
+    : [...request.enabledActions, "direct"];
+  const revision = await reopenForRevision(tx, {
+    ...request,
+    target: "VISUAL",
     enabledActions: actions,
   });
-  const direct = chain.find((task) => task.action === "direct");
-  if (!direct) throw new Error(`The visual revision of post ${post.id} has no direct task`);
-  return { post, cancelled, direct };
+  const direct = revision.tasks.find((task) => task.action === "direct");
+  if (!direct) throw new Error(`The visual revision of post ${revision.post.id} has no direct task`);
+  return { ...revision, direct };
+}
+
+export interface CopyRevisionRequest extends RevisionReopen {
+  /** What the Copywriter must fix, as QA would word it. */
+  issues: readonly QaIssue[];
+  /** The feedback when there are no issues to list. */
+  summary: string;
+}
+
+/**
+ * reopenForRevision through the Copywriter: a COPY chain (write.rN → [adapt] → qa.rN) carrying
+ * the issues as QA feedback. For copy an automated check refused after approval (the publish
+ * guard's banned words), which, like QA's gate, must not go back to reviewers unchanged.
+ */
+export function routeCopyRevision(
+  tx: DbTransaction,
+  request: CopyRevisionRequest,
+): Promise<Revision> {
+  return reopenForRevision(tx, {
+    ...request,
+    target: "COPY",
+    feedback: {
+      verbatim: qaFeedbackText(request.issues, request.summary),
+      source: "QA",
+      decisionId: null,
+    },
+  });
 }
 
 /** The graph the post's planned tasks belong to, or null for a post outside any plan. */

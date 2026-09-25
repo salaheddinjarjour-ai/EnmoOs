@@ -24,8 +24,17 @@ export type SlotSource = z.infer<typeof SlotSource>;
 
 /** Only a job still waiting for its slot can be moved (the calendar drags only these). */
 export const RESCHEDULABLE_PUBLISH_STATUSES: readonly PublishStatus[] = ["SCHEDULED"];
-/** A job that hasn't started publishing can be called off. */
-export const CANCELLABLE_PUBLISH_STATUSES: readonly PublishStatus[] = ["SCHEDULED", "QUEUED"];
+/** Jobs waiting for their slot or their run: what reopening a post's approval calls off. */
+export const WAITING_PUBLISH_STATUSES: readonly PublishStatus[] = ["SCHEDULED", "QUEUED"];
+/**
+ * What a teammate can call off: a job that hasn't started publishing, or one that failed, so a
+ * platform that keeps refusing the post can be dropped and the post settle on the rest (LIVE when
+ * they are out, APPROVED and editable again when nothing is).
+ */
+export const CANCELLABLE_PUBLISH_STATUSES: readonly PublishStatus[] = [
+  ...WAITING_PUBLISH_STATUSES,
+  "FAILED",
+];
 /** A failed job can be tried again (it resumes its media container when it has one). */
 export const RETRYABLE_PUBLISH_STATUSES: readonly PublishStatus[] = ["FAILED"];
 
@@ -45,8 +54,16 @@ export const PublishJobDto = z.object({
   timezone: z.string(),
   slotSource: SlotSource,
   slotReason: z.string().nullable(),
-  /** Simulated: validated like a real publish, with a https://dryrun.enmo.marketing/… live URL. */
+  /**
+   * Simulated: validated like a real publish, with a https://dryrun.enmo.marketing/… live URL.
+   * Forecast when the job is scheduled, then settled when it starts publishing, from the publish
+   * mode and the client's account at that moment.
+   */
   dryRun: z.boolean(),
+  /**
+   * Publish runs over the job's whole life. Never reset when the job is scheduled again, so each
+   * run keeps a queue id of its own.
+   */
   attempts: z.int().nonnegative(),
   /** Null only in dry-run. */
   socialAccountId: Id.nullable(),

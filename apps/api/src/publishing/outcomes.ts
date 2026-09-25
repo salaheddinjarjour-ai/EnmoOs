@@ -1,5 +1,6 @@
+import { COPY_BANNED_SCAN_IGNORE } from "@enmo/agents";
 import type { AccountStatus, DbTransaction } from "@enmo/db";
-import { PLATFORM_LABEL } from "@enmo/shared";
+import { PLATFORM_LABEL, scanForBannedWords } from "@enmo/shared";
 import type { Deps } from "../deps";
 import { enqueuePublishRun } from "../jobs/queues";
 import { afterCommit } from "../orchestrator/after-commit";
@@ -10,6 +11,7 @@ import {
   openApprovalRound,
 } from "../orchestrator/approval-round";
 import { EventBatch } from "../orchestrator/events";
+import { bannedWordIssues, plannedGraphOf, routeCopyRevision } from "../orchestrator/feedback";
 import { lockPost } from "../orchestrator/locks";
 import { postUpdated, requireTransition } from "../orchestrator/post-status";
 import {
@@ -32,9 +34,10 @@ import type { GuardFailure, GuardName } from "./guards";
 /*
  * How a publish attempt ends (DESIGN §F): PUBLISHED with its live URL (the post LIVE once every
  * variant is), QUEUED again for an automatic retry, FAILED with an alert (an expired token also
- * marks the account), or CANCELLED when the publish guard refuses the content, which reopens the
- * post's approval. Each write is conditional on the job still being on the attempt that decided
- * it, so a late or duplicate job can't overwrite a newer state.
+ * marks the account), or CANCELLED when the publish guard refuses it: archived work is held back,
+ * and refused content goes back to its approval (banned copy to the Copywriter first). Each write
+ * is conditional on the job still being on the attempt that decided it, so a late or duplicate
+ * job can't overwrite a newer state.
  */
 
 /** A job on one publish attempt (PublishRunJob.attempt). */
@@ -93,7 +96,12 @@ export async function recordPublished(
   return done;
 }
 
-async function announceLive(tx: DbTransaction, events: EventBatch, postId: string): Promise<void> {
+/** The Publisher's "p1 is live." note with each live URL, once the post's last variant is out. */
+export async function announceLive(
+  tx: DbTransaction,
+  events: EventBatch,
+  postId: string,
+): Promise<void> {
   const post = await tx.post.findUniqueOrThrow({
     where: { id: postId },
     select: {
@@ -195,13 +203,15 @@ export async function failJob(
 /**
  * A retryable failure with automatic attempts left: the job waits QUEUED (the post back to
  * SCHEDULED unless another variant is out) and publish.run comes back for the next attempt after
- * `delayMs`. A lost enqueue is re-driven by tick.publish.
+ * `delayMs`, in the same chain of retries as `firstAttempt`. A lost enqueue is re-driven by
+ * tick.publish.
  */
 export async function retryLater(
   deps: Deps,
   ref: AttemptRef,
   message: string,
   delayMs: number,
+  firstAttempt: number = ref.attempt,
 ): Promise<boolean> {
   const events = new EventBatch();
   const queued = await deps.prisma.$transaction(async (tx) => {
@@ -220,7 +230,7 @@ export async function retryLater(
     await afterCommit(deps, "queueing an automatic publish retry", () =>
       enqueuePublishRun(
         deps.queues,
-        { publishJobId: ref.jobId, attempt: ref.attempt + 1 },
+        { publishJobId: ref.jobId, attempt: ref.attempt + 1, firstAttempt },
         { delayMs },
       ),
     );
@@ -228,18 +238,60 @@ export async function retryLater(
   return queued;
 }
 
-const CANCEL_REASON: Readonly<Record<Exclude<GuardName, "token">, PublishCancelReason>> = {
+const CANCEL_REASON: Readonly<
+  Record<Exclude<GuardName, "token" | "archived">, PublishCancelReason>
+> = {
   approval: "approvalWithdrawn",
   contentHash: "contentChanged",
   bannedWords: "bannedWords",
 };
 
+/** What a refusal leaves for after its transaction commits. */
+export interface Refusal {
+  /** The graph a revision was appended to: advance() it once committed. */
+  revisedGraph: string | null;
+}
+
+const NOTHING_TO_ADVANCE: Refusal = { revisedGraph: null };
+
+/**
+ * Archived work never goes out, and nobody has to act on it: the job and every other waiting job
+ * of the post are CANCELLED (the archive's own reason, so nothing schedules them again), the post
+ * settles on what is left, and the thread is told.
+ */
+async function holdBackArchivedIn(
+  tx: DbTransaction,
+  events: EventBatch,
+  job: PublishJobWithContext,
+  ref: AttemptRef,
+  failure: GuardFailure,
+): Promise<void> {
+  const post = job.variant.post;
+  const reason = post.campaign.status === "ARCHIVED" ? "campaignArchived" : "clientArchived";
+  const [cancelled] = await tx.publishJob.updateManyAndReturn({
+    where: onAttempt(ref),
+    data: { status: "CANCELLED", lastError: PUBLISH_CANCEL_REASONS[reason] },
+  });
+  if (!cancelled) return;
+  publishUpdated(events, cancelled, ref.postId);
+  await cancelScheduledForPost(tx, events, ref.postId, reason);
+  await syncPostPublishStatus(tx, events, ref.postId);
+  await publisherNote(
+    tx,
+    events,
+    post.campaign.thread?.id,
+    `I held back ${labelOf(job)}: ${clause(failure.message)}.`,
+  );
+}
+
 /**
  * The guard refused the job (inside the publish transaction, rounds and post locked). A token
- * problem fails it like a platform AUTH error: people reconnect and retry. Anything about the
- * content cancels it with every other waiting job of the post and, while the post is only
- * approved or scheduled, reopens its approval on what it holds now; a post already partly out
- * stays where it is, flagged.
+ * problem fails it like a platform AUTH error: people reconnect and retry. Archived work is simply
+ * held back. Anything about the content cancels it with every other waiting job of the post and,
+ * while the post is only approved or scheduled, sends it back: banned words to the Copywriter
+ * (the gate before an approval round, as QA's is: reviewers never get copy that can't go out),
+ * anything else to its approval, reopened on what the post holds now. A post already partly out,
+ * or banned copy outside any plan, stays where it is, flagged.
  */
 export async function refuseIn(
   tx: DbTransaction,
@@ -248,27 +300,54 @@ export async function refuseIn(
   job: PublishJobWithContext,
   ref: AttemptRef,
   failure: GuardFailure,
-): Promise<void> {
+): Promise<Refusal> {
   if (failure.guard === "token") {
     await failJobIn(tx, deps, events, job, ref, failure.message, {
       accountStatus: failure.accountStatus,
     });
-    return;
+    return NOTHING_TO_ADVANCE;
+  }
+  if (failure.guard === "archived") {
+    await holdBackArchivedIn(tx, events, job, ref, failure);
+    return NOTHING_TO_ADVANCE;
   }
   const reason = CANCEL_REASON[failure.guard];
   const [cancelled] = await tx.publishJob.updateManyAndReturn({
     where: onAttempt(ref),
     data: { status: "CANCELLED", lastError: PUBLISH_CANCEL_REASONS[reason] },
   });
-  if (!cancelled) return;
+  if (!cancelled) return NOTHING_TO_ADVANCE;
   publishUpdated(events, cancelled, ref.postId);
   await cancelScheduledForPost(tx, events, ref.postId, reason);
 
   const post = job.variant.post;
   const context = { campaignId: post.campaignId, clientId: post.clientId };
   const current = await tx.post.findUniqueOrThrow({ where: { id: ref.postId } });
-  let reopened = false;
-  if (current.status === "APPROVED" || current.status === "SCHEDULED") {
+  const waiting = current.status === "APPROVED" || current.status === "SCHEDULED";
+  const graphId =
+    waiting && failure.guard === "bannedWords" ? await plannedGraphOf(tx, ref.postId) : null;
+  let next = "";
+  let revisedGraph: string | null = null;
+  if (graphId) {
+    const hits = scanForBannedWords(post.copy, post.client.bannedWords, {
+      ignoreKeys: COPY_BANNED_SCAN_IGNORE,
+      limit: 20,
+    });
+    const revision = await routeCopyRevision(tx, {
+      postId: ref.postId,
+      graphId,
+      issues: bannedWordIssues(hits),
+      summary: `${clause(failure.message)}. Rewrite the copy without them.`,
+      enabledActions: deps.config.PIPELINE_ACTIONS,
+      now: deps.clock.now(),
+      events,
+      cancelReason: reason,
+    });
+    for (const round of revision.cancelled) approvalResolved(events, round, context);
+    postUpdated(events, revision.post);
+    revisedGraph = graphId;
+    next = " It's back with the Copywriter.";
+  } else if (waiting && failure.guard !== "bannedWords") {
     const rounds = await cancelOpenRounds(tx, ref.postId, deps.clock.now());
     const updated = await requireTransition(tx, ref.postId, "PENDING_APPROVAL", {
       approvedAt: null,
@@ -279,7 +358,7 @@ export async function refuseIn(
     for (const round of rounds) approvalResolved(events, round, context);
     approvalCreated(events, request, context);
     postUpdated(events, updated);
-    reopened = true;
+    next = " Its approval is open again.";
   } else {
     await syncPostPublishStatus(tx, events, ref.postId);
     postUpdated(
@@ -289,15 +368,12 @@ export async function refuseIn(
         data: { needsAttention: true, attentionReason: failure.message },
       }),
     );
+    if (waiting) next = " Edit the copy to drop them; that reopens its approval.";
   }
 
   const label = labelOf(job);
   const why = clause(failure.message);
   jobAlert(events, "failed", cancelled, post, `Held back ${label}: ${why}.`);
-  await publisherNote(
-    tx,
-    events,
-    post.campaign.thread?.id,
-    `I held back ${label}: ${why}.${reopened ? " Its approval is open again." : ""}`,
-  );
+  await publisherNote(tx, events, post.campaign.thread?.id, `I held back ${label}: ${why}.${next}`);
+  return { revisedGraph };
 }

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { canTransition } from "./post-status";
-import { postStatusForJobs } from "./publishing";
+import { LIFECYCLE_CANCEL_MESSAGES, postStatusForJobs, PUBLISH_CANCEL_REASONS } from "./publishing";
 
 /* How a post's publish jobs move it (orchestrator/publishing.ts syncPostPublishStatus). */
 
@@ -38,9 +38,29 @@ describe("postStatusForJobs", () => {
       ["FAILED", "SCHEDULED"], // a retry with nothing else out
       ["FAILED", "PUBLISHING"], // a retry while another variant is out
       ["SCHEDULED", "APPROVED"], // every job called off
+      ["FAILED", "LIVE"], // the failed variant cancelled while the rest is out
+      ["FAILED", "APPROVED"], // the only job failed, then cancelled
     ];
     for (const [from, to] of moves) expect(canTransition(from, to), `${from} → ${to}`).toBe(true);
     expect(canTransition("LIVE", "SCHEDULED")).toBe(false);
     expect(canTransition("APPROVED", "LIVE")).toBe(false);
+  });
+});
+
+describe("LIFECYCLE_CANCEL_MESSAGES", () => {
+  it("holds what the approval lifecycle calls off, never an archive", () => {
+    for (const reason of [
+      "copyEdited",
+      "visualRevision",
+      "takeReplaced",
+      "approvalWithdrawn",
+      "contentChanged",
+      "bannedWords",
+    ] as const) {
+      expect(LIFECYCLE_CANCEL_MESSAGES.has(PUBLISH_CANCEL_REASONS[reason]), reason).toBe(true);
+    }
+    // tick.publish re-schedules a round whose jobs the lifecycle called off; an archive stands.
+    expect(LIFECYCLE_CANCEL_MESSAGES.has(PUBLISH_CANCEL_REASONS.campaignArchived)).toBe(false);
+    expect(LIFECYCLE_CANCEL_MESSAGES.has(PUBLISH_CANCEL_REASONS.clientArchived)).toBe(false);
   });
 });

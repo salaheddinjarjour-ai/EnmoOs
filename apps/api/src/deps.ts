@@ -33,8 +33,9 @@ import { createRealtimePublisher, type RealtimePublisher } from "./realtime/publ
 /**
  * One publisher per platform, as PUBLISH_MODE and the platform's credentials allow (DESIGN §F):
  * the live publisher (`mode: "live"`) or a DryRunPublisher. A PublishJob is a dry run unless its
- * platform's publisher is live and the client has an account there (PublishJob.dryRun, decided
- * when it is scheduled); a job stored as a dry run always runs through a DryRunPublisher.
+ * platform's publisher is live and the client has an account there: forecast when it is scheduled,
+ * settled when it starts publishing (PublishJob.dryRun, publishing/publish-service.ts); a job
+ * settled as a dry run always runs through a DryRunPublisher.
  */
 export type Publishers = Readonly<Record<Platform, Publisher>>;
 

@@ -15,14 +15,15 @@ import { TokenCryptoError, type TokenCipher } from "../lib/crypto";
 
 /*
  * The publish guard (DESIGN §F "Publishing safety"): when a job's slot comes, nothing goes out
- * unless (1) the post's latest approval round is APPROVED, (2) its contentHash still matches what
- * the post holds now, (3) no text going out uses the client's banned words (the list may have
- * grown since approval), and (4) for a live job, the account is ACTIVE with a token that decrypts,
- * hasn't expired and carries the publishing scopes. evaluateGuards is the pure decision;
- * checkPublishGuards reads its inputs inside the publish transaction.
+ * unless (0) neither its campaign nor its client is archived, (1) the post's latest approval round
+ * is APPROVED, (2) its contentHash still matches what the post holds now, (3) no text going out
+ * uses the client's banned words (the list may have grown since approval), and (4) for a live job,
+ * the account is ACTIVE with a token that decrypts, hasn't expired and carries the publishing
+ * scopes. evaluateGuards is the pure decision; checkPublishGuards reads its inputs inside the
+ * publish transaction.
  */
 
-export type GuardName = "approval" | "contentHash" | "bannedWords" | "token";
+export type GuardName = "archived" | "approval" | "contentHash" | "bannedWords" | "token";
 
 export interface GuardFailure {
   guard: GuardName;
@@ -30,6 +31,8 @@ export interface GuardFailure {
   message: string;
   /** For a token failure: what the account turned out to be (null leaves its status alone). */
   accountStatus: AccountStatus | null;
+  /** For a banned-words failure: each hit in what goes out. */
+  bannedHits?: readonly BannedWordHit[];
 }
 
 /** The account side of a live job, as read for the guard. */
@@ -47,6 +50,8 @@ export type TokenState =
 
 export interface GuardSnapshot {
   platform: Platform;
+  /** What of the post's is archived, if anything. */
+  archived: "campaign" | "client" | null;
   latestRound: { status: ApprovalStatus; contentHash: string } | null;
   currentHash: string;
   bannedHits: readonly BannedWordHit[];
@@ -106,6 +111,14 @@ function tokenFailure(snapshot: GuardSnapshot, token: TokenState): GuardFailure 
 
 /** The first guard the job fails, in the order DESIGN lists them; null when it may publish. */
 export function evaluateGuards(snapshot: GuardSnapshot): GuardFailure | null {
+  if (snapshot.archived) {
+    return {
+      guard: "archived",
+      message:
+        snapshot.archived === "campaign" ? "The post's campaign is archived" : "The client is archived",
+      accountStatus: null,
+    };
+  }
   const round = snapshot.latestRound;
   if (!round || round.status !== "APPROVED") {
     return {
@@ -129,6 +142,7 @@ export function evaluateGuards(snapshot: GuardSnapshot): GuardFailure | null {
       guard: "bannedWords",
       message: `The post uses the client's banned words: ${terms.map((term) => `"${term}"`).join(", ")}`,
       accountStatus: null,
+      bannedHits: snapshot.bannedHits,
     };
   }
   return snapshot.token ? tokenFailure(snapshot, snapshot.token) : null;
@@ -136,6 +150,7 @@ export function evaluateGuards(snapshot: GuardSnapshot): GuardFailure | null {
 
 export interface GuardInput {
   postId: string;
+  archived: "campaign" | "client" | null;
   /** Post.copy as stored. */
   copy: unknown;
   bannedWords: readonly string[];
@@ -223,6 +238,7 @@ export async function checkPublishGuards(
 
   const failure = evaluateGuards({
     platform: input.variant.platform,
+    archived: input.archived,
     latestRound: round,
     currentHash,
     bannedHits,

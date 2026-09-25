@@ -25,7 +25,7 @@ import { EventBatch } from "../orchestrator/events";
 import { lockPost } from "../orchestrator/locks";
 import { postUpdated } from "../orchestrator/post-status";
 import { publishUpdated, syncPostPublishStatus } from "../orchestrator/publishing";
-import { copyOf, currentTakesOf, publisherNote } from "./context";
+import { activeAccountOf, copyOf, currentTakesOf, publisherNote } from "./context";
 import { describeIssues, preparePayload, variantCopyOf } from "./payload";
 import { addDays, candidates, slotIsFree, type CandidateRequest } from "./slot-optimizer";
 
@@ -97,15 +97,20 @@ export type ScheduleResult =
 type ScheduleRow = {
   status: string;
   campaign: { status: string };
+  client: { archivedAt: Date | null };
   approvalRequests: { round: number; status: string }[];
 };
 
-/** The job only acts on a post still APPROVED on the round it was queued for. */
+/**
+ * The job only acts on a post still APPROVED on the round it was queued for, whose campaign and
+ * client aren't archived.
+ */
 function scheduleDue(post: ScheduleRow | null, round: number): boolean {
   const latest = post?.approvalRequests[0];
   return (
     post?.status === "APPROVED" &&
     post.campaign.status !== "ARCHIVED" &&
+    post.client.archivedAt === null &&
     latest?.round === round &&
     latest.status === "APPROVED"
   );
@@ -136,7 +141,7 @@ async function prepareVariants(
     const post = await tx.post.findUnique({
       where: { id: data.postId },
       include: {
-        client: { select: { timezone: true, bannedWords: true } },
+        client: { select: { timezone: true, bannedWords: true, archivedAt: true } },
         campaign: {
           select: {
             id: true,
@@ -437,7 +442,8 @@ function scheduleNote(prepared: PreparedPost, scheduled: Scheduled[], problems: 
 /**
  * Transaction B: a job per planned variant at its pick (re-picked when another post of the client
  * took the slot meanwhile), the post SCHEDULED, the thread told. A variant that already has a job
- * that counts keeps it; one whose earlier job was CANCELLED gets that same row back, reset.
+ * that counts keeps it; one whose earlier job was CANCELLED gets that same row back, reset (all but
+ * its attempt count, which only ever grows).
  */
 async function commitSchedule(
   deps: Deps,
@@ -456,6 +462,7 @@ async function commitSchedule(
       select: {
         status: true,
         campaign: { select: { status: true } },
+        client: { select: { archivedAt: true } },
         approvalRequests: LATEST_ROUND,
       },
     });
@@ -485,11 +492,7 @@ async function commitSchedule(
         });
         continue;
       }
-      const account = await tx.socialAccount.findFirst({
-        where: { clientId: prepared.clientId, platform: variant.platform, status: "ACTIVE" },
-        orderBy: { createdAt: "desc" },
-        select: { id: true },
-      });
+      const account = await activeAccountOf(tx, prepared.clientId, variant.platform);
       const liveMode = deps.publishers[variant.platform].mode === "live";
       const fields = {
         socialAccountId: account?.id ?? null,
@@ -498,8 +501,12 @@ async function commitSchedule(
         scheduledFor: new Date(pick.slot.slotStart),
         slotSource: pick.source,
         slotReason: pick.reason,
+        // A forecast: the claim settles it with the mode and account there are at the slot.
         dryRun: !liveMode || !account,
-        attempts: 0,
+        // A reused row counts on: its earlier runs' BullMQ ids (publish-<id>-run<n>) stay in Redis
+        // for a day, and BullMQ ignores an add whose id exists, so starting again at run 1 would
+        // never run. The +1 also skips the run that may have been queued when it was cancelled.
+        attempts: current ? current.attempts + 1 : 0,
         containerId: null,
         externalId: null,
         liveUrl: null,

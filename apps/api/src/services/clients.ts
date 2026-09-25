@@ -15,8 +15,11 @@ import {
   type UpdateApprovalChainRequest,
   type UpdateClientRequest,
 } from "@enmo/shared";
+import type { Deps } from "../deps";
 import { conflict, notFound, unprocessable } from "../lib/errors";
 import { parseStored } from "../lib/stored";
+import { EventBatch } from "../orchestrator/events";
+import { cancelScheduledWhere } from "../orchestrator/publishing";
 import { recordAudit } from "./audit";
 
 /*
@@ -210,23 +213,34 @@ export async function replaceApprovalChain(
   });
 }
 
-/** Idempotent: archiving an archived client returns it unchanged and writes no audit row. */
+/**
+ * Archives the client: nothing of it publishes any more, so every PublishJob of its posts still
+ * waiting for its slot is cancelled (a SCHEDULED post is APPROVED again) and publish.updated sent
+ * once it commits; the publish guard refuses anything this races. Idempotent: archiving an
+ * archived client returns it unchanged and writes no audit row.
+ */
 export async function archiveClient(
-  db: DbClient,
+  deps: Pick<Deps, "prisma" | "realtime">,
   id: string,
   actor: Actor,
   now: Date,
 ): Promise<ClientDto> {
-  return db.$transaction(async (tx) => {
+  const events = new EventBatch();
+  const client = await deps.prisma.$transaction(async (tx) => {
     const { count } = await tx.client.updateMany({
       where: { id, archivedAt: null },
       data: { archivedAt: now },
     });
     const row = await tx.client.findUnique({ where: { id } });
     if (!row) throw notFound("Client");
-    if (count > 0) await auditChange(tx, actor, AUDIT_ACTIONS.clientArchive, clientEntity(id));
+    if (count > 0) {
+      await cancelScheduledWhere(tx, events, { clientId: id }, "clientArchived");
+      await auditChange(tx, actor, AUDIT_ACTIONS.clientArchive, clientEntity(id));
+    }
     return toClientDto(row);
   });
+  await events.publish(deps);
+  return client;
 }
 
 // ── Internals ───────────────────────────────────────────────────────────────

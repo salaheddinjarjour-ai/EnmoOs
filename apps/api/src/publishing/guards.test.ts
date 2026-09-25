@@ -9,6 +9,7 @@ const NOW = new Date("2027-03-02T09:00:00Z");
 function snapshot(overrides: Partial<GuardSnapshot> = {}): GuardSnapshot {
   return {
     platform: "INSTAGRAM",
+    archived: null,
     latestRound: { status: "APPROVED", contentHash: "hash-1" },
     currentHash: "hash-1",
     bannedHits: [],
@@ -63,6 +64,23 @@ describe("evaluateGuards", () => {
       guard: "bannedWords",
       message: `The post uses the client's banned words: "cheap"`,
       accountStatus: null,
+      bannedHits: [hit, { ...hit, path: "copy.caption" }],
+    });
+  });
+
+  it("refuses archived work before anything else", () => {
+    const everythingWrong = snapshot({
+      latestRound: { status: "CANCELLED", contentHash: "hash-1" },
+      token: { kind: "missing" },
+    });
+    expect(evaluateGuards({ ...everythingWrong, archived: "campaign" })).toEqual({
+      guard: "archived",
+      message: "The post's campaign is archived",
+      accountStatus: null,
+    });
+    expect(evaluateGuards(snapshot({ archived: "client" }))).toMatchObject({
+      guard: "archived",
+      message: "The client is archived",
     });
   });
 

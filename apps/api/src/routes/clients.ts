@@ -89,6 +89,6 @@ export const clientsRoutes: RouteModule = (app) => {
       onRequest: requireCap("clients.archive"),
       schema: { params: IdParams, response: { 200: ClientDto } },
     },
-    (request) => archiveClient(prisma, request.params.id, actorOf(request), clock.now()),
+    (request) => archiveClient(app.deps, request.params.id, actorOf(request), clock.now()),
   );
 };

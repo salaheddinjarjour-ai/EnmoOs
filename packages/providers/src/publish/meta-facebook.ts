@@ -16,7 +16,8 @@ import type { PublishOutcome } from "./types";
  *                POST /{page}/video_reels {upload_phase: finish, video_state: PUBLISHED}
  *   video story  the same through /{page}/video_stories (best effort: Meta's story API is young)
  * and the live URL from GET /{post}?fields=permalink_url, or for videos from
- * GET /{video}?fields=status,permalink_url once processing is done.
+ * GET /{video}?fields=status,permalink_url once processing is done. The calls that publish a photo,
+ * feed post or story can't be repeated safely, so an outage on one of them is final (publishOnce).
  */
 
 const Photo = z.looseObject({ id: GraphId, post_id: GraphId.optional() });
@@ -79,6 +80,26 @@ function refused(what: string): PublishError {
   return new PublishError("REJECTED", `Facebook did not accept the ${what}`);
 }
 
+/**
+ * The POST that makes a post public (a published photo, the feed post, the story) isn't
+ * idempotent, and Meta can create the post and still time out or answer 5xx. Such an ambiguous
+ * failure (UNAVAILABLE) is final, never retried automatically, so the Page never gets the post
+ * twice: a person checks it, then retries or cancels. A clear refusal (rate limit, token, a 4xx)
+ * means nothing was created and stays as it is.
+ */
+async function publishOnce<T>(what: string, call: () => Promise<T>): Promise<T> {
+  try {
+    return await call();
+  } catch (error) {
+    if (!(error instanceof PublishError) || error.code !== "UNAVAILABLE") throw error;
+    throw new PublishError(
+      "UNAVAILABLE",
+      `${error.message}. Facebook may have published the ${what} anyway, so it isn't retried automatically: check the Page, then retry or cancel the job`,
+      { status: error.status, retryable: false, cause: error },
+    );
+  }
+}
+
 async function photo(ctx: MetaFlowContext, progress: MetaProgress | null) {
   if (progress?.result) return published(ctx, progress.result);
   const body = defined({
@@ -87,7 +108,9 @@ async function photo(ctx: MetaFlowContext, progress: MetaProgress | null) {
     alt_text_custom: ctx.payload.altText,
     published: true,
   });
-  const created = await ctx.post(graphPath(ctx.nodeId, "photos"), body, Photo);
+  const created = await publishOnce("photo post", () =>
+    ctx.post(graphPath(ctx.nodeId, "photos"), body, Photo),
+  );
   return recordResult(ctx, startProgress("FB_PHOTO"), created.post_id ?? created.id);
 }
 
@@ -109,13 +132,15 @@ async function stagePhotos(ctx: MetaFlowContext, progress: MetaProgress): Promis
 async function multiPhoto(ctx: MetaFlowContext, progress: MetaProgress | null) {
   if (progress?.result) return published(ctx, progress.result);
   const current = await stagePhotos(ctx, progress ?? startProgress("FB_MULTI_PHOTO"));
-  const post = await ctx.post(
-    graphPath(ctx.nodeId, "feed"),
-    {
-      ...defined({ message: messageOf(ctx) }),
-      attached_media: current.items.map((id) => ({ media_fbid: id })),
-    },
-    Post,
+  const post = await publishOnce("multi-photo post", () =>
+    ctx.post(
+      graphPath(ctx.nodeId, "feed"),
+      {
+        ...defined({ message: messageOf(ctx) }),
+        attached_media: current.items.map((id) => ({ media_fbid: id })),
+      },
+      Post,
+    ),
   );
   return recordResult(ctx, current, post.id);
 }
@@ -125,10 +150,8 @@ async function photoStory(ctx: MetaFlowContext, progress: MetaProgress | null) {
   const current = await stagePhotos(ctx, progress ?? startProgress("FB_PHOTO_STORY"));
   const [photoId] = current.items;
   if (!photoId) throw new Error("A story's photo is staged before the story is posted");
-  const story = await ctx.post(
-    graphPath(ctx.nodeId, "photo_stories"),
-    { photo_id: photoId },
-    Story,
+  const story = await publishOnce("photo story", () =>
+    ctx.post(graphPath(ctx.nodeId, "photo_stories"), { photo_id: photoId }, Story),
   );
   if (story.success === false) throw refused("photo story");
   return recordResult(ctx, current, story.post_id);

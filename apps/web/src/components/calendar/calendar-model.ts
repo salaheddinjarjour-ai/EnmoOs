@@ -3,6 +3,7 @@ import {
   PLATFORM_LABEL,
   RESCHEDULABLE_PUBLISH_STATUSES,
   RETRYABLE_PUBLISH_STATUSES,
+  type CalendarGhostItem,
   type CalendarItemDto,
   type CalendarJobItem,
   type CalendarQuery,
@@ -180,6 +181,28 @@ export function isCancellable(item: CalendarItemDto): item is CalendarJobItem {
 
 export function isRetryable(item: CalendarItemDto): item is CalendarJobItem {
   return item.kind === "job" && RETRYABLE_PUBLISH_STATUSES.includes(item.status);
+}
+
+/**
+ * What a ghost means for its post: a planned slot waiting on approval or, once the post is past
+ * approval, a platform with nothing scheduled (its publish cancelled, or no free slot found) and
+ * whether it can still be scheduled.
+ */
+export function ghostNote(item: CalendarGhostItem): string {
+  const platform = PLATFORM_LABEL[item.platform];
+  switch (item.postStatus) {
+    case "APPROVED":
+    case "SCHEDULED":
+      return `The post is approved, but nothing is scheduled on ${platform}: its publish there was cancelled, or the Publisher found no free slot for it. Edit the post and approve it again to schedule it anew.`;
+    case "FAILED":
+      return `Nothing is scheduled on ${platform}, and another platform's publish failed. Retry or cancel that one first; if none of the post is out then, editing it and approving it again schedules it anew.`;
+    case "PUBLISHING":
+    case "LIVE":
+    case "SCORED":
+      return `The post went out without ${platform}: nothing is scheduled there, and a post that is out can't be scheduled again.`;
+    default:
+      return `The campaign plan puts this post here; nothing is scheduled yet. Once the post is approved, the Publisher picks its slot on ${platform}.`;
+  }
 }
 
 /** A published job with somewhere to go: its chip links to the live post. */

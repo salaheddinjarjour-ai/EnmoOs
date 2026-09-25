@@ -14,8 +14,8 @@ import { obliterateQueues, queuedJobs, sender } from "../helpers/route-fixtures"
  * The publish-job controls behind the calendar (DESIGN §E "calendar"): a drag moves a SCHEDULED
  * job to the best free hour of the new client-local day (the slot optimizer's bestSlotOn, no LLM),
  * a FAILED job is retried (QUEUED with a publish.run for its next attempt), a job that hasn't
- * started publishing is cancelled. Each is MANAGER+, audited, and announced with publish.updated,
- * and the post's status follows its jobs.
+ * started publishing, or that failed, is cancelled. Each is MANAGER+, audited, and announced with
+ * publish.updated, and the post's status follows its jobs.
  */
 
 /** Monday 1 March 2027, 09:00 in Riyadh. */
@@ -383,6 +383,40 @@ describe("POST /v1/publish-jobs/:id/retry", () => {
     },
   );
 
+  it("refuses once the campaign or the client is archived", async () => {
+    const seed = () =>
+      seedPublishPost({
+        createdBy: admin,
+        client,
+        status: "FAILED",
+        jobs: [{ platform: "INSTAGRAM", status: "FAILED", scheduledFor: TUESDAY_1100 }],
+      });
+    const inCampaign = await seed();
+    await testDb().campaign.update({
+      where: { id: inCampaign.campaignId },
+      data: { status: "ARCHIVED" },
+    });
+    const campaignRetry = await send(
+      "POST",
+      `/v1/publish-jobs/${inCampaign.jobs.INSTAGRAM!.id}/retry`,
+      cookies.admin,
+    );
+    expect(campaignRetry.statusCode, campaignRetry.body).toBe(409);
+    expect(campaignRetry.json()).toMatchObject({
+      error: { message: "The campaign is archived, so nothing of it publishes any more" },
+    });
+
+    const ofClient = await seed();
+    await testDb().client.update({ where: { id: client.id }, data: { archivedAt: new Date() } });
+    const clientRetry = await send(
+      "POST",
+      `/v1/publish-jobs/${ofClient.jobs.INSTAGRAM!.id}/retry`,
+      cookies.admin,
+    );
+    expect(clientRetry.statusCode, clientRetry.body).toBe(409);
+    expect(await queuedJobs(t.deps, "ops")).toEqual([]);
+  });
+
   it("refuses once the post has gone back to approval", async () => {
     const { jobs } = await seedPublishPost({
       createdBy: admin,
@@ -466,7 +500,87 @@ describe("POST /v1/publish-jobs/:id/cancel", () => {
     ]);
   });
 
-  it.each(["PUBLISHING", "PUBLISHED", "FAILED", "CANCELLED"] as const)(
+  it("drops a failed platform: the post goes LIVE on the rest, the failure kept in the audit", async () => {
+    const liveUrl = "https://dryrun.enmo.marketing/facebook/variant";
+    const error = "Instagram can't take this post: the image is 9:16";
+    const { jobs, post } = await seedPublishPost({
+      createdBy: admin,
+      client,
+      status: "FAILED",
+      needsAttention: true,
+      jobs: [
+        {
+          platform: "INSTAGRAM",
+          status: "FAILED",
+          scheduledFor: "2027-03-01T05:00:00.000Z",
+          attempts: 1,
+          lastError: error,
+        },
+        {
+          platform: "FACEBOOK",
+          status: "PUBLISHED",
+          scheduledFor: "2027-03-01T04:00:00.000Z",
+          attempts: 1,
+          publishedAt: new Date("2027-03-01T04:00:05.000Z"),
+          liveUrl,
+        },
+      ],
+    });
+
+    const response = await send(
+      "POST",
+      `/v1/publish-jobs/${jobs.INSTAGRAM!.id}/cancel`,
+      cookies.manager,
+    );
+    expect(response.statusCode, response.body).toBe(200);
+    expect(response.json<PublishJobDto>()).toMatchObject({
+      status: "CANCELLED",
+      lastError: "Cancelled by Maha",
+    });
+    expect(await testDb().post.findUniqueOrThrow({ where: { id: post.id } })).toMatchObject({
+      status: "LIVE",
+      needsAttention: false,
+      attentionReason: null,
+      liveAt: new Date("2027-03-01T04:00:05.000Z"),
+    });
+    const [audit] = await auditOf(AUDIT_ACTIONS.publishCancel);
+    expect(audit?.data).toMatchObject({ previousStatus: "FAILED", previousError: error });
+    // Nothing is queued: a dropped platform stays dropped.
+    expect(await queuedJobs(t.deps, "ops")).toEqual([]);
+  });
+
+  it("drops the only failed job: the post is approved again, and editable", async () => {
+    const { jobs, post } = await seedPublishPost({
+      createdBy: admin,
+      client,
+      status: "FAILED",
+      needsAttention: true,
+      platforms: ["INSTAGRAM"],
+      jobs: [
+        {
+          platform: "INSTAGRAM",
+          status: "FAILED",
+          scheduledFor: "2027-03-01T05:00:00.000Z",
+          attempts: 3,
+          lastError: "Instagram rejected the post",
+        },
+      ],
+    });
+    const response = await send(
+      "POST",
+      `/v1/publish-jobs/${jobs.INSTAGRAM!.id}/cancel`,
+      cookies.admin,
+    );
+    expect(response.statusCode, response.body).toBe(200);
+    expect(await testDb().post.findUniqueOrThrow({ where: { id: post.id } })).toMatchObject({
+      status: "APPROVED",
+      needsAttention: false,
+    });
+    const dto = await send("GET", `/v1/posts/${post.id}`, cookies.admin);
+    expect(dto.json<{ editable: boolean }>().editable).toBe(true);
+  });
+
+  it.each(["PUBLISHING", "PUBLISHED", "CANCELLED"] as const)(
     "refuses to cancel a %s job",
     async (status) => {
       const { jobs } = await seedPublishPost({

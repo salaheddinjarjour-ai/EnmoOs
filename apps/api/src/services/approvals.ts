@@ -177,7 +177,13 @@ async function applyApproval(
     return null;
   }
   if (outcome.status !== "APPROVED") return null;
-  const approved = await requireTransition(tx, request.postId, "APPROVED", { approvedAt: now });
+  // The reviewers' approval answers whatever the post was flagged for on its way to them (a
+  // publish-time refusal that reopened it, say); publisher.schedule flags it again if it must.
+  const approved = await requireTransition(tx, request.postId, "APPROVED", {
+    approvedAt: now,
+    needsAttention: false,
+    attentionReason: null,
+  });
   postUpdated(events, approved);
   approvalResolved(events, { ...request, status: "APPROVED" }, post);
   return { postId: request.postId, round: request.round };
