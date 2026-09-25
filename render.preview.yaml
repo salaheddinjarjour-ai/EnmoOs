@@ -4,12 +4,14 @@
 # the session cookie is first-party without any DNS setup.
 #
 # Everything is on Render's free plan: one web service that also runs the queue workers
-# (EMBEDDED_WORKER), a free Key Value instance for BullMQ and realtime, and a free Postgres 16.
+# (EMBEDDED_WORKER) and a free Key Value instance for BullMQ and realtime. Postgres comes from
+# DATABASE_URL: any Postgres 14+ works, including one shared with another app, because ENMO keeps
+# its tables in its own schema (`?schema=enmo`). A workspace gets only one free Render database.
 # The agents run on the mock LLM, visuals are mock renders, and publishing is dry-run, so no API
 # keys are needed. Limits of the free plan: the service sleeps after 15 idle minutes (the Worker's
 # cron pings /healthz every 5 minutes to prevent it), the disk is wiped on every deploy (rendered
-# visuals vanish then), Key Value keeps nothing across restarts, and Render deletes a free
-# database after 30 days. Production uses render.yaml instead.
+# visuals vanish then), Key Value keeps nothing across restarts, and a free Render database is
+# deleted after 30 days. Production uses render.yaml instead.
 #
 # Create it with Render → New → Blueprint → this repo → Blueprint path `render.preview.yaml`.
 # Render asks for the values marked `sync: false`.
@@ -54,10 +56,11 @@ services:
         sync: false
       - key: SEED_ADMIN_PASSWORD
         sync: false
+      # A Postgres URL plus `?sslmode=require&schema=enmo`, e.g. a Render database's External
+      # Database URL (its Internal URL when it is in this service's region). Migrations create the
+      # `enmo` schema; nothing outside it is touched.
       - key: DATABASE_URL
-        fromDatabase:
-          name: enmo-preview-db
-          property: connectionString
+        sync: false
       - key: REDIS_URL
         fromService:
           type: keyvalue
@@ -96,13 +99,4 @@ services:
     # BullMQ must never have its keys evicted.
     maxmemoryPolicy: noeviction
     # Reachable only from services in this Render account.
-    ipAllowList: []
-
-databases:
-  - name: enmo-preview-db
-    databaseName: enmo
-    user: enmo
-    plan: free
-    region: frankfurt
-    postgresMajorVersion: "16"
     ipAllowList: []
