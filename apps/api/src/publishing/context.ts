@@ -76,15 +76,18 @@ export function payloadOf(
   });
 }
 
-/** The client's newest ACTIVE account on the platform, which its jobs publish through. */
+/**
+ * The account the client chose to publish through on the platform (SocialAccount.isPrimary), when
+ * it is ACTIVE. Never another of its accounts: with several Pages connected (or another brand's
+ * among them) a post only ever goes where the client's publishing account is.
+ */
 export function activeAccountOf(
   db: Db,
   clientId: string,
   platform: Platform,
 ): Promise<{ id: string } | null> {
   return db.socialAccount.findFirst({
-    where: { clientId, platform, status: "ACTIVE" },
-    orderBy: { createdAt: "desc" },
+    where: { clientId, platform, isPrimary: true, status: "ACTIVE" },
     select: { id: true },
   });
 }

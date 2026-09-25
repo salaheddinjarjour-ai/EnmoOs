@@ -211,11 +211,14 @@ export function waitForJobs(
   }, 45_000);
 }
 
-/** The fake Graph's first Page and its Instagram account, connected as the client's accounts. */
+/**
+ * The fake Graph's first Page and its Instagram account, connected as the client's accounts it
+ * publishes through (each the client's only one on its platform, so its publishing account).
+ */
 export async function connectMetaAccounts(
   h: Harness,
   client: Client,
-  overrides: Partial<Pick<SocialAccount, "tokenExpiresAt" | "status" | "scopes">> = {},
+  overrides: Partial<Pick<SocialAccount, "tokenExpiresAt" | "status" | "scopes" | "isPrimary">> = {},
 ): Promise<{ instagram: SocialAccount; facebook: SocialAccount; token: string }> {
   const page = FAKE_META_PAGES[0]!;
   const ig = page.instagram!;
@@ -224,6 +227,7 @@ export async function connectMetaAccounts(
     clientId: client.id,
     accessTokenEnc: h.deps.tokenCipher.encrypt(token),
     status: "ACTIVE" as const,
+    isPrimary: true,
     ...overrides,
   };
   const facebook = await testDb().socialAccount.create({

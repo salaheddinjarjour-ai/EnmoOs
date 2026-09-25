@@ -31,7 +31,12 @@ import { pollPublish, runPublish } from "../../src/publishing/publish-service";
 import { testDb } from "../helpers/db";
 import { createClient, createUser } from "../helpers/factories";
 import { startHarness, type Harness, type HarnessOptions } from "../helpers/harness";
-import { GRAPH_ERRORS, startFakeGraph, type FakeGraph } from "../fakes/meta-graph";
+import {
+  FAKE_META_PAGES,
+  GRAPH_ERRORS,
+  startFakeGraph,
+  type FakeGraph,
+} from "../fakes/meta-graph";
 import {
   apiFor,
   approvePost,
@@ -47,6 +52,7 @@ import {
   seedMetaPlan,
   THURSDAY,
   tickAt,
+  TUESDAY,
   waitForJobs,
   waitForPostStatus,
   type SeededMetaPlan,
@@ -551,6 +557,49 @@ describe("dry run or live, settled at the slot", () => {
       externalId: media!.id,
       liveUrl: media!.permalink,
     });
+  }, 90_000);
+
+  it("never picks one of a client's Pages by itself: the post waits for the admin's choice", async () => {
+    const h = await startLive();
+    const seeded = await seedMetaPlan(h, { platforms: ["FACEBOOK"] });
+    // Two Pages connected, neither chosen to publish through (a second one arrived later).
+    await connectMetaAccounts(h, seeded.client, { isPrimary: null });
+    const events = FAKE_META_PAGES[1]!;
+    const eventsPage = await testDb().socialAccount.create({
+      data: {
+        clientId: seeded.client.id,
+        platform: "FACEBOOK",
+        externalId: events.id,
+        handle: events.name,
+        accessTokenEnc: h.deps.tokenCipher.encrypt(events.accessToken),
+        meta: { pageId: events.id, pageName: events.name, source: "oauth" },
+      },
+    });
+    const [post] = await runToApproval(h, seeded);
+    const postId = post!.id;
+    await approvePost(h, seeded, postId);
+
+    const flagged = await h.waitFor(async () => {
+      const row = await testDb().post.findUniqueOrThrow({ where: { id: postId } });
+      return row.needsAttention ? row : null;
+    });
+    expect(flagged.attentionReason).toBe(
+      "Not scheduled on Facebook: several Facebook accounts are connected and none is chosen to publish through; choose one in the client's accounts, then put it on a day on the calendar",
+    );
+    expect(await testDb().publishJob.count()).toBe(0);
+
+    // The admin chooses the Events Page, then a teammate puts the post on Tuesday.
+    const api = apiFor(h, seeded.cookie);
+    await api("POST", `/v1/social-accounts/${eventsPage.id}/primary`, {});
+    const job = await api<PublishJobDto>("POST", "/v1/publish-jobs", {
+      postId,
+      platform: "FACEBOOK",
+      date: TUESDAY,
+    });
+    expect(job).toMatchObject({ dryRun: false, socialAccountId: eventsPage.id });
+    await tickAt(h, job.scheduledFor);
+    await waitForPostStatus(h, postId, "LIVE");
+    expect(graph!.sequence()[0]).toBe(`POST /v26.0/${events.id}/photos`);
   }, 90_000);
 
   it("fails a live publish still processing once publishing is switched off, faking nothing", async () => {

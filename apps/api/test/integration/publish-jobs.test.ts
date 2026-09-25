@@ -496,7 +496,7 @@ describe("POST /v1/publish-jobs/:id/retry", () => {
     expect(stored).toMatchObject({ status: "QUEUED", containerId: "FB_MULTI_PHOTO;items=301,302" });
   });
 
-  it("puts a live job whose account was disconnected on the client's current account", async () => {
+  it("puts a live job whose account was disconnected on the account the client publishes through", async () => {
     const account = await testDb().socialAccount.create({
       data: {
         clientId: client.id,
@@ -504,6 +504,18 @@ describe("POST /v1/publish-jobs/:id/retry", () => {
         externalId: "17841400000000009",
         handle: "qahwa.co",
         accessTokenEnc: t.deps.tokenCipher.encrypt("page-token"),
+        status: "ACTIVE",
+        isPrimary: true,
+      },
+    });
+    // Connected later, but not chosen to publish: never picked for being the newest.
+    await testDb().socialAccount.create({
+      data: {
+        clientId: client.id,
+        platform: "INSTAGRAM",
+        externalId: "17841400000000010",
+        handle: "other.brand",
+        accessTokenEnc: t.deps.tokenCipher.encrypt("other-token"),
         status: "ACTIVE",
       },
     });

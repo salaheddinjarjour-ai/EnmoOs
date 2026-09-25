@@ -4,6 +4,8 @@ import {
   META_OAUTH_SCOPES,
   OAUTH_STATE_TTL_SECONDS,
   OAuthResultQuery,
+  OAuthSelectionDto,
+  type ConnectOAuthSelectionResponse,
   type OAuthStartResponse,
   type SocialAccountDto,
 } from "@enmo/shared";
@@ -26,8 +28,11 @@ import {
  * Connecting Meta accounts (DESIGN §E "OAuth", §F "Meta") against the fake Graph server: /start
  * mints a state bound to the admin's session and the client, Meta's consent dialog sends the
  * browser to the callback, which checks the state (once, same session, unexpired), exchanges the
- * code, and stores every Page and linked Instagram account with its token encrypted at rest, then
- * redirects to the client's accounts tab. Every failure is a redirect with a readable message.
+ * code and keeps every Page and linked Instagram account Meta lists as a selection, then redirects
+ * to the client's accounts tab to choose. Only the accounts the admin picks are stored, each with
+ * its token encrypted at rest; another client's Page can't be picked, and the account a client
+ * publishes through on a platform is its only one there, or an admin's explicit choice. Every
+ * callback failure is a redirect with a readable message.
  */
 
 const V = "/v26.0";
@@ -112,6 +117,49 @@ async function connect(cookie = adminCookie, clientId = client.id): Promise<Land
   return callback(await consent(await authorizeUrl(cookie, clientId)), cookie);
 }
 
+/** The selection a successful callback lands with. */
+function pickOf(landing: Landing): string {
+  expect(landing).toMatchObject({
+    path: `/clients/${client.id}`,
+    tab: "accounts",
+    result: { oauth: "meta", outcome: "choose" },
+  });
+  return landing.result.pick!;
+}
+
+function selection(pick: string, cookie = adminCookie) {
+  return t.app.inject({
+    method: "GET",
+    url: `/v1/oauth/meta/selections/${pick}`,
+    headers: browserHeaders(cookie),
+  });
+}
+
+function choose(pick: string, keys: readonly string[], cookie = adminCookie) {
+  return t.app.inject({
+    method: "POST",
+    url: `/v1/oauth/meta/selections/${pick}`,
+    headers: browserHeaders(cookie),
+    payload: { keys },
+  });
+}
+
+/** What POST picks each fake account by. */
+const KEYS = {
+  instagram: `INSTAGRAM:${QAHWA.instagram!.id}`,
+  qahwa: `FACEBOOK:${QAHWA.id}`,
+  events: `FACEBOOK:${EVENTS.id}`,
+} as const;
+
+/** The whole round trip: sign in with Meta, then connect `keys` (all three by default). */
+async function connectPicked(
+  keys: readonly string[] = Object.values(KEYS),
+): Promise<ConnectOAuthSelectionResponse> {
+  const response = await choose(pickOf(await connect()), keys);
+  expect(response.statusCode, response.body).toBe(200);
+  return response.json<ConnectOAuthSelectionResponse>();
+}
+
 async function accountsOf(clientId = client.id) {
   return testDb().socialAccount.findMany({
     where: { clientId },
@@ -171,19 +219,66 @@ describe("GET /v1/oauth/meta/start", () => {
 });
 
 describe("GET /v1/oauth/meta/callback", () => {
-  it("stores every Page and linked Instagram account, then lands on the client's accounts tab", async () => {
-    const landing = await connect();
-    expect(landing).toEqual({
-      path: `/clients/${client.id}`,
-      tab: "accounts",
-      result: { oauth: "meta", outcome: "connected", connected: 3 },
-    });
+  it("lists every Page and linked Instagram account for the admin to pick, storing none yet", async () => {
+    const pick = pickOf(await connect());
+    expect(pick).toMatch(/^[\w-]{40,}$/);
     expect(graph.sequence()).toEqual([
       `GET ${V}/dialog/oauth`,
       `GET ${V}/oauth/access_token`,
       `GET ${V}/oauth/access_token`,
       `GET ${V}/debug_token`,
       `GET ${V}/me/accounts`,
+    ]);
+    // Meta lists every Page the admin ever granted the app: nothing is anyone's account yet.
+    expect(await accountsOf()).toEqual([]);
+
+    // The list waits in Redis under the id's hash, its tokens encrypted.
+    const keys = await t.deps.redis.keys(`${t.deps.config.BULLMQ_PREFIX}:oauth:meta:selection:*`);
+    expect(keys).toHaveLength(1);
+    expect(keys[0]).not.toContain(pick);
+    const raw = (await t.deps.redis.get(keys[0]!))!;
+    for (const token of [QAHWA.accessToken, EVENTS.accessToken, "fake-user-token"]) {
+      expect(raw).not.toContain(token);
+    }
+    expect(await t.deps.redis.ttl(keys[0]!)).toBeLessThanOrEqual(OAUTH_STATE_TTL_SECONDS);
+
+    const response = await selection(pick);
+    expect(response.statusCode, response.body).toBe(200);
+    expect(response.body).not.toContain("fake-page-token");
+    const listed = OAuthSelectionDto.parse(response.json());
+    expect(listed).toMatchObject({ id: pick, clientId: client.id, clientName: "Qahwa Co" });
+    expect(listed.accounts).toEqual([
+      {
+        key: KEYS.qahwa,
+        platform: "FACEBOOK",
+        externalId: QAHWA.id,
+        handle: QAHWA.name,
+        displayName: QAHWA.name,
+        meta: { pageId: QAHWA.id, pageName: QAHWA.name, source: "oauth" },
+        status: "available",
+        takenBy: null,
+      },
+      expect.objectContaining({
+        key: KEYS.instagram,
+        platform: "INSTAGRAM",
+        handle: QAHWA.instagram!.username,
+        meta: expect.objectContaining({ pageId: QAHWA.id, username: QAHWA.instagram!.username }) as unknown,
+        status: "available",
+      }),
+      expect.objectContaining({ key: KEYS.events, platform: "FACEBOOK", status: "available" }),
+    ]);
+  });
+
+  it("connects only the picked accounts, each the client's publishing account on its platform", async () => {
+    const pick = pickOf(await connect());
+    const response = await choose(pick, [KEYS.qahwa, KEYS.instagram]);
+    expect(response.statusCode, response.body).toBe(200);
+    expect(response.body).not.toContain("fake-page-token");
+    const connected = response.json<ConnectOAuthSelectionResponse>();
+    expect(connected.connected).toBe(2);
+    expect(connected.items.map((item) => [item.platform, item.externalId, item.isPrimary])).toEqual([
+      ["INSTAGRAM", QAHWA.instagram!.id, true],
+      ["FACEBOOK", QAHWA.id, true],
     ]);
 
     const accounts = await accountsOf();
@@ -193,6 +288,7 @@ describe("GET /v1/oauth/meta/callback", () => {
         externalId: QAHWA.instagram!.id,
         handle: QAHWA.instagram!.username,
         status: "ACTIVE",
+        isPrimary: true,
         scopes: [...META_OAUTH_SCOPES],
         tokenExpiresAt: null,
         connectedById: admin.id,
@@ -209,50 +305,82 @@ describe("GET /v1/oauth/meta/callback", () => {
         externalId: QAHWA.id,
         handle: QAHWA.name,
         displayName: QAHWA.name,
+        isPrimary: true,
         meta: { pageId: QAHWA.id, pageName: QAHWA.name, source: "oauth" },
       }),
-      expect.objectContaining({ platform: "FACEBOOK", externalId: EVENTS.id, handle: EVENTS.name }),
     ]);
-
     // Encrypted at rest: the stored value is the cipher's, and it opens to the Page's token.
     for (const account of accounts) {
-      const page = account.externalId === EVENTS.id ? EVENTS : QAHWA;
       expect(account.accessTokenEnc).toMatch(/^v1:/);
-      expect(account.accessTokenEnc).not.toContain(page.accessToken);
-      expect(t.deps.tokenCipher.decrypt(account.accessTokenEnc)).toBe(page.accessToken);
+      expect(account.accessTokenEnc).not.toContain(QAHWA.accessToken);
+      expect(t.deps.tokenCipher.decrypt(account.accessTokenEnc)).toBe(QAHWA.accessToken);
       expect(account.refreshTokenEnc).toBeNull();
     }
 
     const audits = await testDb().auditLog.findMany({
       where: { action: AUDIT_ACTIONS.socialAccountConnect },
     });
-    expect(audits).toHaveLength(3);
+    expect(audits).toHaveLength(2);
     expect(audits[0]).toMatchObject({
       actorId: admin.id,
       entityType: "SocialAccount",
       data: { clientId: client.id, source: "oauth", reconnected: false },
     });
+    expect(
+      await testDb().auditLog.count({ where: { action: AUDIT_ACTIONS.socialAccountPrimary } }),
+    ).toBe(2);
 
-    // The accounts API shows them without any token.
+    // The selection is used up, and the accounts API shows the accounts without any token.
+    expect((await selection(pick)).statusCode).toBe(404);
+    expect((await choose(pick, [KEYS.events])).statusCode).toBe(404);
     const listed = await t.app.inject({
       method: "GET",
       url: `/v1/clients/${client.id}/social-accounts`,
       headers: browserHeaders(adminCookie),
     });
-    expect(listed.json<{ items: SocialAccountDto[] }>().items).toHaveLength(3);
+    expect(listed.json<{ items: SocialAccountDto[] }>().items).toHaveLength(2);
     expect(listed.body).not.toContain("fake-page-token");
   });
 
+  it("leaves the choice of the publishing Page to the admin when two are picked", async () => {
+    const { items } = await connectPicked();
+    expect(items.map((item) => [item.platform, item.handle, item.isPrimary])).toEqual([
+      ["INSTAGRAM", QAHWA.instagram!.username, true],
+      ["FACEBOOK", QAHWA.name, false],
+      ["FACEBOOK", EVENTS.name, false],
+    ]);
+    // Nothing publishes to either Page until the admin says which.
+    const facebook = items.find((item) => item.externalId === EVENTS.id)!;
+    const chosen = await t.app.inject({
+      method: "POST",
+      url: `/v1/social-accounts/${facebook.id}/primary`,
+      headers: browserHeaders(adminCookie),
+    });
+    expect(chosen.statusCode, chosen.body).toBe(200);
+    const primary = await testDb().socialAccount.findMany({
+      where: { clientId: client.id, platform: "FACEBOOK", isPrimary: true },
+    });
+    expect(primary.map((account) => account.externalId)).toEqual([EVENTS.id]);
+  });
+
   it("refreshes the accounts in place when the admin connects again", async () => {
-    await connect();
+    await connectPicked();
     const before = await accountsOf();
     await testDb().socialAccount.updateMany({
       where: { clientId: client.id },
       data: { status: "EXPIRED" },
     });
 
-    const landing = await connect();
-    expect(landing.result).toMatchObject({ outcome: "connected", connected: 3 });
+    // Already this client's: listed as connected, and picked again to refresh their tokens.
+    const pick = pickOf(await connect());
+    const listed = OAuthSelectionDto.parse((await selection(pick)).json());
+    expect(listed.accounts.map((account) => account.status)).toEqual([
+      "connected",
+      "connected",
+      "connected",
+    ]);
+    const response = await choose(pick, Object.values(KEYS));
+    expect(response.json<ConnectOAuthSelectionResponse>().connected).toBe(3);
     const after = await accountsOf();
     expect(after.map((account) => account.id)).toEqual(before.map((account) => account.id));
     expect(after.every((account) => account.status === "ACTIVE")).toBe(true);
@@ -267,9 +395,30 @@ describe("GET /v1/oauth/meta/callback", () => {
     ]);
   });
 
+  it("keeps a selection to the session that made it, until it expires", async () => {
+    const pick = pickOf(await connect());
+    const otherAdmin = await createUser({ role: "ADMIN" });
+    const other = await sessionCookieFor(otherAdmin, { now: t.clock.now() });
+    const sameAdminElsewhere = await sessionCookieFor(admin, { now: t.clock.now() });
+    for (const cookie of [other, sameAdminElsewhere]) {
+      expect((await selection(pick, cookie)).statusCode).toBe(404);
+      expect((await choose(pick, [KEYS.qahwa], cookie)).statusCode).toBe(404);
+    }
+    const unknown = await choose(pick, [KEYS.qahwa, "FACEBOOK:999"]);
+    expect(unknown.statusCode).toBe(422);
+    expect(await accountsOf()).toEqual([]);
+
+    t.clock.advance(OAUTH_STATE_TTL_SECONDS * SECOND_MS + 1);
+    const expired = await selection(pick);
+    expect(expired.statusCode).toBe(404);
+    expect(expired.json()).toMatchObject({
+      error: { message: expect.stringContaining("expired or was already used") as string },
+    });
+  });
+
   it("works once: a replayed callback is refused", async () => {
     const path = await consent(await authorizeUrl());
-    expect((await callback(path, adminCookie)).result.outcome).toBe("connected");
+    expect((await callback(path, adminCookie)).result.outcome).toBe("choose");
 
     const replay = await callback(path, adminCookie);
     expect(replay.path).toBe("/clients");
@@ -351,7 +500,7 @@ describe("GET /v1/oauth/meta/callback", () => {
     expect(await accountsOf()).toEqual([]);
   });
 
-  it("refuses a Page another client already has, and stores nothing", async () => {
+  it("shows a Page another client has as taken: it can't be picked, and the rest still connect", async () => {
     const other = await createClient({ name: "Other Co" });
     await testDb().socialAccount.create({
       data: {
@@ -360,18 +509,36 @@ describe("GET /v1/oauth/meta/callback", () => {
         externalId: EVENTS.id,
         handle: EVENTS.name,
         accessTokenEnc: t.deps.tokenCipher.encrypt("other-token"),
+        isPrimary: true,
       },
     });
-    const landing = await connect();
-    expect(landing.path).toBe(`/clients/${client.id}`);
-    expect(landing.result).toMatchObject({
-      outcome: "error",
-      message: expect.stringContaining(
-        `"${EVENTS.name}" is already connected to Other Co`,
-      ) as string,
+    const pick = pickOf(await connect());
+    const listed = OAuthSelectionDto.parse((await selection(pick)).json());
+    expect(listed.accounts.find((account) => account.key === KEYS.events)).toMatchObject({
+      status: "taken",
+      takenBy: { clientId: other.id, clientName: "Other Co" },
+    });
+
+    const refused = await choose(pick, [KEYS.qahwa, KEYS.events]);
+    expect(refused.statusCode, refused.body).toBe(409);
+    expect(refused.json()).toMatchObject({
+      error: {
+        message: expect.stringContaining(
+          `"${EVENTS.name}" is already connected to Other Co`,
+        ) as string,
+      },
     });
     expect(await accountsOf()).toEqual([]);
-    expect(await accountsOf(other.id)).toHaveLength(1);
+
+    // The same list, picked again without it.
+    const connected = await choose(pick, [KEYS.qahwa, KEYS.instagram]);
+    expect(connected.statusCode, connected.body).toBe(200);
+    expect((await accountsOf()).map((account) => account.externalId)).toEqual([
+      QAHWA.instagram!.id,
+      QAHWA.id,
+    ]);
+    const others = await accountsOf(other.id);
+    expect(others).toEqual([expect.objectContaining({ externalId: EVENTS.id, isPrimary: true })]);
   });
 
   it("says so when Meta fails during the exchange", async () => {
@@ -430,7 +597,14 @@ describe("GET /v1/oauth/meta/callback", () => {
       const url = new URL(response.json<OAuthStartResponse>().authorizeUrl);
       const path = await consent(url.toString());
       const callbackUrl = new URL(path, "http://api.test");
-      expect((await callback(path, adminCookie, logged)).result.outcome).toBe("connected");
+      const landing = await callback(path, adminCookie, logged);
+      const picked = await logged.app.inject({
+        method: "POST",
+        url: `/v1/oauth/meta/selections/${pickOf(landing)}`,
+        headers: browserHeaders(adminCookie),
+        payload: { keys: Object.values(KEYS) },
+      });
+      expect(picked.statusCode, picked.body).toBe(200);
 
       const text = lines.join("\n");
       expect(text).toContain("/v1/oauth/meta/callback");
@@ -461,7 +635,7 @@ describe("POST /v1/social-accounts/:id/check on a Meta account", () => {
   }
 
   it("asks Meta's debug_token whether the token still works", async () => {
-    await connect();
+    await connectPicked();
     const [instagram] = await accountsOf();
     graph.reset();
 
@@ -476,7 +650,7 @@ describe("POST /v1/social-accounts/:id/check on a Meta account", () => {
   });
 
   it("answers 503 when Meta can't be asked, and leaves the account alone", async () => {
-    await connect();
+    await connectPicked();
     const [instagram] = await accountsOf();
     graph.failNext({ match: /debug_token$/, status: 500, error: GRAPH_ERRORS.unavailable });
     const response = await check(instagram!.id);

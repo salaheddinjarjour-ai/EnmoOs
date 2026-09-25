@@ -31,6 +31,7 @@ import { isUnscheduledAttention, variantProblem } from "../publishing/schedule";
 import { bestSlotOn } from "../publishing/slot-optimizer";
 import type { ServiceUser } from "./actor";
 import { recordAudit } from "./audit";
+import { publishingAccountUnchosen } from "./social-accounts";
 
 export { listCalendar } from "./calendar";
 
@@ -303,6 +304,13 @@ export async function schedule(
       );
     }
     const account = await activeAccountOf(tx, post.clientId, platform);
+    const liveMode = deps.publishers[platform].mode === "live";
+    if (liveMode && !account && (await publishingAccountUnchosen(tx, post.clientId, platform))) {
+      throw conflict(
+        `Several ${label} accounts are connected to this client and none is chosen to publish through; choose one in the client's accounts first`,
+        { platform },
+      );
+    }
     const fields = {
       socialAccountId: account?.id ?? null,
       platform,
@@ -311,7 +319,7 @@ export async function schedule(
       slotSource: "manual" satisfies SlotSource,
       slotReason: `Scheduled on ${date} by ${user.name}, at the day's best free hour. ${slot.reasons.join(". ")}`,
       // A forecast: the claim settles it with the mode and account there are at the slot.
-      dryRun: deps.publishers[platform].mode !== "live" || !account,
+      dryRun: !liveMode || !account,
       // Never back to an attempt whose run id BullMQ may still hold (see publisher.schedule).
       attempts: current ? current.attempts + 1 : 0,
       containerId: null,

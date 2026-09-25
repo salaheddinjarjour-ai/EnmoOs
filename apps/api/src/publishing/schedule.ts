@@ -26,6 +26,7 @@ import { EventBatch } from "../orchestrator/events";
 import { lockPost } from "../orchestrator/locks";
 import { postUpdated } from "../orchestrator/post-status";
 import { publishUpdated, syncPostPublishStatus } from "../orchestrator/publishing";
+import { publishingAccountUnchosen } from "../services/social-accounts";
 import { activeAccountOf, copyOf, currentTakesOf, publisherNote } from "./context";
 import { describeIssues, preparePayload, variantCopyOf, type PayloadTake } from "./payload";
 import { addDays, candidates, slotIsFree, type CandidateRequest } from "./slot-optimizer";
@@ -529,6 +530,19 @@ async function commitSchedule(
       }
       const account = await activeAccountOf(tx, prepared.clientId, variant.platform);
       const liveMode = deps.publishers[variant.platform].mode === "live";
+      if (
+        liveMode &&
+        !account &&
+        (await publishingAccountUnchosen(tx, prepared.clientId, variant.platform))
+      ) {
+        // Several accounts and none chosen: a dry run would pass for a post nobody will see.
+        problems.push({
+          platform: variant.platform,
+          message: `several ${PLATFORM_LABEL[variant.platform]} accounts are connected and none is chosen to publish through; choose one in the client's accounts, then put it on a day on the calendar`,
+          actionable: true,
+        });
+        continue;
+      }
       const fields = {
         socialAccountId: account?.id ?? null,
         platform: variant.platform,

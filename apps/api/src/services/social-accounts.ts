@@ -1,4 +1,4 @@
-import type { AccountStatus, DbClient, Prisma } from "@enmo/db";
+import type { AccountStatus, DbClient, DbTransaction, Prisma } from "@enmo/db";
 import {
   AUDIT_ACTIONS,
   SocialAccountMeta,
@@ -22,9 +22,15 @@ import {
  * Connected social accounts (DESIGN §B SocialAccount, §E routes). Tokens are encrypted with
  * lib/crypto before they reach the database and never leave this module: reads select only the
  * public columns below, and the DTO mapper lists its fields explicitly.
+ *
+ * Each client publishes on a platform through one account it chose, SocialAccount.isPrimary, never
+ * "whichever was connected last": an agency admin's Meta sign-in reaches many brands' Pages, and a
+ * client can have several. A client's only account on a platform is its publishing account
+ * (settlePrimary keeps that true through connects and disconnects); with several, an admin picks
+ * one (makePrimary), and the posts waiting to go out there move to it.
  */
 
-const PUBLIC_COLUMNS = {
+export const PUBLIC_COLUMNS = {
   id: true,
   clientId: true,
   platform: true,
@@ -32,6 +38,7 @@ const PUBLIC_COLUMNS = {
   handle: true,
   displayName: true,
   status: true,
+  isPrimary: true,
   scopes: true,
   meta: true,
   tokenExpiresAt: true,
@@ -56,6 +63,7 @@ export function toSocialAccountDto(row: PublicSocialAccount): SocialAccountDto {
     handle: row.handle,
     displayName: row.displayName,
     status: row.status,
+    isPrimary: row.isPrimary === true,
     scopes: row.scopes,
     meta: meta.success ? meta.data : {},
     tokenExpiresAt: iso(row.tokenExpiresAt),
@@ -139,6 +147,49 @@ export function verifyWithPlatform(oauth: Pick<OAuthProviders, "meta">): Account
   };
 }
 
+// ── The publishing account ──────────────────────────────────────────────────
+
+type Db = DbClient | DbTransaction;
+
+/** Serialises changes to one client's accounts (which one publishes is decided across rows). */
+export async function lockClientAccounts(tx: DbTransaction, clientId: string): Promise<void> {
+  await tx.$queryRaw`SELECT id FROM "Client" WHERE id = ${clientId} FOR NO KEY UPDATE`;
+}
+
+/**
+ * Makes the client's only account on the platform its publishing account when none is: the one
+ * choice that needs nobody. With several and none chosen, it waits for an admin (makePrimary).
+ * Returns the account it made primary, if any.
+ */
+export async function settlePrimary(
+  tx: DbTransaction,
+  clientId: string,
+  platform: Platform,
+): Promise<{ id: string } | null> {
+  const accounts = await tx.socialAccount.findMany({
+    where: { clientId, platform },
+    select: { id: true, isPrimary: true },
+    take: 2,
+  });
+  const [only] = accounts;
+  if (!only || accounts.length > 1 || only.isPrimary) return null;
+  await tx.socialAccount.update({ where: { id: only.id }, data: { isPrimary: true } });
+  return { id: only.id };
+}
+
+/** Whether the client has accounts on the platform but none chosen to publish through. */
+export async function publishingAccountUnchosen(
+  db: Db,
+  clientId: string,
+  platform: Platform,
+): Promise<boolean> {
+  const [primary, any] = await Promise.all([
+    db.socialAccount.count({ where: { clientId, platform, isPrimary: true } }),
+    db.socialAccount.count({ where: { clientId, platform } }),
+  ]);
+  return primary === 0 && any > 0;
+}
+
 // ── Service ─────────────────────────────────────────────────────────────────
 
 export async function listSocialAccounts(
@@ -182,6 +233,7 @@ export async function connectSocialAccount(
   try {
     return await db.$transaction(async (tx) => {
       await requireEditableClient(tx, clientId);
+      await lockClientAccounts(tx, clientId);
       const existing = await tx.socialAccount.findUnique({
         where: { platform_externalId: { platform: input.platform, externalId: input.externalId } },
         select: { id: true, clientId: true },
@@ -213,7 +265,8 @@ export async function connectSocialAccount(
         externalId: row.externalId,
         handle: row.handle,
       });
-      return toSocialAccountDto(row);
+      const primary = await settlePrimary(tx, clientId, row.platform);
+      return toSocialAccountDto(primary ? { ...row, isPrimary: true } : row);
     });
   } catch (error) {
     // Lost a race with a concurrent connect of the same account.
@@ -222,12 +275,19 @@ export async function connectSocialAccount(
   }
 }
 
+/**
+ * Removes the account. When it was the client's publishing account there and one other account
+ * is left on the platform, that one publishes from now on; with several left, an admin chooses.
+ */
 export async function disconnectSocialAccount(
   db: DbClient,
   id: string,
   actor: Actor,
 ): Promise<void> {
   await db.$transaction(async (tx) => {
+    const head = await tx.socialAccount.findUnique({ where: { id }, select: { clientId: true } });
+    if (!head) throw notFound("Social account");
+    await lockClientAccounts(tx, head.clientId);
     const row = await tx.socialAccount.findUnique({
       where: { id },
       select: { clientId: true, platform: true, externalId: true, handle: true },
@@ -235,6 +295,75 @@ export async function disconnectSocialAccount(
     if (!row) throw notFound("Social account");
     await tx.socialAccount.delete({ where: { id } });
     await auditChange(tx, actor, AUDIT_ACTIONS.socialAccountDisconnect, accountEntity(id), row);
+    const promoted = await settlePrimary(tx, row.clientId, row.platform);
+    if (promoted) {
+      await auditChange(tx, actor, AUDIT_ACTIONS.socialAccountPrimary, accountEntity(promoted.id), {
+        clientId: row.clientId,
+        platform: row.platform,
+        disconnectedId: id,
+        reason: "the only account left on the platform",
+      });
+    }
+  });
+}
+
+/** Posts that haven't started going out: they publish through whatever is primary when they do. */
+const WAITING_JOB_STATUSES = ["SCHEDULED", "QUEUED"] as const;
+
+/**
+ * POST /social-accounts/:id/primary: the account its client's posts on its platform publish
+ * through from now on, the posts waiting to go out there included. CONFLICT unless it is ACTIVE
+ * (nothing could publish through it); NOT_FOUND when missing.
+ */
+export async function makePrimarySocialAccount(
+  db: DbClient,
+  id: string,
+  actor: Actor,
+): Promise<SocialAccountDto> {
+  return db.$transaction(async (tx) => {
+    const head = await tx.socialAccount.findUnique({ where: { id }, select: { clientId: true } });
+    if (!head) throw notFound("Social account");
+    await lockClientAccounts(tx, head.clientId);
+    const account = await tx.socialAccount.findUnique({ where: { id }, select: PUBLIC_COLUMNS });
+    if (!account) throw notFound("Social account");
+    if (account.status !== "ACTIVE") {
+      throw conflict(
+        `Only an active account can publish; this one is ${account.status.toLowerCase()}. Check or reconnect it first`,
+        { status: account.status },
+      );
+    }
+    if (account.isPrimary) return toSocialAccountDto(account);
+    const { clientId, platform } = account;
+    const previous = await tx.socialAccount.findFirst({
+      where: { clientId, platform, isPrimary: true },
+      select: { id: true },
+    });
+    // Cleared first: the unique index allows one primary per client and platform at any moment.
+    await tx.socialAccount.updateMany({
+      where: { clientId, platform, isPrimary: true },
+      data: { isPrimary: null },
+    });
+    const row = await tx.socialAccount.update({
+      where: { id },
+      data: { isPrimary: true },
+      select: PUBLIC_COLUMNS,
+    });
+    const moved = await tx.publishJob.updateMany({
+      where: {
+        platform,
+        status: { in: [...WAITING_JOB_STATUSES] },
+        socialAccountId: { not: null },
+        variant: { post: { clientId } },
+      },
+      data: { socialAccountId: id },
+    });
+    await auditChange(tx, actor, AUDIT_ACTIONS.socialAccountPrimary, accountEntity(id), {
+      clientId,
+      platform,
+      previousId: previous?.id ?? null,
+      movedJobs: moved.count,
+    });
+    return toSocialAccountDto(row);
   });
 }
 

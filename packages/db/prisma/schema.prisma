@@ -285,6 +285,10 @@ model SocialAccount {
   /// Non-secret ids: pageId, igUserId, username.
   meta             Json          @default("{}")
   status           AccountStatus @default(ACTIVE)
+  /// The account the client's posts on this platform publish through: true on at most one account
+  /// per client and platform, null (never false) on the others, so the unique index below lets any
+  /// number of them sit beside it.
+  isPrimary        Boolean?
   lastCheckedAt    DateTime?
   connectedById    String?
   connectedBy      User?         @relation("AccountConnector", fields: [connectedById], references: [id], onDelete: SetNull)
@@ -294,6 +298,7 @@ model SocialAccount {
   publishJobs PublishJob[]
 
   @@unique([platform, externalId])
+  @@unique([clientId, platform, isPrimary])
   @@index([clientId])
 }
 

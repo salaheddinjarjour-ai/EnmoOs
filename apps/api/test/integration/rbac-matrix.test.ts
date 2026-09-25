@@ -171,6 +171,12 @@ const ROUTES: readonly RouteCase[] = [
   },
   {
     method: "POST",
+    route: "/v1/social-accounts/:id/primary",
+    access: "socialAccounts.manage",
+    url: `/v1/social-accounts/${MISSING}/primary`,
+  },
+  {
+    method: "POST",
     route: "/v1/social-accounts/:id/check",
     access: "socialAccounts.manage",
     url: `/v1/social-accounts/${MISSING}/check`,
@@ -342,6 +348,19 @@ const ROUTES: readonly RouteCase[] = [
   },
   // Meta redirects the browser here; without a valid state it redirects back with an error.
   { method: "GET", route: "/v1/oauth/meta/callback", access: "public" },
+  {
+    method: "GET",
+    route: "/v1/oauth/meta/selections/:id",
+    access: "socialAccounts.manage",
+    url: "/v1/oauth/meta/selections/matrix-missing-selection-id",
+  },
+  {
+    method: "POST",
+    route: "/v1/oauth/meta/selections/:id",
+    access: "socialAccounts.manage",
+    url: "/v1/oauth/meta/selections/matrix-missing-selection-id",
+    payload: () => ({ keys: ["FACEBOOK:1"] }),
+  },
 ];
 
 /*
