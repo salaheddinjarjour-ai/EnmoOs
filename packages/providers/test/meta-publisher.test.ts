@@ -308,7 +308,9 @@ describe("Graph calls", () => {
     // A clear refusal means nothing was created: a rate limit is still retried.
     const { fetch } = scriptedFetch(json({ error: { message: "Slow down", code: 32 } }, 400));
     expect(
-      await publishError(facebookPublisher(fetch).publish(payload(), account, { containerId: null })),
+      await publishError(
+        facebookPublisher(fetch).publish(payload(), account, { containerId: null }),
+      ),
     ).toMatchObject({ code: "RATE_LIMITED", retryable: true });
   });
 });

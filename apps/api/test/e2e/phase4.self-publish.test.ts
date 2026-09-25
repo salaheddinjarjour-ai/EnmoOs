@@ -499,6 +499,7 @@ describe("phase4.self-publish", () => {
     ]);
 
     // Re-approval: the same job rows, reset and scheduled again, the edited captions going out.
+    // Their attempt count moves on rather than back to 0, so no run reuses an earlier one's id.
     h.clock.set(NOW);
     await approvePost(h, seeded, postId);
     await waitForPostStatus(h, postId, "SCHEDULED");
@@ -507,7 +508,7 @@ describe("phase4.self-publish", () => {
       expect(again[platform]).toMatchObject({
         id: before[platform]!.id,
         status: "SCHEDULED",
-        attempts: 0,
+        attempts: before[platform]!.attempts + 1,
         lastError: null,
         liveUrl: null,
       });
@@ -526,6 +527,9 @@ describe("phase4.self-publish", () => {
     await tickAt(h, FB_TUESDAY_0900);
     await tickAt(h, IG_TUESDAY_1100);
     await waitForPostStatus(h, postId, "LIVE");
+    for (const job of Object.values(await jobsOf(postId))) {
+      expect(job).toMatchObject({ status: "PUBLISHED", attempts: 2 });
+    }
   }, 90_000);
 
   it("(d) a calendar drag moves the job to the best free hour of the new day", async () => {

@@ -259,7 +259,8 @@ export async function routeVisualRevision(
     enabledActions: actions,
   });
   const direct = revision.tasks.find((task) => task.action === "direct");
-  if (!direct) throw new Error(`The visual revision of post ${revision.post.id} has no direct task`);
+  if (!direct)
+    throw new Error(`The visual revision of post ${revision.post.id} has no direct task`);
   return { ...revision, direct };
 }
 

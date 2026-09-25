@@ -252,12 +252,14 @@ describe("archiving", () => {
       (await db.publishJob.findUniqueOrThrow({ where: { id: other.jobs.INSTAGRAM!.id } })).status,
     ).toBe("SCHEDULED");
     const announced = await db.realtimeEvent.findMany({ where: { type: "publish.updated" } });
-    expect(announced.map((event) => event.payload)).toEqual(
-      expect.arrayContaining(
-        Object.values(seeded.jobs).map((job) =>
-          expect.objectContaining({ jobId: job.id, status: "CANCELLED" }),
-        ),
-      ),
+    const cancelled = announced
+      .map((event) => event.payload as { jobId: string; status: string })
+      .filter((payload) => payload.status === "CANCELLED")
+      .map((payload) => payload.jobId);
+    expect(cancelled.sort()).toEqual(
+      Object.values(seeded.jobs)
+        .map((job) => job.id)
+        .sort(),
     );
   });
 

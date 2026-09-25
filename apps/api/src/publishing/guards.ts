@@ -115,7 +115,9 @@ export function evaluateGuards(snapshot: GuardSnapshot): GuardFailure | null {
     return {
       guard: "archived",
       message:
-        snapshot.archived === "campaign" ? "The post's campaign is archived" : "The client is archived",
+        snapshot.archived === "campaign"
+          ? "The post's campaign is archived"
+          : "The client is archived",
       accountStatus: null,
     };
   }

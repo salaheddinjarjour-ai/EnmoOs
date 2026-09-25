@@ -1,7 +1,16 @@
-import { MockLlm, type LlmClient, type LlmRequest, type LlmResponse } from "@enmo/agents";
+import {
+  COPY_BANNED_SCAN_IGNORE,
+  MockLlm,
+  type LlmClient,
+  type LlmRequest,
+  type LlmResponse,
+} from "@enmo/agents";
 import type { Client } from "@enmo/db";
+import { DryRunPublisher } from "@enmo/providers";
 import {
   CopywriterOutput,
+  Feedback,
+  scanForBannedWords,
   type AlertPayload,
   type ApproveAllResponse,
   type Platform,
@@ -40,9 +49,12 @@ import {
  * Phase 4 publishing safety (DESIGN §F "Publishing safety", §D ticks), on the pipeline harness:
  *   - publisher.schedule: the optimizer's top candidates when the Publisher agent fails (never an
  *     escalation), and a post no platform would take left approved and flagged;
- *   - the publish guard at the slot: content changed behind the approval's back, banned words
- *     added since, an expired token; content refusals cancel and reopen approval, a token refusal
- *     fails the job (retryable once reconnected);
+ *   - the publish guard at the slot: archived work, content changed behind the approval's back,
+ *     banned words added since, an expired token; content refusals cancel and reopen approval
+ *     (banned copy through the Copywriter first) and the re-approved job goes out at its new slot,
+ *     archived work is held back, a token refusal fails the job (retryable once reconnected);
+ *   - dry run or live settled at the slot: a kill switch after scheduling, an account connected
+ *     after scheduling, and a live publish still processing when publishing is switched off;
  *   - the live publisher's failures against the fake Graph server: a transient error retried
  *     automatically on the same container, a permanent refusal, a revoked token, media still
  *     processing (publish.poll) and a poll that never finishes;
@@ -267,20 +279,109 @@ describe("the publish guard", () => {
     expect(graph!.calls).toEqual([]);
   }, 90_000);
 
-  it("cancels a post that uses a word the client banned after approval", async () => {
+  it("publishes a job the guard refused at its new slot once the post is approved again", async () => {
     const h = await start();
-    const { postId } = await scheduledPost(h);
-    const [variant] = await testDb().postVariant.findMany({ where: { postId } });
-    const word = /\p{L}{5,}/u.exec(variant!.caption)![0];
-    await testDb().client.updateMany({ data: { bannedWords: [word] } });
+    const { seeded, postId } = await scheduledPost(h);
+    const db = testDb();
+    const { INSTAGRAM: job } = await jobsOf(postId);
+    const stored = await db.post.findUniqueOrThrow({ where: { id: postId } });
+    const copy = CopywriterOutput.parse(stored.copy);
+    await db.post.update({
+      where: { id: postId },
+      data: { copy: { ...copy, caption: "Changed behind the approval's back." } },
+    });
 
     await tickAt(h, IG_TUESDAY_1100);
     const reopened = await waitForPostStatus(h, postId, "PENDING_APPROVAL");
-    expect(reopened.attentionReason).toBe(`The post uses the client's banned words: "${word}"`);
-    expect((await jobsOf(postId)).INSTAGRAM).toMatchObject({
-      status: "CANCELLED",
-      lastError: PUBLISH_CANCEL_REASONS.bannedWords,
+    expect(reopened.needsAttention).toBe(true);
+    // The refused run is done, and BullMQ keeps its id taken for a day.
+    const runOne = jobIds.publishRun({ publishJobId: job!.id, attempt: 1 });
+    await h.waitFor(async () => {
+      const run = await h.deps.queues.queue("ops").getJob(runOne);
+      return run && (await run.getState()) === "completed";
     });
+
+    await approvePost(h, seeded, postId);
+    const rescheduled = await waitForPostStatus(h, postId, "SCHEDULED");
+    // The reviewers' approval answers the refusal's flag.
+    expect(rescheduled).toMatchObject({ needsAttention: false, attentionReason: null });
+    const again = (await jobsOf(postId)).INSTAGRAM!;
+    expect(again).toMatchObject({ id: job!.id, status: "SCHEDULED", attempts: 1, lastError: null });
+    expect(again.scheduledFor.getTime()).toBeGreaterThan(Date.parse(IG_TUESDAY_1100));
+
+    await tickAt(h, again.scheduledFor.toISOString());
+    const live = await waitForPostStatus(h, postId, "LIVE");
+    expect(live.needsAttention).toBe(false);
+    expect((await jobsOf(postId)).INSTAGRAM).toMatchObject({ status: "PUBLISHED", attempts: 2 });
+  }, 90_000);
+
+  it("sends copy that uses a word the client banned after approval back to the Copywriter", async () => {
+    const h = await start();
+    const { seeded, postId } = await scheduledPost(h);
+    const db = testDb();
+    const [variant] = await db.postVariant.findMany({ where: { postId } });
+    const word = /\p{L}{5,}/u.exec(variant!.caption)![0];
+    await db.client.updateMany({ data: { bannedWords: [word] } });
+
+    await tickAt(h, IG_TUESDAY_1100);
+    const message = `The post uses the client's banned words: "${word}"`;
+    const held = await waitForJobs(h, postId, "CANCELLED", ["INSTAGRAM"]);
+    expect(held.INSTAGRAM!.lastError).toBe(PUBLISH_CANCEL_REASONS.bannedWords);
+    // No round opens on copy that can't go out: the Copywriter rewrites it and QA sends it on.
+    const write = await db.agentTask.findFirstOrThrow({
+      where: { postId, action: "write", revision: { gt: 0 } },
+    });
+    const feedback = Feedback.parse(write.feedback);
+    expect(feedback).toMatchObject({ source: "QA", decisionId: null });
+    expect(feedback.verbatim).toContain(`Uses the banned term "${word}"`);
+    expect((await publisherNotes(seeded.threadId)).at(-1)).toBe(
+      `I held back p1 on Instagram: ${message}. It's back with the Copywriter.`,
+    );
+
+    const revised = await waitForPostStatus(h, postId, "PENDING_APPROVAL");
+    expect(revised.needsAttention).toBe(false);
+    expect(
+      scanForBannedWords(revised.copy, [word], { ignoreKeys: COPY_BANNED_SCAN_IGNORE }),
+    ).toEqual([]);
+    const rounds = await db.approvalRequest.findMany({
+      where: { postId },
+      orderBy: { round: "asc" },
+    });
+    expect(rounds.map((round) => round.status)).toEqual(["CANCELLED", "PENDING"]);
+    expect(rounds[1]!.contentHash).toBe(await currentContentHash(db, postId));
+  }, 90_000);
+
+  it("holds back a job whose campaign was archived behind its back, reopening nothing", async () => {
+    const h = await startLive();
+    const { seeded, postId } = await scheduledPost(h, ["INSTAGRAM"], (client) =>
+      connectMetaAccounts(h, client),
+    );
+    const { INSTAGRAM: job } = await jobsOf(postId);
+    // Archived without the service, which would have cancelled the job itself.
+    await testDb().campaign.update({
+      where: { id: seeded.campaignId },
+      data: { status: "ARCHIVED" },
+    });
+
+    await tickAt(h, IG_TUESDAY_1100);
+    const held = await waitForJobs(h, postId, "CANCELLED", ["INSTAGRAM"]);
+    expect(held.INSTAGRAM).toMatchObject({
+      id: job!.id,
+      lastError: PUBLISH_CANCEL_REASONS.campaignArchived,
+      liveUrl: null,
+    });
+    const post = await waitForPostStatus(h, postId, "APPROVED");
+    expect(post.needsAttention).toBe(false);
+    expect(await testDb().approvalRequest.count({ where: { postId, status: "PENDING" } })).toBe(0);
+    expect((await publisherNotes(seeded.threadId)).at(-1)).toBe(
+      "I held back p1 on Instagram: The post's campaign is archived.",
+    );
+    expect(graph!.calls).toEqual([]);
+
+    // Nothing schedules it again.
+    await tickAt(h, new Date(Date.parse(IG_TUESDAY_1100) + 10 * MINUTE_MS).toISOString());
+    expect((await jobsOf(postId)).INSTAGRAM!.status).toBe("CANCELLED");
+    expect(await alerts()).toEqual([]);
   }, 90_000);
 
   it("fails a live job whose token expired, marks the account, and publishes on a retry once reconnected", async () => {
@@ -338,6 +439,85 @@ describe("the publish guard", () => {
   }, 90_000);
 });
 
+describe("dry run or live, settled at the slot", () => {
+  it("publishes a job scheduled live as a dry run once publishing is switched off, and says so", async () => {
+    const live = await startLive();
+    const { seeded, postId } = await scheduledPost(live, ["INSTAGRAM"], (client) =>
+      connectMetaAccounts(live, client),
+    );
+    expect((await jobsOf(postId)).INSTAGRAM).toMatchObject({ dryRun: false });
+    // The kill switch: the next process runs with PUBLISH_MODE=dry-run.
+    await live.stop();
+    harness = undefined;
+    const h = await start();
+
+    await tickAt(h, IG_TUESDAY_1100);
+    await waitForPostStatus(h, postId, "LIVE");
+    const { INSTAGRAM: job } = await jobsOf(postId);
+    expect(job).toMatchObject({
+      status: "PUBLISHED",
+      dryRun: true,
+      externalId: `dryrun_${job!.variantId}`,
+      liveUrl: `https://dryrun.enmo.marketing/instagram/${job!.variantId}`,
+    });
+    expect(graph!.calls).toEqual([]);
+    expect((await publisherNotes(seeded.threadId)).at(-1)).toBe(
+      `p1 is live.\nInstagram: ${job!.liveUrl} (dry run)`,
+    );
+  }, 90_000);
+
+  it("publishes for real a post scheduled before its account was connected", async () => {
+    const h = await startLive();
+    const { seeded, postId } = await scheduledPost(h);
+    expect((await jobsOf(postId)).INSTAGRAM).toMatchObject({
+      dryRun: true,
+      socialAccountId: null,
+    });
+    expect((await publisherNotes(seeded.threadId)).at(-1)).toContain(
+      "[dry run: no Instagram account connected]",
+    );
+    const { instagram } = await connectMetaAccounts(h, seeded.client);
+
+    await tickAt(h, IG_TUESDAY_1100);
+    await waitForPostStatus(h, postId, "LIVE");
+    const [media] = [...graph!.state.media.values()];
+    expect((await jobsOf(postId)).INSTAGRAM).toMatchObject({
+      status: "PUBLISHED",
+      dryRun: false,
+      socialAccountId: instagram.id,
+      externalId: media!.id,
+      liveUrl: media!.permalink,
+    });
+  }, 90_000);
+
+  it("fails a live publish still processing once publishing is switched off, faking nothing", async () => {
+    const h = await startLive();
+    const { postId } = await scheduledPost(h, ["INSTAGRAM"], (client) =>
+      connectMetaAccounts(h, client),
+    );
+    graph!.state.containerPolls = 10_000;
+    await tickAt(h, IG_TUESDAY_1100);
+    const publishing = await h.waitFor(async () => {
+      const { INSTAGRAM: job } = await jobsOf(postId);
+      return job?.status === "PUBLISHING" && job.containerId ? job : null;
+    });
+
+    const switchedOff = {
+      ...h.deps,
+      publishers: { ...h.deps.publishers, INSTAGRAM: new DryRunPublisher("INSTAGRAM") },
+    };
+    const result = await pollPublish(
+      switchedOff,
+      { publishJobId: publishing.id, attempt: 1, poll: 1 },
+      { isLast: false },
+    );
+    expect(result).toBe("failed");
+    const { INSTAGRAM: failed } = await jobsOf(postId);
+    expect(failed).toMatchObject({ status: "FAILED", dryRun: false, liveUrl: null });
+    expect(failed!.lastError).toMatch(/^Instagram publishing was switched to dry run /);
+  }, 90_000);
+});
+
 describe("the live publisher's failures", () => {
   it("retries a transient error automatically on the same container", async () => {
     const h = await startLive();
@@ -362,6 +542,11 @@ describe("the live publisher's failures", () => {
     const published = await waitForJobs(h, postId, "PUBLISHED", ["INSTAGRAM"]);
     expect(published.INSTAGRAM).toMatchObject({ attempts: 2, lastError: null });
     await waitForPostStatus(h, postId, "LIVE");
+    // The automatic retry runs in the chain its first attempt began.
+    const retried = await h.deps.queues
+      .queue("ops")
+      .getJob(jobIds.publishRun({ publishJobId: retrying.id, attempt: 2 }));
+    expect(retried?.data).toEqual({ publishJobId: retrying.id, attempt: 2, firstAttempt: 1 });
     const calls = graph!.sequence();
     expect(calls.filter((call) => /\/media$/.test(call))).toHaveLength(1);
     expect(calls.filter((call) => /\/media_publish$/.test(call))).toHaveLength(2);
