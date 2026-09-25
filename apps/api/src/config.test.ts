@@ -337,6 +337,28 @@ describe("loadConfig", () => {
     ).toThrow(/R2_PUBLIC_BASE_URL/);
   });
 
+  it("behind the web Worker's proxy, serves the API, files and OAuth from the web app's address", () => {
+    const secret = "p".repeat(40);
+    const proxied = loadConfig({
+      ...PRODUCTION,
+      APP_ORIGINS: "https://enmoos.example.workers.dev",
+      EDGE_PROXY_SECRET: secret,
+    });
+    expect(proxied.EDGE_PROXY_SECRET).toBe(secret);
+    expect(proxied.API_PUBLIC_URL).toBe("https://enmoos.example.workers.dev");
+    expect(proxied.PUBLIC_ASSET_BASE_URL).toBe("https://enmoos.example.workers.dev/files");
+    expect(proxied.META_REDIRECT_URI).toMatch(/^https:\/\/enmoos\.example\.workers\.dev\/v1\//);
+    // An explicit API_PUBLIC_URL still wins, and a short secret is refused.
+    expect(
+      loadConfig({
+        ...PRODUCTION,
+        EDGE_PROXY_SECRET: secret,
+        API_PUBLIC_URL: "https://api.enmo.marketing",
+      }).API_PUBLIC_URL,
+    ).toBe("https://api.enmo.marketing");
+    expect(() => loadConfig({ ...PRODUCTION, EDGE_PROXY_SECRET: "short" })).toThrow(ConfigError);
+  });
+
   it("defaults publishing to dry-run with Meta's real hosts and a callback on this API", () => {
     const config = loadConfig({
       NODE_ENV: "test",

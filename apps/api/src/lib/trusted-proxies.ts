@@ -1,3 +1,4 @@
+import { timingSafeEqual } from "node:crypto";
 import { BlockList, isIP } from "node:net";
 import type { FastifyRequest } from "fastify";
 
@@ -128,10 +129,42 @@ export function resolveClientIp(
   return isIP(connecting) === 0 ? peer : connecting;
 }
 
+/** Headers the web Worker's same-origin proxy (apps/web/src/edge/api-proxy.ts) sends. */
+export const EDGE_CLIENT_IP_HEADER = "x-enmo-client-ip";
+export const EDGE_AUTH_HEADER = "x-enmo-edge-auth";
+
+function sameSecret(sent: string, expected: string): boolean {
+  const a = Buffer.from(sent);
+  const b = Buffer.from(expected);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+/**
+ * The visitor our own web Worker vouches for, or null. Every proxied request reaches the API from
+ * Cloudflare's shared Workers egress address, so without this every visitor would share one
+ * address (one login rate-limit bucket). The header counts only with the shared secret, so a
+ * client that writes it itself is ignored; a malformed address is ignored too.
+ */
+export function edgeClientIp(
+  headers: FastifyRequest["headers"],
+  secret: string | undefined,
+): string | null {
+  if (!secret) return null;
+  const auth = headers[EDGE_AUTH_HEADER];
+  const address = headers[EDGE_CLIENT_IP_HEADER];
+  if (typeof auth !== "string" || typeof address !== "string") return null;
+  if (!sameSecret(auth, secret)) return null;
+  const trimmed = address.trim();
+  return isIP(trimmed) === 0 ? null : trimmed;
+}
+
 /** The `request.clientIp` getter app.ts decorates requests with. */
-export function clientIpGetter({ cloudflare }: ClientIpPolicy) {
+export function clientIpGetter({ cloudflare }: ClientIpPolicy, edgeSecret?: string) {
   return function clientIp(this: FastifyRequest): string {
-    return resolveClientIp(this.ip, this.headers["cf-connecting-ip"], cloudflare);
+    return (
+      edgeClientIp(this.headers, edgeSecret) ??
+      resolveClientIp(this.ip, this.headers["cf-connecting-ip"], cloudflare)
+    );
   };
 }
 

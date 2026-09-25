@@ -1,5 +1,6 @@
 # Render Blueprint for the ENMO OS backend (DESIGN §H): the API web service, the queue worker and
-# Postgres 16. The web app deploys to Cloudflare Workers instead (apps/web, see README "Deploy"),
+# Postgres 16. The web app deploys to Cloudflare Workers instead (apps/web, see README "Deploy");
+# its Worker forwards the browser's /v1/* and /files/* calls here,
 # and Redis is Upstash (REDIS_URL, eviction off). Both services run the same build: one bundle,
 # two entrypoints.
 #
@@ -8,7 +9,8 @@
 #   - enmo-shared   (defined below) non-secret settings shared by both services;
 #   - enmo-secrets  created by hand in the Dashboard (Environment Groups → New) BEFORE the first
 #                   Blueprint sync, so no secret ever lives in git. Keys:
-#                     REDIS_URL, TOKEN_ENC_KEY, ANTHROPIC_API_KEY,
+#                     REDIS_URL, TOKEN_ENC_KEY, ANTHROPIC_API_KEY, EDGE_PROXY_SECRET (the same value as
+#                     the web Worker's; README "Deploy"),
 #                     R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY,
 #                   and later META_APP_ID, META_APP_SECRET, TIKTOK_CLIENT_KEY, TIKTOK_CLIENT_SECRET,
 #                   HIGGSFIELD_CREDENTIALS, HIGGSFIELD_IMAGE_MODEL,

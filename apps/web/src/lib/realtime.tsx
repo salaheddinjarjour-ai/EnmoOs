@@ -19,7 +19,7 @@ import {
   type ReactNode,
 } from "react";
 import { queryKeys } from "../hooks/query-keys";
-import { API_URL } from "./api";
+import { apiUrl } from "./api";
 import {
   effectsOf,
   patchPost,
@@ -117,7 +117,7 @@ export class LiveStream {
 
   private connect(): void {
     this.close();
-    const url = new URL(`${API_URL}/v1/events`);
+    const url = apiUrl("/v1/events");
     if (this.threadId) url.searchParams.set("threadId", this.threadId);
     const cursor = this.lastEventId;
     if (cursor) url.searchParams.set("lastEventId", cursor);

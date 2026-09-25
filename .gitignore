@@ -25,3 +25,6 @@ coverage
 
 # logs
 *.log
+
+# Wrangler local secrets (wrangler dev)
+.dev.vars*

@@ -1,0 +1,108 @@
+# Render Blueprint for a free, click-through PREVIEW of ENMO OS (README "Quick preview").
+# Pair it with the web app on its Cloudflare workers.dev address: the Worker forwards /v1/* and
+# /files/* here (apps/web/src/edge/api-proxy.ts), so the browser only ever talks to workers.dev and
+# the session cookie is first-party without any DNS setup.
+#
+# Everything is on Render's free plan: one web service that also runs the queue workers
+# (EMBEDDED_WORKER), a free Key Value instance for BullMQ and realtime, and a free Postgres 16.
+# The agents run on the mock LLM, visuals are mock renders, and publishing is dry-run, so no API
+# keys are needed. Limits of the free plan: the service sleeps after 15 idle minutes (the Worker's
+# cron pings /healthz every 5 minutes to prevent it), the disk is wiped on every deploy (rendered
+# visuals vanish then), Key Value keeps nothing across restarts, and Render deletes a free
+# database after 30 days. Production uses render.yaml instead.
+#
+# Create it with Render → New → Blueprint → this repo → Blueprint path `render.preview.yaml`.
+# Render asks for the values marked `sync: false`.
+
+services:
+  - type: web
+    name: enmo-api-preview
+    runtime: node
+    plan: free
+    region: frankfurt
+    # --prod=false: the build needs devDependencies (turbo, tsup, the Prisma CLI).
+    buildCommand: corepack enable && pnpm install --frozen-lockfile --prod=false && pnpm turbo run build --filter=@enmo/api...
+    # Free services have no pre-deploy command, so migrations run at start.
+    startCommand: (cd packages/db && ./node_modules/.bin/prisma migrate deploy) && node --enable-source-maps apps/api/dist/server.js
+    healthCheckPath: /healthz
+    autoDeployTrigger: commit
+    buildFilter:
+      ignoredPaths:
+        - apps/web/**
+        - docs/**
+        - "**/*.md"
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: COREPACK_ENABLE_DOWNLOAD_PROMPT
+        value: "0"
+      - key: LOG_LEVEL
+        value: info
+      # The web app's address, e.g. https://enmoos.<your-subdomain>.workers.dev (no trailing slash).
+      # It is the CORS/CSRF origin and, behind the Worker's proxy, this API's public address too.
+      - key: APP_ORIGINS
+        sync: false
+      # Copy this value into the Worker's EDGE_PROXY_SECRET (Cloudflare → Workers → enmoos →
+      # Settings → Variables and Secrets), so the API can see each visitor's real address.
+      - key: EDGE_PROXY_SECRET
+        generateValue: true
+      # 32 random bytes, base64: encrypts connected social-account tokens at rest.
+      - key: TOKEN_ENC_KEY
+        generateValue: true
+      # The first ADMIN, created on the first boot while the users table is empty.
+      - key: SEED_ADMIN_EMAIL
+        sync: false
+      - key: SEED_ADMIN_PASSWORD
+        sync: false
+      - key: DATABASE_URL
+        fromDatabase:
+          name: enmo-preview-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: enmo-preview-kv
+          property: connectionString
+      - key: EMBEDDED_WORKER
+        value: "true"
+      - key: SCHEDULERS_ENABLED
+        value: "true"
+      - key: BULLMQ_PREFIX
+        value: enmo
+      # Host-only session cookie on the workers.dev address (no COOKIE_DOMAIN), always Secure.
+      - key: COOKIE_SECURE
+        value: "true"
+      - key: TRUST_PROXY
+        value: loopback,uniquelocal,cloudflare
+      - key: LLM_PROVIDER
+        value: mock
+      # Paces the mock agents so live progress is visible in the Brief.
+      - key: MOCK_LLM_DELAY_MS
+        value: "300"
+      - key: VISUAL_PROVIDER
+        value: mock
+      - key: PUBLISH_MODE
+        value: dry-run
+      # Preview only: renders live on the instance's disk and are lost on the next deploy.
+      - key: STORAGE_DRIVER
+        value: local
+      - key: ALLOW_LOCAL_STORAGE_IN_PRODUCTION
+        value: "true"
+
+  - type: keyvalue
+    name: enmo-preview-kv
+    plan: free
+    region: frankfurt
+    # BullMQ must never have its keys evicted.
+    maxmemoryPolicy: noeviction
+    # Reachable only from services in this Render account.
+    ipAllowList: []
+
+databases:
+  - name: enmo-preview-db
+    databaseName: enmo
+    user: enmo
+    plan: free
+    region: frankfurt
+    postgresMajorVersion: "16"
+    ipAllowList: []

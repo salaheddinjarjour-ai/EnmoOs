@@ -11,6 +11,7 @@ const REDACTED = "[redacted]";
 const REDACT_PATHS = [
   "req.headers.cookie",
   "req.headers.authorization",
+  'req.headers["x-enmo-edge-auth"]',
   'res.headers["set-cookie"]',
   "*.password",
   "*.passwordHash",

@@ -4,6 +4,9 @@ import {
   CLOUDFLARE_IP_RANGES,
   clientIpGetter,
   clientIpPolicy,
+  EDGE_AUTH_HEADER,
+  EDGE_CLIENT_IP_HEADER,
+  edgeClientIp,
   ipRateLimitKey,
   isCloudflareEdge,
   isTrustedProxyEntry,
@@ -194,5 +197,43 @@ describe("ipRateLimitKey", () => {
     expect(ipRateLimitKey("::1")).toBe("0:0:0:0::/64");
     expect(ipRateLimitKey("fe80::1%eth0")).toBe("fe80:0:0:0::/64");
     expect(ipRateLimitKey("64:ff9b::192.0.2.33")).toBe("64:ff9b:0:0::/64");
+  });
+});
+
+describe("edgeClientIp (the web Worker's same-origin proxy)", () => {
+  const SECRET = "e".repeat(40);
+
+  it("believes X-Enmo-Client-IP only with the shared secret", () => {
+    const headers = { [EDGE_AUTH_HEADER]: SECRET, [EDGE_CLIENT_IP_HEADER]: " 203.0.113.9 " };
+    expect(edgeClientIp(headers, SECRET)).toBe("203.0.113.9");
+    expect(edgeClientIp(headers, undefined)).toBeNull();
+    expect(edgeClientIp({ ...headers, [EDGE_AUTH_HEADER]: "f".repeat(40) }, SECRET)).toBeNull();
+    expect(edgeClientIp({ ...headers, [EDGE_AUTH_HEADER]: "short" }, SECRET)).toBeNull();
+    expect(edgeClientIp({ [EDGE_CLIENT_IP_HEADER]: "203.0.113.9" }, SECRET)).toBeNull();
+    expect(edgeClientIp({ ...headers, [EDGE_CLIENT_IP_HEADER]: "not-an-ip" }, SECRET)).toBeNull();
+    expect(
+      edgeClientIp({ ...headers, [EDGE_CLIENT_IP_HEADER]: ["203.0.113.9", "6.6.6.6"] }, SECRET),
+    ).toBeNull();
+  });
+
+  it("names the visitor on request.clientIp, and falls back to the usual rules otherwise", async () => {
+    const policy = clientIpPolicy(["loopback", "uniquelocal", "cloudflare"]);
+    const app = Fastify({ trustProxy: policy.trustProxy });
+    app.decorateRequest("clientIp", { getter: clientIpGetter(policy, SECRET) });
+    app.get("/ip", (request) => ({ ip: request.clientIp }));
+    try {
+      const vouched = await app.inject({
+        url: "/ip",
+        headers: { [EDGE_AUTH_HEADER]: SECRET, [EDGE_CLIENT_IP_HEADER]: "203.0.113.9" },
+      });
+      expect(vouched.json()).toEqual({ ip: "203.0.113.9" });
+      const forged = await app.inject({
+        url: "/ip",
+        headers: { [EDGE_AUTH_HEADER]: "x".repeat(40), [EDGE_CLIENT_IP_HEADER]: "203.0.113.9" },
+      });
+      expect(forged.json()).toEqual({ ip: "127.0.0.1" });
+    } finally {
+      await app.close();
+    }
   });
 });

@@ -36,7 +36,9 @@ export async function buildApp(deps: Deps): Promise<ApiApp> {
   app.setValidatorCompiler(validatorCompiler);
   app.setSerializerCompiler(serializerCompiler);
   app.decorate("deps", deps);
-  app.decorateRequest("clientIp", { getter: clientIpGetter(clientIp) });
+  app.decorateRequest("clientIp", {
+    getter: clientIpGetter(clientIp, deps.config.EDGE_PROXY_SECRET),
+  });
 
   await app.register(errorsPlugin);
   await app.register(cookie);

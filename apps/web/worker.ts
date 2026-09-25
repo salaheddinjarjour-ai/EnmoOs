@@ -1,11 +1,15 @@
 // @ts-expect-error -- generated (untyped) by `opennextjs-cloudflare build`; wrangler bundles it.
 import openNextWorker from "./.open-next/worker.js";
+import { isApiPath, keepAliveUrl, proxyToApi } from "./src/edge/api-proxy";
 
-// Cloudflare Worker entry (wrangler.jsonc "main"): serves the Next app through OpenNext and, on
-// the every-5-minutes cron trigger, pings the API so Render's free tier never sleeps.
+// Cloudflare Worker entry (wrangler.jsonc "main"): forwards /v1/* and /files/* to the API (same
+// origin for the browser, see src/edge/api-proxy.ts), serves everything else through OpenNext, and
+// on the every-5-minutes cron trigger pings the API so Render's free tier never sleeps.
 
 /** The bindings this file reads; the runtime passes the full env through to OpenNext. */
 interface Env {
+  readonly API_ORIGIN?: string;
+  readonly EDGE_PROXY_SECRET?: string;
   readonly KEEPALIVE_URL?: string;
   readonly [binding: string]: unknown;
 }
@@ -41,9 +45,13 @@ async function pingApi(url: string): Promise<void> {
 }
 
 export default {
-  fetch: (request, env, ctx) => nextApp.fetch(request, env, ctx),
+  fetch: (request, env, ctx) =>
+    isApiPath(new URL(request.url).pathname)
+      ? proxyToApi(request, env)
+      : nextApp.fetch(request, env, ctx),
 
   scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): void {
-    if (env.KEEPALIVE_URL) ctx.waitUntil(pingApi(env.KEEPALIVE_URL));
+    const target = keepAliveUrl(env);
+    if (target) ctx.waitUntil(pingApi(target));
   },
 } satisfies WorkerHandler & Record<string, unknown>;

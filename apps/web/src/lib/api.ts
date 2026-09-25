@@ -11,10 +11,27 @@ import { z } from "zod";
  * - a 401 on an authenticated call runs the handler the AuthGate registers (session → /login)
  */
 
-export const API_URL = (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:4000").replace(
-  /\/+$/,
-  "",
-);
+/** NEXT_PUBLIC_API_URL value that sends API calls to the page's own origin. */
+export const SAME_ORIGIN_API = "same-origin";
+
+/**
+ * Where the API lives, baked in at build time from NEXT_PUBLIC_API_URL:
+ * - an absolute URL (local dev: http://localhost:4000): the browser calls the API cross-origin;
+ * - "same-origin" (production, apps/web/.env.production): "" here, so calls go to /v1/* on the
+ *   page's own origin, which the Cloudflare Worker forwards to the API (src/edge/api-proxy.ts).
+ */
+export const API_URL = resolveApiUrl(process.env.NEXT_PUBLIC_API_URL);
+
+export function resolveApiUrl(configured: string | undefined): string {
+  const value = (configured ?? "http://localhost:4000").trim();
+  return value === SAME_ORIGIN_API ? "" : value.replace(/\/+$/, "");
+}
+
+/** Absolute URL of an API path such as "/v1/events"; same-origin resolves against the page. */
+export function apiUrl(pathname: string, base: string = API_URL): URL {
+  const origin = typeof window === "undefined" ? "http://localhost" : window.location.origin;
+  return new URL(`${base}${pathname}`, origin);
+}
 
 export class ApiError extends Error {
   override readonly name = "ApiError";
@@ -56,7 +73,7 @@ export function apiPath(...segments: readonly string[]): string {
 }
 
 function buildUrl(path: string, query: ApiRequest<unknown>["query"]): string {
-  const url = new URL(`${API_URL}/v1${path.startsWith("/") ? path : `/${path}`}`);
+  const url = apiUrl(`/v1${path.startsWith("/") ? path : `/${path}`}`);
   for (const [key, value] of Object.entries(query ?? {})) {
     if (value !== undefined && value !== null) url.searchParams.set(key, String(value));
   }

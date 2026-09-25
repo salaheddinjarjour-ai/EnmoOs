@@ -523,18 +523,19 @@ combination stops the process at boot with a list of the problems, for example
 
 **Server**
 
-| Variable           | Default                            | Purpose                                                                                                                                                           |
-| ------------------ | ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `NODE_ENV`         | `development`                      | `development`, `test` or `production`. `production` makes `COOKIE_SECURE` default to true. `test` lets a built-in key stand in for `TOKEN_ENC_KEY`.               |
-| `LOG_LEVEL`        | `info` (`silent` under test)       | pino level: `fatal`, `error`, `warn`, `info`, `debug`, `trace`, `silent`.                                                                                         |
-| `HOST`             | `0.0.0.0`                          | Bind address.                                                                                                                                                     |
-| `PORT`             | `4000`                             | HTTP port. Render injects its own.                                                                                                                                |
-| `API_PUBLIC_URL`   | `http://localhost:$PORT`           | Public base URL of the API, used for OAuth callbacks and local file URLs. Production: `https://api.enmo.marketing`.                                               |
-| `TRUST_PROXY`      | `false`                            | Proxies to believe about the client IP, so rate limits and audit rows see client IPs. Render: `loopback,uniquelocal,cloudflare` (see _Client IPs_). Never `true`. |
-| `APP_ORIGINS`      | `http://localhost:3000`            | Comma-separated exact origins (no path, no trailing slash) for CORS and the CSRF origin check. The first one is the web app.                                      |
-| `COOKIE_DOMAIN`    | unset (host-only cookie)           | Session cookie domain. Production: `.enmo.marketing`.                                                                                                             |
-| `COOKIE_SECURE`    | `true` in production, else `false` | `Secure` flag on the `enmo_session` cookie.                                                                                                                       |
-| `SESSION_TTL_DAYS` | `30`                               | Session lifetime. Sessions roll forward while in use.                                                                                                             |
+| Variable            | Default                            | Purpose                                                                                                                                                                        |
+| ------------------- | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `NODE_ENV`          | `development`                      | `development`, `test` or `production`. `production` makes `COOKIE_SECURE` default to true. `test` lets a built-in key stand in for `TOKEN_ENC_KEY`.                            |
+| `LOG_LEVEL`         | `info` (`silent` under test)       | pino level: `fatal`, `error`, `warn`, `info`, `debug`, `trace`, `silent`.                                                                                                      |
+| `HOST`              | `0.0.0.0`                          | Bind address.                                                                                                                                                                  |
+| `PORT`              | `4000`                             | HTTP port. Render injects its own.                                                                                                                                             |
+| `API_PUBLIC_URL`    | `http://localhost:$PORT`           | Public base URL of the API, used for OAuth callbacks and local file URLs. Behind the web Worker's proxy (`EDGE_PROXY_SECRET` set) it defaults to the web app's address.        |
+| `TRUST_PROXY`       | `false`                            | Proxies to believe about the client IP, so rate limits and audit rows see client IPs. Render: `loopback,uniquelocal,cloudflare` (see _Client IPs_). Never `true`.              |
+| `EDGE_PROXY_SECRET` | unset                              | Shared with the web Worker (32+ characters). The Worker forwards the browser's API calls and names the visitor in `X-Enmo-Client-IP`, which is believed only with this secret. |
+| `APP_ORIGINS`       | `http://localhost:3000`            | Comma-separated exact origins (no path, no trailing slash) for CORS and the CSRF origin check. The first one is the web app.                                                   |
+| `COOKIE_DOMAIN`     | unset (host-only cookie)           | Session cookie domain. Production: `.enmo.marketing`.                                                                                                                          |
+| `COOKIE_SECURE`     | `true` in production, else `false` | `Secure` flag on the `enmo_session` cookie.                                                                                                                                    |
+| `SESSION_TTL_DAYS`  | `30`                               | Session lifetime. Sessions roll forward while in use.                                                                                                                          |
 
 **Data**
 
@@ -626,10 +627,12 @@ combination stops the process at boot with a list of the problems, for example
 
 ### Web (`apps/web`)
 
-| Variable              | Default                              | Purpose                                                                                                                                                                |
-| --------------------- | ------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `NEXT_PUBLIC_API_URL` | `http://localhost:4000`              | API base URL, **inlined at build time**. Production builds default to `https://api.enmo.marketing` (`apps/web/.env.production`); the environment or `.env.local` wins. |
-| `KEEPALIVE_URL`       | `https://api.enmo.marketing/healthz` | Worker var in `wrangler.jsonc`. The every-5-minutes cron pings it.                                                                                                     |
+| Variable              | Default                   | Purpose                                                                                                                                                                                                                                                    |
+| --------------------- | ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `NEXT_PUBLIC_API_URL` | `http://localhost:4000`   | API base URL, **inlined at build time**. Production builds default to `same-origin` (`apps/web/.env.production`): the browser calls `/v1/*` on the web app's own address and the Worker forwards it to `API_ORIGIN`. The environment or `.env.local` wins. |
+| `API_ORIGIN`          | none                      | Worker variable (dashboard): the API's origin, e.g. `https://enmo-api.onrender.com`. `/v1/*` and `/files/*` are forwarded to it; without it they answer 503.                                                                                               |
+| `EDGE_PROXY_SECRET`   | none                      | Worker secret (dashboard): the API's `EDGE_PROXY_SECRET`, so the API sees each visitor's address.                                                                                                                                                          |
+| `KEEPALIVE_URL`       | `API_ORIGIN` + `/healthz` | Optional Worker variable. The every-5-minutes cron pings it so a free Render service never sleeps.                                                                                                                                                         |
 
 ### Database package (`packages/db`)
 
@@ -669,11 +672,12 @@ Render redeploys each commit after CI passes (`autoDeployTrigger: checksPass`).
 | `api.enmo.marketing`    | `CNAME enmo-api.onrender.com`           | You, after Render lists the domain (`domains` in `render.yaml`)                            |
 | `assets.enmo.marketing` | R2 bucket `enmo-assets` (custom domain) | R2 → bucket → Settings → Custom Domains                                                    |
 
-The API sets `enmo_session` as `HttpOnly; Secure; SameSite=Lax; Domain=.enmo.marketing`.
-`app.` and `api.` are the same _site_, so the browser sends that cookie with the web app's
-credentialed `fetch` and `EventSource` calls. The default hostnames (`*.onrender.com` and
-`*.workers.dev`) are different sites, and there the cookie would be dropped. So always put both
-behind `enmo.marketing`. `APP_ORIGINS` must be exactly `https://app.enmo.marketing`.
+The browser only ever talks to the web app. Its Worker forwards `/v1/*` (the API, the SSE stream
+included) and `/files/*` to `API_ORIGIN` (`apps/web/src/edge/api-proxy.ts`), so the `enmo_session`
+cookie is first-party on whatever host serves the web app: `app.enmo.marketing`, or the Worker's
+`workers.dev` address before any DNS exists. `APP_ORIGINS` must be exactly the web app's address.
+The Worker and the API share `EDGE_PROXY_SECRET`, which lets the API believe the visitor address the
+Worker forwards (otherwise every visitor shares Cloudflare's Workers egress address).
 
 For `api.`, start with the record **DNS only** (grey cloud) until Render has issued its
 certificate. If you proxy it afterwards, use SSL mode _Full (strict)_. The 15 s SSE heartbeat keeps
@@ -692,6 +696,25 @@ production. After the first deploy (and after changing the cloud colour), sign i
 `remoteAddress` in the API's request log is your own public IP. If it shows a `10.x` address, a
 Render hop is missing from `TRUST_PROXY`. If it shows a Cloudflare address, `cloudflare` is missing
 or `CF-Connecting-IP` is not reaching the API.
+
+### Quick preview (free: Render + the Worker's workers.dev address)
+
+`render.preview.yaml` runs the whole backend on Render's free plan: one web service with the queue
+workers inside, a free Key Value instance (Redis) and a free Postgres 16. It uses the mock LLM, mock
+visuals and dry-run publishing, so it needs no API keys. See the file's header for the free plan's
+limits (sleeping, a disk wiped on every deploy, databases deleted after 30 days).
+
+1. Deploy the web app first (section 4 below), so you know its address:
+   `https://enmoos.<your-subdomain>.workers.dev`.
+2. Render → **New → Blueprint** → this repository and branch → Blueprint path
+   `render.preview.yaml`. Fill in `APP_ORIGINS` (the workers.dev address, no trailing slash),
+   `SEED_ADMIN_EMAIL` and `SEED_ADMIN_PASSWORD` (12+ characters), then apply.
+3. When `enmo-api-preview` is live, copy its URL (`https://enmo-api-preview.onrender.com`, or with a
+   suffix Render added) and its generated `EDGE_PROXY_SECRET` (service → Environment).
+4. Cloudflare → Workers → `enmoos` → Settings → Variables and Secrets: add `API_ORIGIN` (text) = the
+   Render URL and `EDGE_PROXY_SECRET` (secret) = the copied value. `keep_vars` keeps them on later
+   deploys.
+5. Open the workers.dev address and sign in with the seed admin.
 
 ### 1. Upstash Redis
 
@@ -786,10 +809,11 @@ minutes to keep it awake.
 
 `apps/web/wrangler.jsonc` sets up the Worker `enmoos`:
 
-- entry `worker.ts`, which is the OpenNext handler plus a keep-alive cron
+- entry `worker.ts`: `/v1/*` and `/files/*` go to `API_ORIGIN`, everything else to OpenNext, plus a
+  keep-alive cron
 - the flags `nodejs_compat` and `global_fetch_strictly_public`
 - static assets from `.open-next/assets`
-- the cron `*/5 * * * *`, which pings `KEEPALIVE_URL`
+- the cron `*/5 * * * *`, which pings `API_ORIGIN` + `/healthz` (or `KEEPALIVE_URL`)
 
 It serves on the Worker's `workers.dev` address. To put it on `app.enmo.marketing`, add the custom
 domain under the Worker's _Settings → Domains & Routes_, or uncomment `routes` in `wrangler.jsonc`.
@@ -799,14 +823,13 @@ Cloudflare Workers_ template, with the `enmo.marketing` zone included:
 
 ```sh
 export CLOUDFLARE_API_TOKEN=…  CLOUDFLARE_ACCOUNT_ID=…
-NEXT_PUBLIC_API_URL=https://api.enmo.marketing pnpm --filter @enmo/web run deploy
+pnpm --filter @enmo/web run deploy
 ```
 
 - Write `run deploy`: plain `pnpm deploy` is a built-in pnpm command, not the package script.
-- `NEXT_PUBLIC_API_URL` is compiled into the client bundle. Changing the API URL needs a rebuild,
-  not a Worker variable. Production builds fall back to `https://api.enmo.marketing` from
-  `apps/web/.env.production`, so a deploy without it can't ship a bundle that calls localhost.
-  For a local production build (`next start`, `preview`) against a local API, keep
+- Production builds use `NEXT_PUBLIC_API_URL=same-origin` from `apps/web/.env.production`, so the
+  bundle never names the API: moving the API only means changing the Worker's `API_ORIGIN`. For a
+  local production build (`next start`) against a local API, keep
   `NEXT_PUBLIC_API_URL=http://localhost:4000` in `apps/web/.env.local`.
 - `pnpm --filter @enmo/web run preview` builds the Worker and serves it locally in workerd.
 - The app uses no middleware and no image optimisation (`images.unoptimized`), because OpenNext on
@@ -817,19 +840,18 @@ monorepo, so the dashboard's defaults (`npm run build`, then `npx wrangler deplo
 fail: the root has no Wrangler config, and a plain `next build` doesn't produce the Worker. In the
 Worker's _Settings → Build_, set:
 
-| Setting        | Value                                                                           |
-| -------------- | ------------------------------------------------------------------------------- |
-| Root directory | `/` (the repo root, so pnpm installs the whole workspace)                       |
-| Build command  | `pnpm --filter @enmo/web run build:cf`                                          |
-| Deploy command | `pnpm --filter @enmo/web exec wrangler deploy`                                  |
-| Build variable | `NEXT_PUBLIC_API_URL` = your API URL (defaults to `https://api.enmo.marketing`) |
+| Setting        | Value                                                     |
+| -------------- | --------------------------------------------------------- |
+| Root directory | `/` (the repo root, so pnpm installs the whole workspace) |
+| Build command  | `pnpm --filter @enmo/web run build:cf`                    |
+| Deploy command | `pnpm --filter @enmo/web exec wrangler deploy`            |
 
 - The Worker's name in the dashboard must match `"name"` in `apps/web/wrangler.jsonc` (`enmoos`,
   also used by the `WORKER_SELF_REFERENCE` service binding). If you rename the Worker, change both.
 - The `app.enmo.marketing` custom domain needs the `enmo.marketing` zone in the same Cloudflare
   account and no existing DNS record for `app`.
-- The web app only works end to end once the API is live: sign-in cookies are scoped to
-  `.enmo.marketing`, so the web app and API must be served from `app.` and `api.enmo.marketing`.
+- Under _Settings → Variables and Secrets_, set `API_ORIGIN` and `EDGE_PROXY_SECRET` (see the
+  Web variables above). Until the API is live, the pages load but every API call answers 503.
 
 ## Credentials needed later
 

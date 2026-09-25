@@ -24,9 +24,13 @@
     // Render's free tier sleeps after 15 idle minutes.
     "crons": ["*/5 * * * *"],
   },
-  "vars": {
-    "KEEPALIVE_URL": "https://api.enmo.marketing/healthz",
-  },
+  // Set in the dashboard (Worker → Settings → Variables and Secrets), never here, so deploys keep
+  // them (keep_vars):
+  //   API_ORIGIN         the API's origin, e.g. https://enmo-api.onrender.com; /v1/* and /files/*
+  //                      are forwarded to it (src/edge/api-proxy.ts) and the cron pings its /healthz
+  //   EDGE_PROXY_SECRET  (secret) the same value as the API's EDGE_PROXY_SECRET
+  //   KEEPALIVE_URL      optional; overrides API_ORIGIN + /healthz for the cron
+  "keep_vars": true,
   "observability": {
     "enabled": true,
     // Invocation logs record every request URL, and /invite/<token> carries a one-time secret

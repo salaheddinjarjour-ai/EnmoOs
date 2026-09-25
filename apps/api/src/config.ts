@@ -113,6 +113,12 @@ const EnvSchema = z.object({
   API_PUBLIC_URL: HttpUrl.optional(),
   /** Proxies to believe about the client's IP, so rate limits and audit rows see clients. */
   TRUST_PROXY: TrustProxy.default(false),
+  /**
+   * Shared with the web Worker's EDGE_PROXY_SECRET. The Worker forwards the browser's API calls
+   * (same-origin mode) and names the visitor in X-Enmo-Client-IP; the header is believed only when
+   * X-Enmo-Edge-Auth carries this secret. Unset: the header is ignored.
+   */
+  EDGE_PROXY_SECRET: z.string().trim().min(32).optional(),
   /** Exact web origins allowed by CORS and the CSRF origin check. The first is the web app URL. */
   APP_ORIGINS: commaList(Origin).default(["http://localhost:3000"]),
   /** e.g. ".enmo.marketing"; unset → host-only cookie (local dev). */
@@ -422,9 +428,12 @@ function resolveConfig(env: Env) {
     throw new ConfigError(`Invalid API configuration:\n  - ${problems.join("\n  - ")}`);
   }
 
-  const apiPublicUrl = env.API_PUBLIC_URL ?? `http://localhost:${env.PORT}`;
   // APP_ORIGINS' schema guarantees at least one entry.
   const appPublicUrl: string = env.APP_PUBLIC_URL ?? (env.APP_ORIGINS[0] as string);
+  // Behind the web Worker's same-origin proxy (EDGE_PROXY_SECRET), the web app's address is also
+  // the API's public address: OAuth callbacks and /files URLs go through the proxy.
+  const apiPublicUrl =
+    env.API_PUBLIC_URL ?? (env.EDGE_PROXY_SECRET ? appPublicUrl : `http://localhost:${env.PORT}`);
   return Object.freeze({
     ...env,
     LOG_LEVEL: env.LOG_LEVEL ?? (isTest ? "silent" : "info"),
