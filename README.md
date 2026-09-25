@@ -699,16 +699,20 @@ or `CF-Connecting-IP` is not reaching the API.
 
 ### Quick preview (free: Render + the Worker's workers.dev address)
 
-`render.preview.yaml` runs the whole backend on Render's free plan: one web service with the queue
-workers inside, a free Key Value instance (Redis) and a free Postgres 16. It uses the mock LLM, mock
-visuals and dry-run publishing, so it needs no API keys. See the file's header for the free plan's
-limits (sleeping, a disk wiped on every deploy, databases deleted after 30 days).
+`render.preview.yaml` runs the backend on Render's free plan: one web service with the queue workers
+inside and a free Key Value instance (Redis). Postgres comes from `DATABASE_URL`, and any Postgres
+14+ works, even one another app already uses: ENMO keeps its tables in its own schema
+(`?schema=enmo`). A Render workspace gets only one free database, so sharing is often the way. It
+uses the mock LLM, mock visuals and dry-run publishing, so it needs no API keys. See the file's
+header for the free plan's limits (sleeping, a disk wiped on every deploy).
 
 1. Deploy the web app first (section 4 below), so you know its address:
    `https://<worker-name>.<your-subdomain>.workers.dev`.
 2. Render → **New → Blueprint** → this repository and branch → Blueprint path
    `render.preview.yaml`. Fill in `APP_ORIGINS` (the workers.dev address, no trailing slash),
-   `SEED_ADMIN_EMAIL` and `SEED_ADMIN_PASSWORD` (12+ characters), then apply.
+   `SEED_ADMIN_EMAIL` and `SEED_ADMIN_PASSWORD` (12+ characters) and `DATABASE_URL`: a Postgres
+   URL followed by `?sslmode=require&schema=enmo` (for a Render database in another region, its
+   _External Database URL_), then apply.
 3. When `enmo-api-preview` is live, copy its URL (`https://enmo-api-preview.onrender.com`, or with a
    suffix Render added) and its generated `EDGE_PROXY_SECRET` (service → Environment).
 4. Cloudflare → Workers → your Worker (`enmo-web`) → Settings → Variables and Secrets: add `API_ORIGIN` (text) = the
