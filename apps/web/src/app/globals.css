@@ -19,6 +19,44 @@
 
   --animate-agent-pulse: agent-pulse 2.4s var(--ease-enmo) infinite;
   --animate-shimmer: shimmer 1.6s linear infinite;
+  --animate-nav-in: nav-in 480ms var(--ease-enmo) both;
+  --animate-badge-in: badge-in 320ms var(--ease-enmo) both;
+  --animate-fade-in: fade-in 260ms var(--ease-enmo) both;
+
+  /* Sidebar rows arriving (staggered by animation-delay): a short slide, no overshoot. */
+  @keyframes nav-in {
+    from {
+      opacity: 0;
+      transform: translateX(-8px);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+
+  /* A count badge settling in when its number changes. */
+  @keyframes badge-in {
+    from {
+      opacity: 0;
+      transform: scale(0.6);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+
+  @keyframes fade-in {
+    from {
+      opacity: 0;
+      transform: translateY(2px);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
 
   /* Soft green halo for active agents: grows and fades, never bounces. */
   @keyframes agent-pulse {

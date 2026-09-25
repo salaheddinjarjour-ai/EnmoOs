@@ -86,7 +86,7 @@ export function UserMenu() {
         >
           {initials(user.name) || "·"}
         </span>
-        <span className="max-w-40 truncate text-paper/90">{user.name}</span>
+        <span className="hidden max-w-40 truncate text-paper/90 sm:inline">{user.name}</span>
         <svg
           aria-hidden
           viewBox="0 0 16 16"

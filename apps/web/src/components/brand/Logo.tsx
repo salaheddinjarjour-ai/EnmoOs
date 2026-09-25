@@ -41,3 +41,24 @@ export function Logo({ className = "", title = "ENMO" }: { className?: string; t
     </svg>
   );
 }
+
+/** The O on its own (with its notch): the mark for tight spaces such as the folded sidebar. */
+export function LogoMark({
+  className = "",
+  title = "ENMO",
+}: {
+  className?: string;
+  title?: string;
+}) {
+  return (
+    <svg
+      role="img"
+      aria-label={title}
+      viewBox="350 -3 106 106"
+      className={cx("inline-block size-[1em] shrink-0 overflow-visible", className)}
+    >
+      <path d={`${O_DISC}${O_CUTOUT}`} fill="currentColor" fillRule="evenodd" />
+      <path d={O_NOTCH} className="fill-enmo stroke-enmo" strokeWidth={4} strokeLinejoin="round" />
+    </svg>
+  );
+}
