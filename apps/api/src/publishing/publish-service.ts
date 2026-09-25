@@ -36,12 +36,12 @@ import {
   syncPostPublishStatus,
 } from "../orchestrator/publishing";
 import {
-  activeAccountOf,
   archivedOf,
   loadPublishJob,
   payloadOf,
   publisherFor,
   publishesLive,
+  publishingAccountOf,
   type PublishJobWithContext,
 } from "./context";
 import { checkPublishGuards, decryptAccount } from "./guards";
@@ -185,10 +185,13 @@ interface PublishMode {
  * PUBLISH_MODE is live, the platform has credentials and there is an account). Scheduling only
  * forecast it, so a kill switch (PUBLISH_MODE=dry-run, credentials removed) never passes a
  * simulated post off as live, and a post scheduled before its account was connected goes out for
- * real. The account is the job's own, or else the client's current one. A job scheduled live
- * whose account is gone stays live: the token guard fails it, so people reconnect rather than
- * find a simulated post. A job already PUBLISHING (a BullMQ retry after a crash) keeps what its
- * first claim settled: that attempt may have media at the platform already.
+ * real. The account is the job's own, or else the client's publishing account. While the client
+ * has any account on the platform the job is live, even without one it can use: scheduled live
+ * with its account gone since, a publishing account that expired, several connected and none
+ * chosen. The token guard fails it then, so people reconnect or choose rather than find a
+ * simulated post while real accounts are connected. A job already PUBLISHING (a BullMQ retry
+ * after a crash) keeps what its first claim settled: that attempt may have media at the platform
+ * already.
  */
 async function publishModeOf(
   tx: DbTransaction,
@@ -199,8 +202,11 @@ async function publishModeOf(
   if (job.status === "PUBLISHING") return stored;
   if (!publishesLive(deps, job.platform)) return { ...stored, dryRun: true };
   if (job.socialAccountId) return { ...stored, dryRun: false };
-  const account = await activeAccountOf(tx, job.variant.post.clientId, job.platform);
-  return account ? { dryRun: false, socialAccountId: account.id } : stored;
+  const { clientId } = job.variant.post;
+  const account = await publishingAccountOf(tx, clientId, job.platform);
+  if (account) return { dryRun: false, socialAccountId: account.id };
+  const connected = await tx.socialAccount.count({ where: { clientId, platform: job.platform } });
+  return connected > 0 ? { dryRun: false, socialAccountId: null } : stored;
 }
 
 /** QUEUED for this attempt, or already PUBLISHING on it (a BullMQ retry after a crash). */
@@ -234,6 +240,7 @@ async function claim(deps: Deps, data: PublishRunJob): Promise<Claim> {
 
     const guard = await checkPublishGuards(tx, deps.tokenCipher, {
       postId: post.id,
+      clientId: post.clientId,
       archived: archivedOf(job),
       copy: post.copy,
       bannedWords: post.client.bannedWords,
@@ -246,7 +253,11 @@ async function claim(deps: Deps, data: PublishRunJob): Promise<Claim> {
       now: deps.clock.now(),
     });
     if (!guard.ok) {
-      const refusal = await refuseIn(tx, deps, events, job, ref, guard.failure);
+      // The refused job keeps the mode it was to go out in: a live one failed, nothing simulated.
+      if (mode.dryRun !== job.dryRun || mode.socialAccountId !== job.socialAccountId) {
+        await tx.publishJob.update({ where: { id: job.id }, data: mode });
+      }
+      const refusal = await refuseIn(tx, deps, events, { ...job, ...mode }, ref, guard.failure);
       return { kind: "settled", revisedGraph: refusal.revisedGraph };
     }
     const prepared = payloadOf(deps, job);

@@ -263,6 +263,43 @@ describe("archiving", () => {
     );
   });
 
+  it("leaves a retry resuming what reached the platform to the publish guard", async () => {
+    const client = await createClient();
+    const seeded = await seedPublishPost({
+      createdBy: team.admin,
+      client,
+      status: "PUBLISHING",
+      jobs: [
+        { platform: "FACEBOOK", scheduledFor: TUESDAY_1100 },
+        {
+          platform: "INSTAGRAM",
+          status: "QUEUED",
+          scheduledFor: new Date(),
+          attempts: 1,
+          containerId: "IG_IMAGE;items=17890000000000001",
+        },
+      ],
+    });
+
+    const response = await send(
+      "POST",
+      `/v1/campaigns/${seeded.campaignId}/archive`,
+      team.cookies.admin,
+    );
+    expect(response.statusCode, response.body).toBe(200);
+    const db = testDb();
+    expect(
+      await db.publishJob.findUniqueOrThrow({ where: { id: seeded.jobs.FACEBOOK!.id } }),
+    ).toMatchObject({ status: "CANCELLED", lastError: PUBLISH_CANCEL_REASONS.campaignArchived });
+    // Calling it off would drop the only record of what Instagram may have published already.
+    expect(
+      await db.publishJob.findUniqueOrThrow({ where: { id: seeded.jobs.INSTAGRAM!.id } }),
+    ).toMatchObject({ status: "QUEUED", containerId: "IG_IMAGE;items=17890000000000001" });
+    expect((await db.post.findUniqueOrThrow({ where: { id: seeded.post.id } })).status).toBe(
+      "PUBLISHING",
+    );
+  });
+
   it("calls off every waiting publish job of an archived client, leaving what is out", async () => {
     const client = await createClient();
     const first = await seedPublishPost({

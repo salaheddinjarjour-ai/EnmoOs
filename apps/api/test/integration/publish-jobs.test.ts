@@ -148,6 +148,50 @@ describe("POST /v1/publish-jobs (schedule)", () => {
     ]);
   });
 
+  it("puts a platform on a day after the rest of the post went out: LIVE is PUBLISHING again", async () => {
+    const { post } = await unscheduledPost({
+      status: "LIVE",
+      jobs: [
+        {
+          platform: "INSTAGRAM",
+          status: "PUBLISHED",
+          scheduledFor: "2027-03-01T05:00:00.000Z",
+          attempts: 1,
+          publishedAt: new Date("2027-03-01T05:00:05.000Z"),
+          liveUrl: "https://dryrun.enmo.marketing/instagram/variant",
+        },
+      ],
+    });
+    await testDb().post.update({
+      where: { id: post.id },
+      data: {
+        attentionReason:
+          "Not scheduled on Facebook: no free slot is left in the campaign window (2027-03-01 to 2027-03-02); put it on a day on the calendar",
+      },
+    });
+    const response = await send("POST", "/v1/publish-jobs", cookies.manager, {
+      postId: post.id,
+      platform: "FACEBOOK",
+      date: WEDNESDAY,
+    });
+    expect(response.statusCode, response.body).toBe(201);
+    expect(response.json<PublishJobDto>()).toMatchObject({
+      platform: "FACEBOOK",
+      status: "SCHEDULED",
+      date: WEDNESDAY,
+      slotSource: "manual",
+    });
+    expect(await testDb().post.findUniqueOrThrow({ where: { id: post.id } })).toMatchObject({
+      status: "PUBLISHING",
+      needsAttention: false,
+      attentionReason: null,
+    });
+    const postEvents = await testDb().realtimeEvent.findMany({ where: { type: "post.updated" } });
+    expect(postEvents.map((row) => row.payload)).toContainEqual(
+      expect.objectContaining({ postId: post.id, status: "PUBLISHING" }),
+    );
+  });
+
   it("puts a platform whose job was cancelled back on that row, its attempts moving on", async () => {
     const { jobs, post } = await unscheduledPost({
       jobs: [
@@ -194,11 +238,11 @@ describe("POST /v1/publish-jobs (schedule)", () => {
     const notApproved = await schedule(pending.post.id);
     expect(notApproved.statusCode).toBe(409);
     expect(notApproved.json()).toMatchObject({
-      error: {
-        message:
-          "Only an approved post with nothing out yet can be scheduled; this one is pending approval",
-      },
+      error: { message: "Only an approved post can be scheduled; this one is pending approval" },
     });
+    // A scored post is done with.
+    const scored = await unscheduledPost({ status: "SCORED", ref: "p4" });
+    expect((await schedule(scored.post.id)).statusCode).toBe(409);
 
     // Checked as the Publisher checks it: no visuals, nothing to publish.
     const bare = await seedPublishPost({ createdBy: admin, client, status: "APPROVED", ref: "p3" });
@@ -758,6 +802,49 @@ describe("POST /v1/publish-jobs/:id/cancel", () => {
     });
     const dto = await send("GET", `/v1/posts/${post.id}`, cookies.admin);
     expect(dto.json<{ editable: boolean }>().editable).toBe(true);
+  });
+
+  it("refuses to cancel a retry resuming a container that already reached the platform", async () => {
+    const { jobs, post } = await seedPublishPost({
+      createdBy: admin,
+      client,
+      status: "PUBLISHING",
+      platforms: ["INSTAGRAM"],
+      jobs: [
+        {
+          platform: "INSTAGRAM",
+          status: "QUEUED",
+          scheduledFor: "2027-03-01T05:00:00.000Z",
+          attempts: 1,
+          dryRun: false,
+          lastError: "Instagram is unavailable: Meta did not answer POST /v26.0/1789/media_publish",
+          containerId: "IG_IMAGE;items=17890000000000001",
+        },
+      ],
+    });
+    const response = await send(
+      "POST",
+      `/v1/publish-jobs/${jobs.INSTAGRAM!.id}/cancel`,
+      cookies.admin,
+    );
+    expect(response.statusCode, response.body).toBe(409);
+    expect(response.json()).toMatchObject({
+      error: {
+        message:
+          "This Instagram job is retrying a publish that already reached Instagram, so it can't be cancelled until that settles",
+        details: { status: "QUEUED" },
+      },
+    });
+    expect(
+      await testDb().publishJob.findUniqueOrThrow({ where: { id: jobs.INSTAGRAM!.id } }),
+    ).toMatchObject({
+      status: "QUEUED",
+      containerId: "IG_IMAGE;items=17890000000000001",
+    });
+    expect((await testDb().post.findUniqueOrThrow({ where: { id: post.id } })).status).toBe(
+      "PUBLISHING",
+    );
+    expect(await auditOf(AUDIT_ACTIONS.publishCancel)).toEqual([]);
   });
 
   it.each(["PUBLISHING", "PUBLISHED", "CANCELLED"] as const)(

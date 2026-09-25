@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { canTransition } from "./post-status";
-import { LIFECYCLE_CANCEL_MESSAGES, postStatusForJobs, PUBLISH_CANCEL_REASONS } from "./publishing";
+import { canTransition, FROZEN_POST_STATUSES } from "./post-status";
+import {
+  countedPublishStatus,
+  LIFECYCLE_CANCEL_MESSAGES,
+  postStatusForJobs,
+  PUBLISH_CANCEL_REASONS,
+} from "./publishing";
 
 /* How a post's publish jobs move it (orchestrator/publishing.ts syncPostPublishStatus). */
 
@@ -40,10 +45,30 @@ describe("postStatusForJobs", () => {
       ["SCHEDULED", "APPROVED"], // every job called off
       ["FAILED", "LIVE"], // the failed variant cancelled while the rest is out
       ["FAILED", "APPROVED"], // the only job failed, then cancelled
+      ["LIVE", "PUBLISHING"], // a platform nothing was scheduled on put on a day afterwards
     ];
     for (const [from, to] of moves) expect(canTransition(from, to), `${from} → ${to}`).toBe(true);
     expect(canTransition("LIVE", "SCHEDULED")).toBe(false);
     expect(canTransition("APPROVED", "LIVE")).toBe(false);
+  });
+});
+
+describe("countedPublishStatus", () => {
+  it("counts a QUEUED retry resuming what reached the platform as PUBLISHING", () => {
+    expect(countedPublishStatus({ status: "QUEUED", containerId: "IG_IMAGE;items=1789" })).toBe(
+      "PUBLISHING",
+    );
+    // Queued for its slot, or retried before anything reached the platform: still waiting.
+    expect(countedPublishStatus({ status: "QUEUED", containerId: null })).toBe("QUEUED");
+    for (const status of ["SCHEDULED", "PUBLISHING", "PUBLISHED", "FAILED", "CANCELLED"] as const) {
+      expect(countedPublishStatus({ status, containerId: "IG_IMAGE;items=1789" })).toBe(status);
+    }
+  });
+
+  it("keeps a post whose only job is resuming its container PUBLISHING, frozen", () => {
+    const resuming = countedPublishStatus({ status: "QUEUED", containerId: "FB_REEL;items=9" });
+    expect(postStatusForJobs([resuming])).toBe("PUBLISHING");
+    expect(FROZEN_POST_STATUSES.has(postStatusForJobs([resuming]))).toBe(true);
   });
 });
 

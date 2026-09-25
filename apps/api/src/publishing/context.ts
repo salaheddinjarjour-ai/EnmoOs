@@ -92,6 +92,21 @@ export function activeAccountOf(
   });
 }
 
+/**
+ * The client's publishing account on the platform whatever its status (an expired one included),
+ * or null when it has none chosen.
+ */
+export function publishingAccountOf(
+  db: Db,
+  clientId: string,
+  platform: Platform,
+): Promise<{ id: string } | null> {
+  return db.socialAccount.findFirst({
+    where: { clientId, platform, isPrimary: true },
+    select: { id: true },
+  });
+}
+
 /** Whether the platform's publisher calls the platform (PUBLISH_MODE live, with credentials). */
 export function publishesLive(deps: Pick<Deps, "publishers">, platform: Platform): boolean {
   return deps.publishers[platform].mode === "live";

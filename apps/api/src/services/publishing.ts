@@ -24,7 +24,12 @@ import { lockReopenableRounds } from "../orchestrator/approval-round";
 import { EventBatch } from "../orchestrator/events";
 import { lockPost } from "../orchestrator/locks";
 import { postUpdated } from "../orchestrator/post-status";
-import { publishUpdated, syncPostPublishStatus } from "../orchestrator/publishing";
+import {
+  countedPublishStatus,
+  NOT_YET_OUT,
+  publishUpdated,
+  syncPostPublishStatus,
+} from "../orchestrator/publishing";
 import { activeAccountOf, copyOf, currentTakesOf } from "../publishing/context";
 import { announceLive } from "../publishing/outcomes";
 import { isUnscheduledAttention, variantProblem } from "../publishing/schedule";
@@ -54,7 +59,11 @@ export { listCalendar } from "./calendar";
 
 const AUDITED_ENTITY = "PublishJob";
 
-/** Post statuses that follow their publish jobs; any other means it went back to approval. */
+/**
+ * Post statuses that follow their publish jobs; any other means it went back to approval (or, once
+ * SCORED, the post is done). A platform of such a post can still be put on a day: the rest being
+ * out (or failed) doesn't stop a platform nothing was scheduled on from going out later.
+ */
 const PUBLISHING_POST_STATUSES: ReadonlySet<PostStatus> = new Set([
   "APPROVED",
   "SCHEDULED",
@@ -131,6 +140,15 @@ function wrongStatus(job: Pick<PublishJob, "platform" | "status">, action: strin
   return conflict(`${what}, so it can't be ${action}`, { status: job.status });
 }
 
+/** A QUEUED retry resuming what an earlier attempt sent the platform is under way already. */
+function resumingPublish(job: Pick<PublishJob, "platform" | "status">): Error {
+  const label = PLATFORM_LABEL[job.platform];
+  return conflict(
+    `This ${label} job is retrying a publish that already reached ${label}, so it can't be cancelled until that settles`,
+    { status: job.status },
+  );
+}
+
 interface Change {
   /** The job as it ends up. */
   job: PublishJob;
@@ -196,9 +214,6 @@ async function expectUpdated(
   throw wrongStatus({ platform: job.platform, status: now?.status ?? job.status }, action);
 }
 
-/** Post statuses a platform can still be scheduled from: approved, and none of it out yet. */
-const SCHEDULABLE_POST_STATUSES: ReadonlySet<PostStatus> = new Set(["APPROVED", "SCHEDULED"]);
-
 /** Every platform of the post that takes its type has a job that counts (not CANCELLED). */
 async function fullyScheduled(tx: DbTransaction, postId: string): Promise<boolean> {
   const post = await tx.post.findUniqueOrThrow({
@@ -221,11 +236,12 @@ async function fullyScheduled(tx: DbTransaction, postId: string): Promise<boolea
  * scheduled there, put at the best free hour of `date` in the client's calendar (bestSlotOn, no
  * LLM; slotSource "manual"). This is how a post the Publisher couldn't place inside its campaign
  * window (full, or already over) goes out: the day, even one outside the window, is the teammate's
- * call. The variant is checked as the Publisher checks it (publishing rules, banned words), and
- * scheduling the post's last unscheduled platform answers the Publisher's flag. Audited
- * publish.schedule. CONFLICT unless the post stands approved with nothing of it out and the
- * platform has no job that counts, or when the day has no free slot; UNPROCESSABLE when the
- * variant can't go out; NOT_FOUND when the post is missing.
+ * call, and the post's other platforms may be out already (a LIVE post is PUBLISHING again until
+ * this one is out too). The variant is checked as the Publisher checks it (publishing rules,
+ * banned words), and scheduling the post's last unscheduled platform answers the Publisher's flag.
+ * Audited publish.schedule. CONFLICT unless the post stands approved (its status one that follows
+ * its publish jobs) and the platform has no job that counts, or when the day has no free slot;
+ * UNPROCESSABLE when the variant can't go out; NOT_FOUND when the post is missing.
  */
 export async function schedule(
   deps: Deps,
@@ -254,11 +270,11 @@ export async function schedule(
       );
     }
     if (
-      !SCHEDULABLE_POST_STATUSES.has(post.status) ||
+      !PUBLISHING_POST_STATUSES.has(post.status) ||
       post.approvalRequests[0]?.status !== "APPROVED"
     ) {
       throw conflict(
-        `Only an approved post with nothing out yet can be scheduled; this one is ${post.status.toLowerCase().replace(/_/g, " ")}`,
+        `Only an approved post can be scheduled; this one is ${post.status.toLowerCase().replace(/_/g, " ")}`,
         { postStatus: post.status },
       );
     }
@@ -486,13 +502,15 @@ export async function retry(deps: Deps, user: ServiceUser, jobId: string): Promi
 /**
  * POST /publish-jobs/:id/cancel: a waiting job called off, or a failed one dropped (a platform that
  * keeps refusing the post), so the post settles on its other variants. CONFLICT unless the job is
- * CANCELLABLE; NOT_FOUND when missing.
+ * CANCELLABLE, and for a QUEUED retry resuming what already reached the platform (it counts as
+ * publishing: countedPublishStatus); NOT_FOUND when missing.
  */
 export function cancel(deps: Deps, user: ServiceUser, jobId: string): Promise<PublishJobDto> {
   return changeJob(deps, user, jobId, async (tx, job) => {
     if (!CANCELLABLE_PUBLISH_STATUSES.includes(job.status)) throw wrongStatus(job, "cancelled");
+    if (countedPublishStatus(job) === "PUBLISHING") throw resumingPublish(job);
     const rows = await tx.publishJob.updateManyAndReturn({
-      where: { id: job.id, status: { in: [...CANCELLABLE_PUBLISH_STATUSES] } },
+      where: { id: job.id, OR: [{ status: "FAILED" }, NOT_YET_OUT] },
       // Not one of the lifecycle reasons: tick.publish never schedules a person's cancel again.
       data: { status: "CANCELLED", lastError: `Cancelled by ${user.name}` },
     });

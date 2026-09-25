@@ -33,6 +33,7 @@ import { currentContentHash } from "../../src/orchestrator/approval-round";
 import { EventBatch } from "../../src/orchestrator/events";
 import { PUBLISH_CANCEL_REASONS, syncPostPublishStatus } from "../../src/orchestrator/publishing";
 import { pollPublish, runPublish } from "../../src/publishing/publish-service";
+import { browserHeaders } from "../helpers/app";
 import { testDb } from "../helpers/db";
 import { createClient, createUser } from "../helpers/factories";
 import { startHarness, type Harness, type HarnessOptions } from "../helpers/harness";
@@ -55,19 +56,22 @@ import {
   TUESDAY,
   waitForJobs,
   waitForPostStatus,
+  WEDNESDAY,
   type SeededMetaPlan,
 } from "./phase4.fixtures";
 
 /*
  * Phase 4 publishing safety (DESIGN §F "Publishing safety", §D ticks), on the pipeline harness:
  *   - publisher.schedule: the optimizer's top candidates when the Publisher agent fails (never an
- *     escalation), and a post no platform would take left approved and flagged;
+ *     escalation), a post no platform would take left approved and flagged, and a platform it
+ *     couldn't place put on a day by a teammate even after the rest of the post went out;
  *   - the publish guard at the slot: archived work, content changed behind the approval's back,
  *     banned words added since, an expired token; content refusals cancel and reopen approval
  *     (banned copy through the Copywriter first) and the re-approved job goes out at its new slot,
  *     archived work is held back, a token refusal fails the job (retryable once reconnected);
  *   - dry run or live settled at the slot: a kill switch after scheduling, an account connected
- *     after scheduling, and a live publish still processing when publishing is switched off;
+ *     after scheduling, Pages connected with none chosen and an account disconnected (both fail,
+ *     never faked), and a live publish still processing when publishing is switched off;
  *   - the live publisher's failures against the fake Graph server: a transient error retried
  *     automatically on the same container, a permanent refusal, a revoked token, media still
  *     processing (publish.poll) and a poll that never finishes;
@@ -121,6 +125,21 @@ async function scheduledPost(
 
 async function alerts(): Promise<AlertPayload[]> {
   return eventsOfType<AlertPayload>("alert");
+}
+
+/** The fake Graph's second Page (the client's Events Page), connected but not chosen to publish. */
+function connectSecondPage(h: Harness, client: Client) {
+  const page = FAKE_META_PAGES[1]!;
+  return testDb().socialAccount.create({
+    data: {
+      clientId: client.id,
+      platform: "FACEBOOK",
+      externalId: page.id,
+      handle: page.name,
+      accessTokenEnc: h.deps.tokenCipher.encrypt(page.accessToken),
+      meta: { pageId: page.id, pageName: page.name, source: "oauth" },
+    },
+  });
 }
 
 /**
@@ -211,6 +230,68 @@ describe("publisher.schedule", () => {
     expect(scheduled).toMatchObject({ needsAttention: false, attentionReason: null });
     await tickAt(h, job.scheduledFor);
     await waitForPostStatus(h, postId, "LIVE");
+  }, 90_000);
+
+  it("lets a teammate put a platform it couldn't place on a day after the rest of the post went out", async () => {
+    const h = await startLive();
+    const seeded = await seedMetaPlan(h);
+    // Instagram publishes through its account; Facebook has two Pages and neither is chosen.
+    await connectMetaAccounts(h, seeded.client);
+    await testDb().socialAccount.updateMany({
+      where: { clientId: seeded.client.id, platform: "FACEBOOK" },
+      data: { isPrimary: null },
+    });
+    const eventsPage = await connectSecondPage(h, seeded.client);
+    const [post] = await runToApproval(h, seeded);
+    const postId = post!.id;
+    await approvePost(h, seeded, postId);
+    const flagged = await h.waitFor(async () => {
+      const row = await testDb().post.findUniqueOrThrow({ where: { id: postId } });
+      return row.needsAttention ? row : null;
+    });
+    expect(flagged.status).toBe("SCHEDULED");
+    expect(flagged.attentionReason).toMatch(
+      /^Not scheduled on Facebook: several Facebook accounts are connected and none is chosen/,
+    );
+    expect(Object.keys(await jobsOf(postId))).toEqual(["INSTAGRAM"]);
+
+    // Instagram goes out before anyone gets to Facebook: LIVE on it, still flagged for Facebook.
+    await tickAt(h, IG_TUESDAY_1100);
+    const live = await waitForPostStatus(h, postId, "LIVE");
+    expect(live).toMatchObject({ needsAttention: true, attentionReason: flagged.attentionReason });
+
+    // The flag's action still works: the admin chooses a Page, a teammate picks Wednesday.
+    const api = apiFor(h, seeded.cookie);
+    await api("POST", `/v1/social-accounts/${eventsPage.id}/primary`, {});
+    const job = await api<PublishJobDto>("POST", "/v1/publish-jobs", {
+      postId,
+      platform: "FACEBOOK",
+      date: WEDNESDAY,
+    });
+    expect(job).toMatchObject({
+      status: "SCHEDULED",
+      slotSource: "manual",
+      date: WEDNESDAY,
+      dryRun: false,
+      socialAccountId: eventsPage.id,
+    });
+    // Part of the post waits again, and nothing is left unscheduled.
+    expect(await testDb().post.findUniqueOrThrow({ where: { id: postId } })).toMatchObject({
+      status: "PUBLISHING",
+      needsAttention: false,
+      attentionReason: null,
+    });
+
+    await tickAt(h, job.scheduledFor);
+    const done = await waitForPostStatus(h, postId, "LIVE");
+    expectSameInstant(done.liveAt, job.scheduledFor);
+    const jobs = await jobsOf(postId);
+    expect([jobs.INSTAGRAM!.status, jobs.FACEBOOK!.status]).toEqual(["PUBLISHED", "PUBLISHED"]);
+    expect(graph!.sequence()).toContain(`POST /v26.0/${FAKE_META_PAGES[1]!.id}/photos`);
+    const announced = (await publisherNotes(seeded.threadId)).at(-1)!;
+    expect(announced).toMatch(/^p1 is live\.\n/);
+    expect(announced).toContain(`Facebook: ${jobs.FACEBOOK!.liveUrl}`);
+    expect(announced).toContain(`Instagram: ${jobs.INSTAGRAM!.liveUrl}`);
   }, 90_000);
 
   it("falls back to the optimizer's top candidates when the Publisher can't answer", async () => {
@@ -565,16 +646,7 @@ describe("dry run or live, settled at the slot", () => {
     // Two Pages connected, neither chosen to publish through (a second one arrived later).
     await connectMetaAccounts(h, seeded.client, { isPrimary: null });
     const events = FAKE_META_PAGES[1]!;
-    const eventsPage = await testDb().socialAccount.create({
-      data: {
-        clientId: seeded.client.id,
-        platform: "FACEBOOK",
-        externalId: events.id,
-        handle: events.name,
-        accessTokenEnc: h.deps.tokenCipher.encrypt(events.accessToken),
-        meta: { pageId: events.id, pageName: events.name, source: "oauth" },
-      },
-    });
+    const eventsPage = await connectSecondPage(h, seeded.client);
     const [post] = await runToApproval(h, seeded);
     const postId = post!.id;
     await approvePost(h, seeded, postId);
@@ -600,6 +672,75 @@ describe("dry run or live, settled at the slot", () => {
     await tickAt(h, job.scheduledFor);
     await waitForPostStatus(h, postId, "LIVE");
     expect(graph!.sequence()[0]).toBe(`POST /v26.0/${events.id}/photos`);
+  }, 90_000);
+
+  it("fails, rather than fakes, a post whose client connected Pages after scheduling and chose none", async () => {
+    const h = await startLive();
+    const { seeded, postId } = await scheduledPost(h, ["FACEBOOK"]);
+    const { FACEBOOK: job } = await jobsOf(postId);
+    expect(job).toMatchObject({ dryRun: true, socialAccountId: null });
+    // Two Pages arrive by OAuth before the slot, neither chosen to publish through.
+    await connectMetaAccounts(h, seeded.client, { isPrimary: null });
+    const eventsPage = await connectSecondPage(h, seeded.client);
+
+    await tickAt(h, FB_TUESDAY_0900);
+    const failed = await waitForPostStatus(h, postId, "FAILED");
+    const reason =
+      "None of the client's Facebook accounts is chosen to publish through; choose one in the client's accounts";
+    expect(failed).toMatchObject({ needsAttention: true, attentionReason: reason });
+    // A live publish that failed: nothing simulated, nothing sent.
+    expect((await jobsOf(postId)).FACEBOOK).toMatchObject({
+      status: "FAILED",
+      dryRun: false,
+      socialAccountId: null,
+      lastError: reason,
+      externalId: null,
+      liveUrl: null,
+    });
+    expect(graph!.calls).toEqual([]);
+
+    // The admin chooses the Events Page; the retry goes out there, for real.
+    const api = apiFor(h, seeded.cookie);
+    await api("POST", `/v1/social-accounts/${eventsPage.id}/primary`, {});
+    await api("POST", `/v1/publish-jobs/${job!.id}/retry`, {});
+    await waitForPostStatus(h, postId, "LIVE");
+    const [fbPost] = [...graph!.state.posts.values()];
+    expect((await jobsOf(postId)).FACEBOOK).toMatchObject({
+      status: "PUBLISHED",
+      dryRun: false,
+      socialAccountId: eventsPage.id,
+      externalId: fbPost!.id,
+    });
+    expect(graph!.sequence()[0]).toBe(`POST /v26.0/${FAKE_META_PAGES[1]!.id}/photos`);
+  }, 90_000);
+
+  it("fails a live job whose account was disconnected before its slot, faking nothing", async () => {
+    const h = await startLive();
+    const { seeded, postId } = await scheduledPost(h, ["INSTAGRAM"], (client) =>
+      connectMetaAccounts(h, client),
+    );
+    const { INSTAGRAM: job } = await jobsOf(postId);
+    expect(job).toMatchObject({ dryRun: false, socialAccountId: expect.any(String) as string });
+    const disconnect = await h.app.inject({
+      method: "DELETE",
+      url: `/v1/social-accounts/${job!.socialAccountId}`,
+      headers: browserHeaders(seeded.cookie),
+    });
+    expect(disconnect.statusCode, disconnect.body).toBeLessThan(300);
+    expect((await jobsOf(postId)).INSTAGRAM!.socialAccountId).toBeNull();
+
+    await tickAt(h, IG_TUESDAY_1100);
+    const failed = await waitForPostStatus(h, postId, "FAILED");
+    const reason = "No Instagram account is connected to publish through";
+    expect(failed).toMatchObject({ needsAttention: true, attentionReason: reason });
+    expect((await jobsOf(postId)).INSTAGRAM).toMatchObject({
+      status: "FAILED",
+      dryRun: false,
+      lastError: reason,
+      externalId: null,
+      liveUrl: null,
+    });
+    expect(graph!.calls).toEqual([]);
   }, 90_000);
 
   it("fails a live publish still processing once publishing is switched off, faking nothing", async () => {

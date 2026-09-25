@@ -216,17 +216,23 @@ describe("items", () => {
     expect(ghostNote(ghost({ postStatus: "SCHEDULED" }))).toMatch(
       /^The post is approved, but nothing is scheduled on Facebook: .*campaign window.*Put it on a day/,
     );
-    expect(ghostNote(ghost({ postStatus: "FAILED" }))).toMatch(/Retry or cancel that one first/);
-    expect(ghostNote(ghost({ postStatus: "LIVE" }))).toBe(
-      "The post went out without Facebook: nothing is scheduled there, and a post that is out can't be scheduled again.",
+    expect(ghostNote(ghost({ postStatus: "FAILED" }))).toMatch(
+      /another platform's publish failed: retry or cancel that one .*Put it on a day/,
+    );
+    expect(ghostNote(ghost({ postStatus: "LIVE" }))).toMatch(
+      /^The post is going out without Facebook: nothing is scheduled there .*Put it on a day/,
+    );
+    expect(ghostNote(ghost({ postStatus: "SCORED" }))).toBe(
+      "The post went out without Facebook, and it has been scored: nothing is scheduled there any more.",
     );
   });
 
-  it("lets a teammate schedule only an approved post's ghosts, nothing of it out yet", () => {
-    expect(isGhostSchedulable(ghost({ postStatus: "APPROVED" }))).toBe(true);
-    expect(isGhostSchedulable(ghost({ postStatus: "SCHEDULED" }))).toBe(true);
-    for (const postStatus of ["PENDING_APPROVAL", "FAILED", "LIVE"] as const) {
-      expect(isGhostSchedulable(ghost({ postStatus }))).toBe(false);
+  it("lets a teammate schedule an approved post's ghosts, even with the rest of it out", () => {
+    for (const postStatus of ["APPROVED", "SCHEDULED", "PUBLISHING", "LIVE", "FAILED"] as const) {
+      expect(isGhostSchedulable(ghost({ postStatus })), postStatus).toBe(true);
+    }
+    for (const postStatus of ["PENDING_APPROVAL", "CHANGES_REQUESTED", "SCORED"] as const) {
+      expect(isGhostSchedulable(ghost({ postStatus })), postStatus).toBe(false);
     }
     expect(isGhostSchedulable(job())).toBe(false);
   });

@@ -1,16 +1,16 @@
 import { PublishError, type PublishErrorCode } from "./errors";
 import {
   GraphApiError,
+  GraphResponseError,
   GraphTransportError,
   isGraphError,
-  type GraphResponseError,
 } from "./graph-client";
 
 /*
  * Graph failures as PublishErrors, so the publish service knows what to do next (errors.ts):
  * token and permission problems are AUTH (the account is marked, an alert raised), rate limits and
- * outages are retried (except an outage on a call that publishes and can't be repeated safely,
- * which its flow makes final: meta-facebook.ts publishOnce), media Meta couldn't process is
+ * outages are retried (except on a call that publishes and can't be repeated safely, where an
+ * outage or an unreadable answer is final: meta-facebook.ts publishOnce), media Meta couldn't process is
  * MEDIA_FAILED, anything else is a permanent REJECTED. Codes as Meta documents them for the Graph
  * API, Instagram content publishing and Facebook video uploads.
  */
@@ -94,4 +94,13 @@ export function toPublishError(error: unknown): PublishError {
   }
   const unexpected: GraphResponseError = error;
   return new PublishError("REJECTED", unexpected.message, { cause: unexpected });
+}
+
+/**
+ * Whether the Meta call that failed with `error` may have taken effect all the same: an outage
+ * (a timeout, a dropped connection, a 5xx) or a 2xx answer that couldn't be read (no id, a proxy's
+ * HTML page). Only a clear refusal, Graph's error envelope or a 4xx, says Meta created nothing.
+ */
+export function mayHaveTakenEffect(error: PublishError): boolean {
+  return error.code === "UNAVAILABLE" || error.cause instanceof GraphResponseError;
 }

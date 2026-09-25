@@ -1,3 +1,4 @@
+import { MockLlm, type LlmClient, type LlmRequest, type LlmResponse } from "@enmo/agents";
 import { DryRunPublisher, MetaPublisher } from "@enmo/providers";
 import {
   AssetParams,
@@ -5,7 +6,9 @@ import {
   CopywriterOutput,
   PublisherInput,
   publishedCaption,
+  topSlotCandidate,
   type AlertPayload,
+  type PublisherOutput,
   type PostDto,
   type PublishJobDto,
   type PublishUpdatedPayload,
@@ -45,7 +48,8 @@ import {
  *   (a) approve → the Publisher picks each variant's slot among the optimizer's candidates (best
  *       times in the client's own time zone) → SCHEDULED; the FakeClock reaches each slot and
  *       tick.publish sends it through the dry-run publisher → PUBLISHED with its live URL and
- *       publishedAt → the post LIVE once both are out;
+ *       publishedAt → the post LIVE once both are out; a Publisher that picks a lower-ranked
+ *       candidate gets its own pick, not the optimizer's;
  *   (b) the same flow in PUBLISH_MODE=live through the real MetaPublisher against the fake Graph
  *       server, asserting the exact Graph call sequence of every Meta flow: Instagram image,
  *       reel (polled while processing, resumed on its persisted container after an outage),
@@ -54,6 +58,31 @@ import {
  *       schedules the same job rows again with the edited caption;
  *   (d) a calendar drag moves a job to the best free hour of the new day.
  */
+
+/** MockLlm, except that the Publisher picks each variant's last candidate, saying so. */
+class LastCandidateLlm implements LlmClient {
+  readonly provider = "mock" as const;
+  readonly #mock = new MockLlm();
+  readonly model = this.#mock.model;
+
+  static reasonFor(candidates: number): string {
+    return `The last of ${candidates} candidates: a quieter feed that day.`;
+  }
+
+  async complete(request: LlmRequest): Promise<LlmResponse> {
+    const response = await this.#mock.complete(request);
+    if (request.meta.agent !== "PUBLISHER") return response;
+    const input = PublisherInput.parse(request.meta.input);
+    const output: PublisherOutput = {
+      assignments: input.items.map((item) => ({
+        variantId: item.variantId,
+        slotStart: item.candidates.at(-1)!.slotStart,
+        reason: LastCandidateLlm.reasonFor(item.candidates.length),
+      })),
+    };
+    return { ...response, text: JSON.stringify(output) };
+  }
+}
 
 let harness: Harness | undefined;
 let graph: FakeGraph | undefined;
@@ -232,6 +261,35 @@ describe("phase4.self-publish", () => {
     // A late duplicate tick or run changes nothing.
     await h.runTick("tick.publish");
     expect((await testDb().post.findUniqueOrThrow({ where: { id: postId } })).status).toBe("LIVE");
+  }, 90_000);
+
+  it("(a) puts each job on the slot the Publisher picked, even one the optimizer ranks lower", async () => {
+    const llm = new LastCandidateLlm();
+    const h = await start({ llm });
+    const seeded = await seedMetaPlan(h);
+    const [post] = await runToApproval(h, seeded);
+    const postId = post!.id;
+    await approvePost(h, seeded, postId);
+    await waitForPostStatus(h, postId, "SCHEDULED");
+
+    const jobs = await jobsOf(postId);
+    const run = await testDb().agentRun.findFirstOrThrow({
+      where: { agent: "PUBLISHER", action: "schedule", outcome: "OK" },
+    });
+    const { items } = PublisherInput.parse(run.inputSnapshot);
+    expect(items).toHaveLength(2);
+    for (const item of items) {
+      const pick = item.candidates.at(-1)!;
+      // The agent's own call, not the optimizer's top candidate the fallback would take.
+      expect(pick.slotStart).not.toBe(topSlotCandidate(item.candidates)!.slotStart);
+      const job = Object.values(jobs).find((entry) => entry.variantId === item.variantId)!;
+      expectSameInstant(job.scheduledFor, pick.slotStart);
+      expect(job).toMatchObject({
+        status: "SCHEDULED",
+        slotSource: "publisher",
+        slotReason: LastCandidateLlm.reasonFor(item.candidates.length),
+      });
+    }
   }, 90_000);
 
   it("(b) publishes live through the Meta Graph API with the exact call sequence", async () => {

@@ -3,6 +3,7 @@ import { publishedCaption } from "@enmo/shared";
 import { PublishError } from "./errors";
 import { GraphId } from "./graph-client";
 import { defined, graphPath, onlyMedia, processing, type MetaFlowContext } from "./meta-context";
+import { mayHaveTakenEffect } from "./meta-errors";
 import { startProgress, type MetaProgress } from "./meta-progress";
 import type { PublishOutcome } from "./types";
 
@@ -18,7 +19,8 @@ import type { PublishOutcome } from "./types";
  * and the live URL from GET /{post}?fields=permalink_url, or for videos from
  * GET /{video}?fields=status,permalink_url once processing is done. The calls that publish a photo,
  * feed post or story can't be repeated safely: each is marked in the saved progress before it goes
- * out, and neither an outage on it nor a resume that finds the mark sends it again (publishOnce).
+ * out, and neither an outage or an unreadable answer on it nor a resume that finds the mark sends
+ * it again (publishOnce).
  */
 
 const Photo = z.looseObject({ id: GraphId, post_id: GraphId.optional() });
@@ -83,11 +85,12 @@ function refused(what: string): PublishError {
 
 /**
  * The POST that makes a post public (a published photo, the feed post, the story) isn't
- * idempotent: Meta can create the post and still time out or answer 5xx, and the worker can stop
- * (or fail to save the answer) right after Meta created it. So the progress is saved with
- * `posting` before the call goes out, and whatever leaves the answer unknown is final, never
- * retried automatically: an ambiguous failure (UNAVAILABLE), or a resume that finds `posting`
- * without a result (UNCONFIRMED). A person checks the Page, then retries (which clears the mark,
+ * idempotent: Meta can create the post and still time out, answer 5xx or answer 2xx with a body
+ * that can't be read, and the worker can stop (or fail to save the answer) right after Meta
+ * created it. So the progress is saved with `posting` before the call goes out, and whatever
+ * leaves the answer unknown is final, never retried automatically, and keeps the mark: an outage
+ * (UNAVAILABLE), an unreadable answer (UNCONFIRMED), or a resume that finds `posting` without a
+ * result (UNCONFIRMED). A person checks the Page, then retries (which clears the mark,
  * withoutPostingMarker) or cancels, so the Page never gets the post twice. A clear refusal (rate
  * limit, token, a 4xx) means nothing was created: the mark is taken back and the error stays.
  */
@@ -109,12 +112,12 @@ async function publishOnce<T>(
     return await call();
   } catch (error) {
     if (!(error instanceof PublishError)) throw error;
-    if (error.code !== "UNAVAILABLE") {
+    if (!mayHaveTakenEffect(error)) {
       await ctx.save(progress);
       throw error;
     }
     throw new PublishError(
-      "UNAVAILABLE",
+      error.code === "UNAVAILABLE" ? "UNAVAILABLE" : "UNCONFIRMED",
       `${error.message}. Facebook may have published the ${what} anyway, so it isn't retried automatically: check the Page, then retry or cancel the job`,
       { status: error.status, retryable: false, cause: error },
     );
@@ -172,10 +175,16 @@ async function photoStory(ctx: MetaFlowContext, progress: MetaProgress | null) {
   const current = await stagePhotos(ctx, progress ?? startProgress("FB_PHOTO_STORY"));
   const [photoId] = current.items;
   if (!photoId) throw new Error("A story's photo is staged before the story is posted");
-  const story = await publishOnce(ctx, current, "photo story", () =>
-    ctx.post(graphPath(ctx.nodeId, "photo_stories"), { photo_id: photoId }, Story),
-  );
-  if (story.success === false) throw refused("photo story");
+  const story = await publishOnce(ctx, current, "photo story", async () => {
+    const answer = await ctx.post(
+      graphPath(ctx.nodeId, "photo_stories"),
+      { photo_id: photoId },
+      Story,
+    );
+    // Meta's refusal in a 2xx: nothing went on the Page, so publishOnce takes its mark back.
+    if (answer.success === false) throw refused("photo story");
+    return answer;
+  });
   return recordResult(ctx, current, story.post_id);
 }
 
